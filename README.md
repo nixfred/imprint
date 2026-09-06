@@ -64,6 +64,8 @@ imprint save --all -o /mnt/usb/dex.imprint.tar.zst
 imprint restore FILE                 # picker of what is in that file
 imprint restore FILE --only bar,plugins --dry-run
 imprint restore FILE --only identity --confirm-hostname dex
+imprint restore FILE --upgrade       # omarchy update -y first, abort if it fails
+imprint restore FILE --only system --allow-system   # /etc + systemctl enable, via sudo
 
 imprint info FILE                    # machine brief; feed this to an agent
 imprint diff FILE                    # what drifted since the imprint
@@ -83,7 +85,17 @@ On by default (safe to take to another machine):
 - **Hyprland** — bindings, autostart, extra Lua (not monitors/input)
 - **Bar and shell** — `shell.json` layout, idle, disabled plugins
 - **Plugins** — git-backed plugins are recorded as URLs and reinstalled from
-  source; only plugins with no upstream are packed as trees
+  source; only plugins with no upstream are packed as trees. Uncommitted local
+  edits ride along as a small overlay and are reapplied after the clone
+- **Projects** — every git checkout under `~/Projects` and `~/Work` as
+  `git clone URL -b BRANCH`, plus a patch of anything uncommitted. Repos with
+  no remote are listed as **not recoverable**, loudly
+- **Toolchains** — `mise` config and resolved versions, `go install` module
+  paths, `cargo install` crates, global npm packages — as commands, not binaries
+- **System layer** — your `/etc` changes (systemd drop-ins, ufw rules, sshd
+  policy, pacman config, docker daemon) and the list of enabled system units.
+  Off by default and never applied without `--allow-system`; credentials, host
+  keys and wifi secrets are never collected
 - **Themes** — git remotes via `omarchy theme install`; local themes copied
 - **Hooks and menu**
 - **Terminals**
@@ -108,6 +120,10 @@ On restore, `/home/olduser` inside text files becomes the new `$HOME`. Git
 remotes of the form `git@github.com:...` are saved as `https://` so the new
 box does not need your SSH key. Plugins land before `shell.json`, so the bar
 has somewhere to put them.
+
+The system layer never touches `/etc` on its own. It stages the files under
+`~/.local/state/imprint/system-<stamp>/` and writes a `restore-system.sh` you
+can read; only `--allow-system` runs it, and only through `sudo -n`.
 
 `shell.json` is never written directly while the shell is running. Imprint
 snapshots the live config first, then hands the archived file to

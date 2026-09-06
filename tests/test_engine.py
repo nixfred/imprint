@@ -280,5 +280,111 @@ class CodexAuditRegressions(unittest.TestCase):
         engine.FAILURES.clear()
 
 
+class RecipeCategoryTests(unittest.TestCase):
+    def test_etc_denylist_blocks_credentials(self):
+        for bad in ("/etc/shadow", "/etc/gshadow", "/etc/sudoers",
+                    "/etc/NetworkManager/system-connections/wifi.nmconnection",
+                    "/etc/ssh/ssh_host_ed25519_key", "/etc/pki/tls/private/x.key"):
+            self.assertTrue(engine.etc_is_denied(Path(bad)), bad)
+        for good in ("/etc/ufw/user.rules", "/etc/docker/daemon.json",
+                     "/etc/systemd/system/dex-backup.timer"):
+            self.assertFalse(engine.etc_is_denied(Path(good)), good)
+
+    def test_symlink_into_a_repo_is_a_link_not_a_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            repo = home / "Projects/tool"
+            (repo / ".git").mkdir(parents=True)
+            script = repo / "tool"; script.write_text("#!/bin/sh\n", encoding="utf-8")
+            binp = home / "bin"; binp.mkdir()
+            (binp / "tool").symlink_to(script)
+            cat = home / "cat"; cat.mkdir()
+            meta = engine.collect_scripts(cat, home)
+            self.assertEqual(len(meta["links"]), 1)
+            link = meta["links"][0]
+            self.assertEqual(link["link"], "bin/tool")
+            self.assertEqual(link["repo"], "Projects/tool")
+            self.assertFalse((cat / "files/bin/tool").exists(),
+                             "the link must not also be flattened into a payload copy")
+
+    def test_link_restore_recreates_the_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            target = home / "Projects/tool/tool"
+            target.parent.mkdir(parents=True)
+            target.write_text("#!/bin/sh\n", encoding="utf-8")
+            cat = Path(tmp) / "cat"; cat.mkdir()
+            (cat / "meta.json").write_text(json.dumps({"files": [], "links": [
+                {"link": "bin/tool", "target": "Projects/tool/tool",
+                 "repo": "Projects/tool", "url": "https://example/tool.git"}]}), encoding="utf-8")
+            undo = Path(tmp) / "undo"; undo.mkdir()
+            actions = engine.restore_scripts(cat, home, "", undo, False)
+            self.assertTrue((home / "bin/tool").is_symlink())
+            self.assertEqual((home / "bin/tool").resolve(), target.resolve())
+            self.assertTrue(any("linked" in a for a in actions), actions)
+
+    def test_link_restore_reports_a_missing_target_as_failure(self):
+        engine.FAILURES.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"; home.mkdir(parents=True)
+            cat = Path(tmp) / "cat"; cat.mkdir()
+            (cat / "meta.json").write_text(json.dumps({"files": [], "links": [
+                {"link": "bin/tool", "target": "Projects/gone/tool",
+                 "repo": "Projects/gone", "url": "https://example/gone.git"}]}), encoding="utf-8")
+            undo = Path(tmp) / "undo"; undo.mkdir()
+            engine.restore_scripts(cat, home, "", undo, False)
+            self.assertEqual(len(engine.FAILURES), 1)
+            self.assertIn("is missing", engine.FAILURES[0])
+        engine.FAILURES.clear()
+
+    def test_project_path_cannot_escape_home(self):
+        engine.FAILURES.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"; home.mkdir(parents=True)
+            cat = Path(tmp) / "cat"; cat.mkdir()
+            (cat / "meta.json").write_text(json.dumps({"repos": [
+                {"path": "../../etc/evil", "url": "https://example/x.git"}]}), encoding="utf-8")
+            actions = engine.restore_projects(cat, home, False)
+            self.assertTrue(any("refused" in a for a in actions), actions)
+        engine.FAILURES.clear()
+
+    def test_repos_without_a_remote_are_flagged_loudly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"; home.mkdir(parents=True)
+            cat = Path(tmp) / "cat"; cat.mkdir()
+            (cat / "meta.json").write_text(json.dumps({
+                "repos": [{"path": "Projects/local-only", "url": ""}],
+                "withoutRemote": ["Projects/local-only"]}), encoding="utf-8")
+            actions = engine.restore_projects(cat, home, True)
+            self.assertTrue(any("no git remote" in a for a in actions), actions)
+            self.assertTrue(any("WARNING" in a for a in actions), actions)
+
+    def test_system_restore_needs_explicit_permission(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cat = Path(tmp) / "cat"; (cat / "etc").mkdir(parents=True)
+            (cat / "etc/thing.conf").write_text("x=1\n", encoding="utf-8")
+            (cat / "meta.json").write_text(json.dumps(
+                {"enabledUnits": ["docker.service"], "etcFiles": ["thing.conf"]}), encoding="utf-8")
+            home = Path(tmp) / "home"; home.mkdir()
+            actions = engine.restore_system(cat, home, False, False)
+            self.assertTrue(any("NOT applied" in a for a in actions), actions)
+            # Staged outside the archive's temp dir so it survives the restore.
+            scripts = list((home / ".local/state/imprint").glob("system-*/restore-system.sh"))
+            self.assertEqual(len(scripts), 1, scripts)
+            script = scripts[0].read_text(encoding="utf-8")
+            self.assertIn("systemctl enable docker.service", script)
+            self.assertTrue(scripts[0].parent.joinpath("etc/thing.conf").is_file())
+
+    def test_system_dry_run_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cat = Path(tmp) / "cat"; (cat / "etc").mkdir(parents=True)
+            (cat / "etc/thing.conf").write_text("x=1\n", encoding="utf-8")
+            (cat / "meta.json").write_text(json.dumps(
+                {"enabledUnits": ["docker.service"], "etcFiles": ["thing.conf"]}), encoding="utf-8")
+            home = Path(tmp) / "home"; home.mkdir()
+            engine.restore_system(cat, home, True, False)
+            self.assertFalse((home / ".local/state/imprint").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -96,6 +96,8 @@ Usage:
   imprint restore [FILE]      Choose categories from an archive
   imprint restore FILE --only bar,plugins --dry-run
   imprint restore FILE --upgrade      Run `omarchy update -y` first, then restore
+  imprint restore FILE --only system --allow-system
+                                      Apply /etc changes and enable system units
   imprint info FILE           Show the machine brief (AI-readable)
   imprint diff FILE           What drifted since this imprint
   imprint verify FILE         Check the archive
@@ -251,6 +253,7 @@ do_restore() {
   local dry=${3:-0}
   local confirm_host=${4:-}
   local upgrade=${5:-0}
+  local allow_system=${6:-0}
   banner
   if [[ -z $archive ]]; then
     archive=$(pick_archive) || die "cancelled"
@@ -270,12 +273,16 @@ do_restore() {
   if printf '%s' "$only" | grep -q 'identity'; then
     warn "Identity will rename this host. Restore still needs --confirm-hostname."
   fi
+  if printf '%s' "$only" | grep -q 'system'; then
+    warn "System layer needs root. Without --allow-system it only writes a script for you to review."
+  fi
   if printf '%s' "$only" | grep -q 'secrets'; then
     warn "Secrets copies SSH public keys and config, not private keys."
   fi
   local extra=()
   (( dry == 1 )) && extra+=(--dry-run)
   (( upgrade == 1 )) && extra+=(--upgrade)
+  (( allow_system == 1 )) && extra+=(--allow-system)
   # These were parsed and then thrown away on the interactive path.
   [[ -n $confirm_host ]] && extra+=(--confirm-hostname "$confirm_host")
   if [[ $dry -eq 0 ]]; then
@@ -378,12 +385,14 @@ case $cmd in
     only=""
     dry=0
     upgrade=0
+    allow_system=0
     confirm_host=""
     while [[ $# -gt 0 ]]; do
       case $1 in
         --only) [[ $# -ge 2 ]] || die "--only needs a value"; only=$2; shift 2 ;;
         --dry-run) dry=1; shift ;;
         --upgrade) upgrade=1; shift ;;
+        --allow-system) allow_system=1; shift ;;
         --confirm-hostname) [[ $# -ge 2 ]] || die "--confirm-hostname needs a value"; confirm_host=$2; shift 2 ;;
         --yes) shift ;;
         -*) die "unknown restore flag: $1" ;;
@@ -393,11 +402,12 @@ case $cmd in
     extra=()
     [[ $dry -eq 1 ]] && extra+=(--dry-run)
     [[ $upgrade -eq 1 ]] && extra+=(--upgrade)
+    [[ $allow_system -eq 1 ]] && extra+=(--allow-system)
     [[ -n $confirm_host ]] && extra+=(--confirm-hostname "$confirm_host")
     if [[ -n $only && -n $archive ]]; then
       engine restore "$archive" --only "$only" "${extra[@]}"
     else
-      do_restore "$archive" "$only" "$dry" "$confirm_host" "$upgrade"
+      do_restore "$archive" "$only" "$dry" "$confirm_host" "$upgrade" "$allow_system"
     fi
     ;;
   info|brief)

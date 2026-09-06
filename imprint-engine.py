@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -128,6 +129,20 @@ CATEGORIES = [
         "risk": "portable",
     },
     {
+        "id": "projects",
+        "title": "Projects",
+        "summary": "Your git checkouts as clone recipes plus uncommitted patches",
+        "default": True,
+        "risk": "portable",
+    },
+    {
+        "id": "toolchains",
+        "title": "Toolchains",
+        "summary": "mise / cargo / go / npm tools as reinstall commands",
+        "default": True,
+        "risk": "portable",
+    },
+    {
         "id": "wallpapers",
         "title": "Wallpaper overlays",
         "summary": "Extra images under ~/.config/omarchy/backgrounds — often huge",
@@ -159,6 +174,13 @@ CATEGORIES = [
         "id": "input",
         "title": "Pointer and keyboard",
         "summary": "Touchpad, mouse, repeat — tuned per device",
+        "default": False,
+        "risk": "host",
+    },
+    {
+        "id": "system",
+        "title": "System layer",
+        "summary": "Enabled system services and your /etc changes — needs root",
         "default": False,
         "risk": "host",
     },
@@ -900,8 +922,23 @@ def script_should_keep(path: Path) -> bool:
     return True
 
 
+def repo_root_for(path: Path, home: Path) -> Path | None:
+    """The git checkout a path lives in, if any, bounded to $HOME."""
+    try:
+        current = path.resolve()
+    except OSError:
+        return None
+    home_abs = home.resolve()
+    while current != current.parent and home_abs in current.parents:
+        if (current / ".git").exists():
+            return current
+        current = current.parent
+    return None
+
+
 def collect_scripts(cat_dir: Path, home: Path) -> dict:
     kept = []
+    links = []
     skipped = []
     for folder in (home / "bin", home / ".local/bin"):
         if not folder.is_dir():
@@ -911,13 +948,26 @@ def collect_scripts(cat_dir: Path, home: Path) -> dict:
                 continue
             if is_skipped_name(path.name):
                 continue
+            # A symlink into a checkout is a link to that repo, not a file.
+            # Flattening it produced a standalone copy cut off from the rest of
+            # its tree -- that is how imprint's own wrapper lost its engine.
+            if path.is_symlink():
+                repo = repo_root_for(path, home)
+                if repo is not None:
+                    links.append({
+                        "link": rel_under_home(path, home),
+                        "target": rel_under_home(path.resolve(), home),
+                        "repo": rel_under_home(repo, home),
+                        "url": git_remote(repo),
+                    })
+                    continue
             if script_should_keep(path):
                 noted = copy_into_category(cat_dir, path, home)
                 if noted:
                     kept.append(noted)
             else:
                 skipped.append({"path": rel_under_home(path, home), "size": path.stat().st_size if path.exists() else 0})
-    meta = {"files": kept, "skipped_binaries": skipped}
+    meta = {"files": kept, "links": links, "skipped_binaries": skipped}
     write_json(cat_dir / "meta.json", meta)
     return meta
 
@@ -1044,6 +1094,226 @@ def collect_secrets(cat_dir: Path, home: Path) -> dict:
     return meta
 
 
+
+PROJECT_ROOTS = ("Projects", "Work")
+PATCH_LIMIT = 512 * 1024
+
+# /etc paths worth carrying. Everything here is policy you wrote, not package
+# content and not credentials.
+ETC_DIRS = (
+    "systemd/system",
+    "systemd/logind.conf.d",
+    "systemd/sleep.conf.d",
+    "systemd/system.conf.d",
+    "sddm.conf.d",
+    "ssh/sshd_config.d",
+    "pacman.d/hooks",
+    "modprobe.d",
+    "udev/rules.d",
+    "NetworkManager/conf.d",
+    "docker",
+    "ufw",
+)
+UFW_FILES = {
+    "user.rules", "user6.rules", "after.rules", "after6.rules",
+    "before.rules", "before6.rules", "ufw.conf", "sysctl.conf",
+}
+ETC_FILES = ("pacman.conf", "locale.gen", "environment", "vconsole.conf")
+# Never leaves the machine, whatever else matches.
+ETC_DENY_PARTS = (
+    "shadow", "gshadow", "passwd", "group", "sudoers",
+    "system-connections", "private", "secrets",
+)
+ETC_DENY_SUFFIX = (".key", ".pem", ".p12", ".pfx", ".crt", ".gpg")
+
+
+def etc_is_denied(path: Path) -> bool:
+    text = str(path)
+    if any(part in text for part in ETC_DENY_PARTS):
+        return True
+    if path.name.startswith("ssh_host_"):
+        return True
+    return path.suffix in ETC_DENY_SUFFIX
+
+
+def package_owns(path: Path) -> bool:
+    return run(["pacman", "-Qo", str(path)]).returncode == 0
+
+
+def enabled_system_units() -> list[str]:
+    text = run_ok(["systemctl", "list-unit-files", "--state=enabled", "--no-legend"])
+    names = []
+    for line in text.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        name = parts[0]
+        # Templates cannot be enabled by name; instances would need their own record.
+        if name.endswith("@.service") or name.endswith("@.socket"):
+            continue
+        names.append(name)
+    return sorted(names)
+
+
+def collect_system(cat_dir: Path, home: Path) -> dict:
+    etc = Path("/etc")
+    kept, skipped = [], []
+    for rel in ETC_DIRS:
+        root = etc / rel
+        if not root.is_dir():
+            continue
+        for path in sorted(root.rglob("*")):
+            if not path.is_file() or path.is_symlink():
+                continue
+            if is_skipped_name(path.name) or any(is_skipped_name(x) for x in path.parts):
+                continue
+            if etc_is_denied(path):
+                skipped.append(str(path))
+                continue
+            # ufw and docker rewrite package files in place, so those are kept
+            # by name; everything else is only interesting when unowned.
+            if rel == "ufw":
+                if path.name not in UFW_FILES and package_owns(path):
+                    continue
+            elif rel == "docker":
+                if path.name != "daemon.json" and package_owns(path):
+                    continue
+            elif package_owns(path):
+                continue
+            dest = cat_dir / "etc" / path.relative_to(etc)
+            try:
+                copy_file(path, dest)
+            except OSError:
+                skipped.append(f"{path} (unreadable)")
+                continue
+            kept.append(str(path.relative_to(etc)))
+    for name in ETC_FILES:
+        path = etc / name
+        if path.is_file() and not etc_is_denied(path):
+            try:
+                copy_file(path, cat_dir / "etc" / name)
+                kept.append(name)
+            except OSError:
+                skipped.append(f"{path} (unreadable)")
+    meta = {
+        "enabledUnits": enabled_system_units(),
+        "etcFiles": kept,
+        "etcSkipped": skipped,
+        "note": "Restoring this needs root. Credentials and host keys are never collected.",
+    }
+    write_json(cat_dir / "meta.json", meta)
+    return meta
+
+
+def git_branch(path: Path) -> str:
+    name = run_ok(["git", "-C", str(path), "rev-parse", "--abbrev-ref", "HEAD"]).strip()
+    return "" if name == "HEAD" else name
+
+
+def git_unpushed(path: Path) -> int:
+    out = run_ok(["git", "-C", str(path), "rev-list", "--count", "@{upstream}..HEAD"]).strip()
+    try:
+        return int(out)
+    except ValueError:
+        return 0
+
+
+def collect_projects(cat_dir: Path, home: Path) -> dict:
+    records = []
+    for root_name in PROJECT_ROOTS:
+        root = home / root_name
+        if not root.is_dir():
+            continue
+        for entry in sorted(root.iterdir()):
+            if not (entry / ".git").exists() or is_skipped_name(entry.name):
+                continue
+            url = git_remote(entry)
+            rel = rel_under_home(entry, home)
+            rec = {
+                "path": rel,
+                "name": entry.name,
+                "url": url,
+                "branch": git_branch(entry),
+                "commit": git_head(entry),
+                "dirty": git_dirty(entry),
+                "unpushed": git_unpushed(entry),
+                "changed": git_changed_files(entry),
+            }
+            # Uncommitted work has no upstream copy, so carry it as a patch.
+            if rec["dirty"]:
+                diff = run_ok(["git", "-C", str(entry), "diff", "HEAD"])
+                if diff and len(diff.encode("utf-8")) <= PATCH_LIMIT:
+                    patch_rel = Path("patches") / f"{entry.name}.patch"
+                    dest = cat_dir / patch_rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_text(diff, encoding="utf-8")
+                    rec["patch"] = str(patch_rel)
+                elif diff:
+                    rec["patchSkipped"] = f"diff is {len(diff)} bytes, over the {PATCH_LIMIT} limit"
+            if not url:
+                rec["warning"] = "no git remote; this checkout cannot be recreated from source"
+            records.append(rec)
+    meta = {
+        "repos": records,
+        "count": len(records),
+        "withoutRemote": sorted(r["path"] for r in records if not r["url"]),
+        "unpushed": sorted(r["path"] for r in records if r["unpushed"]),
+    }
+    write_json(cat_dir / "meta.json", meta)
+    return meta
+
+
+def go_module_for(binary: Path) -> str:
+    out = run_ok(["go", "version", "-m", str(binary)])
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == "path":
+            return parts[1] if parts[1] != "path" else parts[2]
+        if len(parts) >= 2 and parts[0] == "path":
+            return parts[1]
+    return ""
+
+
+def collect_toolchains(cat_dir: Path, home: Path) -> dict:
+    files = []
+    for rel in (".config/mise/config.toml", ".tool-versions"):
+        noted = copy_into_category(cat_dir, home / rel, home)
+        if noted:
+            files.append(noted)
+    mise = []
+    for line in run_ok(["mise", "ls", "--current"]).splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            mise.append({"tool": parts[0], "version": parts[1]})
+    cargo = []
+    for line in run_ok(["cargo", "install", "--list"]).splitlines():
+        if line and not line.startswith(" ") and line.endswith(":"):
+            cargo.append(line.rstrip(":").split()[0])
+    go_tools = []
+    gobin = home / "go/bin"
+    if gobin.is_dir():
+        for binary in sorted(gobin.iterdir()):
+            if not binary.is_file():
+                continue
+            module = go_module_for(binary)
+            go_tools.append({"name": binary.name, "module": module})
+    npm = []
+    for line in run_ok(["npm", "ls", "-g", "--depth=0", "--parseable"]).splitlines():
+        name = Path(line).name
+        if name and name != "lib" and name != "npm":
+            npm.append(name)
+    meta = {
+        "files": files,
+        "mise": mise,
+        "cargo": cargo,
+        "go": go_tools,
+        "npmGlobal": npm,
+        "unresolvedGo": sorted(t["name"] for t in go_tools if not t["module"]),
+    }
+    write_json(cat_dir / "meta.json", meta)
+    return meta
+
+
 COLLECTORS = {
     "look": collect_look,
     "wallpapers": collect_wallpapers,
@@ -1064,6 +1334,9 @@ COLLECTORS = {
     "input": collect_input,
     "identity": collect_identity,
     "secrets": collect_secrets,
+    "projects": collect_projects,
+    "toolchains": collect_toolchains,
+    "system": collect_system,
 }
 
 
@@ -1149,6 +1422,35 @@ def render_brief(manifest: dict) -> str:
             lines.append("```bash")
             lines.append("omarchy pkg aur add " + " ".join(pkgs["aur"]))
             lines.append("```")
+    projects = ((cats.get("projects") or {}).get("repos")) or []
+    if projects:
+        lines += ["", f"## Projects ({len(projects)} checkouts)", ""]
+        for repo in projects[:40]:
+            if repo.get("url"):
+                extra = " +patch" if repo.get("patch") else ""
+                lines.append(f"- `{repo['path']}` `git clone {repo['url']}`{extra}")
+            else:
+                lines.append(f"- `{repo['path']}` **no remote — not recoverable from this imprint**")
+        if len(projects) > 40:
+            lines.append(f"- ... {len(projects) - 40} more")
+    tools = cats.get("toolchains") or {}
+    if tools.get("mise") or tools.get("go") or tools.get("cargo"):
+        lines += ["", "## Toolchains", ""]
+        if tools.get("mise"):
+            lines.append("```bash")
+            lines.append("mise install   # " + ", ".join(f"{t['tool']}@{t['version']}" for t in tools["mise"][:12]))
+            lines.append("```")
+        for tool in tools.get("go") or []:
+            if tool.get("module"):
+                lines.append(f"- `go install {tool['module']}@latest`")
+        for crate in tools.get("cargo") or []:
+            lines.append(f"- `cargo install {crate}`")
+    system = cats.get("system") or {}
+    if system.get("enabledUnits") or system.get("etcFiles"):
+        lines += ["", "## System layer (needs root)", ""]
+        lines.append(f"- {len(system.get('etcFiles') or [])} files under `/etc`")
+        lines.append(f"- {len(system.get('enabledUnits') or [])} enabled system units")
+        lines.append("- apply with `imprint restore FILE --only system --allow-system`")
     themes = ((cats.get("themes") or {}).get("themes")) or []
     git_themes = [t for t in themes if t.get("url")]
     if git_themes:
@@ -1293,6 +1595,9 @@ def cmd_save(args) -> int:
 
 def strip_heavy(meta: dict) -> dict:
     data = dict(meta)
+    # Recipes are the point of the archive; never truncate them.
+    if "repos" in data or "mise" in data or "enabledUnits" in data:
+        return data
     # Keep plugin index, drop per-file lists that bloat the manifest.
     if "files" in data and isinstance(data["files"], list) and len(data["files"]) > 40:
         data["fileCount"] = len(data["files"])
@@ -1620,6 +1925,182 @@ def restore_identity(cat_dir: Path, dry: bool, confirm_host: str | None) -> list
     return [fail("hostname failed: " + (proc.stderr or proc.stdout).strip()[:200])]
 
 
+
+def restore_scripts(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool) -> list[str]:
+    actions = restore_file_tree(cat_dir, home, old_home, undo, dry)
+    meta_path = cat_dir / "meta.json"
+    if not meta_path.is_file():
+        return actions
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    for entry in meta.get("links") or []:
+        link_rel, target_rel = entry.get("link") or "", entry.get("target") or ""
+        if not link_rel or not target_rel:
+            continue
+        try:
+            link = contained(home, (home / link_rel).parent) / Path(link_rel).name
+            target = contained(home, home / target_rel)
+        except UnsafePath:
+            actions.append(fail(f"refused link outside home: {link_rel!r} -> {target_rel!r}"))
+            continue
+        if dry:
+            actions.append(f"ln -s ~/{target_rel} ~/{link_rel}")
+            continue
+        if not target.exists():
+            actions.append(fail(
+                f"~/{link_rel} not linked: ~/{target_rel} is missing"
+                + (f" (restore Projects, or clone {entry['url']})" if entry.get("url") else "")
+            ))
+            continue
+        if link.exists() or link.is_symlink():
+            backup_existing(link, undo, home)
+            if link.is_dir() and not link.is_symlink():
+                shutil.rmtree(link)
+            else:
+                link.unlink()
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(target)
+        actions.append(f"linked ~/{link_rel} -> ~/{target_rel}")
+    return actions
+
+
+def restore_projects(cat_dir: Path, home: Path, dry: bool) -> list[str]:
+    meta_path = cat_dir / "meta.json"
+    if not meta_path.is_file():
+        return []
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    actions = []
+    for repo in meta.get("repos") or []:
+        rel = repo.get("path") or ""
+        url = repo.get("url") or ""
+        if not rel:
+            continue
+        try:
+            target = contained(home, home / rel)
+        except UnsafePath:
+            actions.append(fail(f"refused project path outside home: {rel!r}"))
+            continue
+        branch = repo.get("branch") or ""
+        if not url:
+            actions.append(f"skip {rel}: no git remote, nothing to clone from")
+            continue
+        if dry:
+            actions.append(f"git clone {url} ~/{rel}" + (f" -b {branch}" if branch else ""))
+            if repo.get("patch"):
+                actions.append(f"  then git apply {len(repo.get('changed') or [])} uncommitted files")
+            continue
+        if target.exists():
+            actions.append(f"{rel} already present, left alone")
+        else:
+            cmd = ["git", "clone"]
+            if branch:
+                cmd += ["-b", branch]
+            cmd += [url, str(target)]
+            proc = run(cmd)
+            if proc.returncode != 0:
+                actions.append(fail(f"clone failed {rel}: " + (proc.stderr or proc.stdout).strip()[:200]))
+                continue
+            actions.append(f"cloned {rel} from source")
+        rel_patch = repo.get("patch") or ""
+        if rel_patch:
+            try:
+                patch = contained(cat_dir, cat_dir / rel_patch)
+            except UnsafePath:
+                actions.append(fail(f"refused patch path {rel_patch!r}"))
+                continue
+            if patch.is_file():
+                proc = run(["git", "-C", str(target), "apply", "--3way", str(patch)])
+                if proc.returncode == 0:
+                    actions.append(f"reapplied uncommitted work to {rel}")
+                else:
+                    actions.append(fail(f"patch failed for {rel}: " + (proc.stderr or proc.stdout).strip()[:200]))
+    for rel in meta.get("withoutRemote") or []:
+        actions.append(f"WARNING {rel} has no remote and was not captured as content")
+    return actions
+
+
+def restore_toolchains(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool) -> list[str]:
+    actions = restore_file_tree(cat_dir, home, old_home, undo, dry)
+    meta_path = cat_dir / "meta.json"
+    if not meta_path.is_file():
+        return actions
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    steps: list[list[str]] = []
+    if meta.get("mise"):
+        steps.append(["mise", "install", "--yes"])
+    for crate in meta.get("cargo") or []:
+        steps.append(["cargo", "install", crate])
+    for tool in meta.get("go") or []:
+        module = tool.get("module")
+        if module:
+            steps.append(["go", "install", f"{module}@latest"])
+    for pkg in meta.get("npmGlobal") or []:
+        steps.append(["npm", "install", "-g", pkg])
+    if dry:
+        return actions + [" ".join(step) for step in steps]
+    for step in steps:
+        if not shutil.which(step[0]):
+            actions.append(fail(f"{step[0]} not installed, skipped: " + " ".join(step)))
+            continue
+        proc = run(step)
+        if proc.returncode == 0:
+            actions.append("ok: " + " ".join(step))
+        else:
+            actions.append(fail("failed: " + " ".join(step) + " -- " + (proc.stderr or proc.stdout).strip()[:200]))
+    for name in meta.get("unresolvedGo") or []:
+        actions.append(f"WARNING go tool {name} has no resolvable module path")
+    return actions
+
+
+def restore_system(cat_dir: Path, home: Path, dry: bool, allow: bool) -> list[str]:
+    meta_path = cat_dir / "meta.json"
+    if not meta_path.is_file():
+        return []
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    etc_root = cat_dir / "etc"
+    # The archive is unpacked into a temp dir that disappears when restore
+    # returns, so stage the payload somewhere the user can actually review and
+    # re-run later.
+    stage = home / ".local/state/imprint" / f"system-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    stage_etc = stage / "etc"
+    lines = ["#!/usr/bin/env bash", "set -euo pipefail", "# Written by imprint. Review before running."]
+    installs = []
+    if etc_root.is_dir():
+        for path in sorted(etc_root.rglob("*")):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(etc_root)
+            if not dry:
+                copy_file(path, stage_etc / rel)
+            installs.append((path, Path("/etc") / rel))
+            lines.append(f'install -Dm644 {shlex.quote(str(stage_etc / rel))} /etc/{rel}')
+    units = [u for u in (meta.get("enabledUnits") or []) if safe_segment(u)]
+    if installs:
+        lines.append("systemctl daemon-reload")
+    for unit in units:
+        lines.append(f"systemctl enable {shlex.quote(unit)} || echo \"could not enable {unit}\" >&2")
+    summary = [f"{len(installs)} /etc files, {len(units)} system units to enable"]
+    if dry:
+        return summary + [f"install /etc/{p.relative_to(etc_root)}" for p, _ in installs[:8]] + \
+               ([f"... {len(installs) - 8} more"] if len(installs) > 8 else []) + \
+               [f"systemctl enable {u}" for u in units[:8]] + \
+               ([f"... {len(units) - 8} more units"] if len(units) > 8 else [])
+    stage.mkdir(parents=True, exist_ok=True)
+    script = stage / "restore-system.sh"
+    script.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.chmod(script, 0o755)
+    if not allow:
+        return summary + [
+            "system layer NOT applied: needs root, pass --allow-system to run it",
+            f"review the generated script at {script}",
+        ]
+    if run(["sudo", "-n", "true"]).returncode != 0:
+        return summary + [fail(f"no non-interactive sudo; run it yourself: sudo {script}")]
+    proc = run(["sudo", "-n", "bash", str(script)])
+    if proc.returncode == 0:
+        return summary + ["system layer applied"]
+    return summary + [fail("system layer failed: " + (proc.stderr or proc.stdout).strip()[:400])]
+
+
 def restore_category(
     cid: str,
     cat_dir: Path,
@@ -1644,6 +2125,14 @@ def restore_category(
         return restore_services(cat_dir, home, old_home, undo, dry)
     if cid == "identity":
         return restore_identity(cat_dir, dry, getattr(args, "confirm_hostname", None))
+    if cid == "scripts":
+        return restore_scripts(cat_dir, home, old_home, undo, dry)
+    if cid == "projects":
+        return restore_projects(cat_dir, home, dry)
+    if cid == "toolchains":
+        return restore_toolchains(cat_dir, home, old_home, undo, dry)
+    if cid == "system":
+        return restore_system(cat_dir, home, dry, bool(getattr(args, "allow_system", False)))
     actions = restore_file_tree(cat_dir, home, old_home, undo, dry)
     if cid == "secrets" and not dry:
         ssh = home / ".ssh"
@@ -1699,7 +2188,15 @@ def cmd_restore(args) -> int:
                     sys.stdout.write("\n")
                     return 1
         # Plugins and packages before bar/look so the layout has somewhere to land.
-        order = [cid for cid in ("packages", "themes", "plugins", "scripts", "hyprland", "look", "bar") if cid in ids]
+        order = [
+            cid
+            for cid in (
+                "packages", "toolchains", "projects", "system",
+                "hooks", "themes", "plugins", "scripts",
+                "hyprland", "wallpapers", "look", "bar",
+            )
+            if cid in ids
+        ]
         order += [cid for cid in ids if cid not in order]
         for cid in order:
             print(f"  restoring {cid}", file=sys.stderr)
@@ -1868,6 +2365,8 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("--only", default="")
     restore.add_argument("--dry-run", action="store_true")
     restore.add_argument("--confirm-hostname", default="")
+    restore.add_argument("--allow-system", action="store_true",
+                         help="apply the system layer (/etc + systemctl enable) with sudo")
     restore.add_argument("--upgrade", action="store_true",
                          help="run `omarchy update -y` before restoring anything")
     info = sub.add_parser("info")
