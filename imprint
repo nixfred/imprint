@@ -1,0 +1,422 @@
+#!/usr/bin/env bash
+# Imprint — stamp one Omarchy machine onto another.
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f $ROOT/imprint-engine.py ]]; then
+  ENGINE="$ROOT/imprint-engine.py"
+elif [[ -f $ROOT/tool/imprint-engine.py ]]; then
+  ENGINE="$ROOT/tool/imprint-engine.py"
+else
+  echo "imprint: cannot find imprint-engine.py next to $0" >&2
+  exit 1
+fi
+
+engine() {
+  python3 "$ENGINE" "$@"
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "imprint: $1 is required" >&2
+    exit 1
+  }
+}
+
+need python3
+need tar
+need zstd
+
+HAVE_GUM=0
+if command -v gum >/dev/null 2>&1; then
+  HAVE_GUM=1
+fi
+
+accent="${GUM_CHOOSE_SELECTED_FOREGROUND:-#7aa2f7}"
+muted="${GUM_CONFIRM_PROMPT_FOREGROUND:-#8E969E}"
+text="${GUM_FILTER_HEADER_FOREGROUND:-#EAECEE}"
+
+banner() {
+  local logo
+  if [[ -r /usr/share/omarchy/logo.txt ]]; then
+    logo=$(cat /usr/share/omarchy/logo.txt)
+  else
+    logo='OMARCHY'
+  fi
+  if (( HAVE_GUM )); then
+    gum style --foreground "$accent" --bold --align center --width 92 "$logo"
+    gum style --foreground "$text" --bold --align center --width 92 "IMPRINT"
+    gum style --foreground "$muted" --italic --align center --width 92 \
+      "Stamp one Omarchy onto another · space selects · enter confirms"
+    echo
+  else
+    printf '%s\n' "$logo"
+    echo "IMPRINT"
+    echo
+  fi
+}
+
+say() {
+  if (( HAVE_GUM )); then
+    gum style --foreground "$text" -- "$@"
+  else
+    printf '%s\n' "$*"
+  fi
+}
+
+warn() {
+  if (( HAVE_GUM )); then
+    gum style --foreground "#E0AF68" -- "$@"
+  else
+    printf 'warning: %s\n' "$*"
+  fi
+}
+
+die() {
+  echo "imprint: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Imprint — save an Omarchy machine to a file, restore it onto another.
+
+Usage:
+  imprint                     Interactive menu
+  imprint save                Choose categories, write an archive
+  imprint save --all -o FILE
+  imprint save --only look,bar,plugins
+  imprint restore [FILE]      Choose categories from an archive
+  imprint restore FILE --only bar,plugins --dry-run
+  imprint info FILE           Show the machine brief (AI-readable)
+  imprint diff FILE           What drifted since this imprint
+  imprint verify FILE         Check the archive
+  imprint undo                Put back files from the last restore
+  imprint list                Archives in ~/imprints
+
+Space toggles categories. Enter confirms. Identity, monitors, input,
+and secrets stay off unless you turn them on.
+EOF
+}
+
+default_selected() {
+  engine categories | python3 -c '
+import json, sys
+cats = json.load(sys.stdin)
+print(",".join(item["id"] for item in cats if item.get("default")))
+'
+}
+
+ids_from_archive_defaults() {
+  local archive=$1
+  python3 - "$ENGINE" "$archive" <<'PY'
+import json, subprocess, sys
+engine, archive = sys.argv[1], sys.argv[2]
+catalog = json.loads(subprocess.check_output(["python3", engine, "categories"], text=True))
+defaults = {c["id"] for c in catalog if c.get("default")}
+man = json.loads(subprocess.check_output(["python3", engine, "info", archive, "--json"], text=True))
+present = [cid for cid in (man.get("categories") or {}) if cid in defaults]
+print(",".join(present))
+PY
+}
+
+choose_categories() {
+  local header=$1
+  local selected=$2
+  local archive=${3:-}
+  need gum
+  local args=(
+    choose --no-limit --ordered
+    --height=18
+    --cursor="▸ "
+    --cursor-prefix="▸ "
+    --selected-prefix="◉ "
+    --unselected-prefix="○ "
+    --header="$header"
+    --label-delimiter=$'\t'
+  )
+  if [[ -n $selected ]]; then
+    args+=(--selected="$selected")
+  fi
+  local lines
+  if [[ -n $archive ]]; then
+    lines=$(python3 - "$ENGINE" "$archive" <<'PY'
+import json, subprocess, sys
+engine, archive = sys.argv[1], sys.argv[2]
+catalog = json.loads(subprocess.check_output(["python3", engine, "categories"], text=True))
+man = json.loads(subprocess.check_output(["python3", engine, "info", archive, "--json"], text=True))
+present = set((man.get("categories") or {}).keys())
+for item in catalog:
+    if item["id"] not in present:
+        continue
+    extra = ""
+    risk = item.get("risk") or "portable"
+    if risk == "host":
+        extra = "  [this machine]"
+    elif risk == "identity":
+        extra = "  [hostname]"
+    elif risk == "secrets":
+        extra = "  [keys]"
+    print(f"{item['id']}\t{item['title']} — {item['summary']}{extra}")
+PY
+)
+  else
+    lines=$(python3 - "$ENGINE" <<'PY'
+import json, subprocess, sys
+engine = sys.argv[1]
+catalog = json.loads(subprocess.check_output(["python3", engine, "categories"], text=True))
+for item in catalog:
+    extra = ""
+    risk = item.get("risk") or "portable"
+    if risk == "host":
+        extra = "  [this machine]"
+    elif risk == "identity":
+        extra = "  [hostname]"
+    elif risk == "secrets":
+        extra = "  [keys]"
+    print(f"{item['id']}\t{item['title']} — {item['summary']}{extra}")
+PY
+)
+  fi
+  [[ -n $lines ]] || die "no categories to choose"
+  local picked
+  picked=$(printf '%s\n' "$lines" | gum "${args[@]}") || return 1
+  printf '%s\n' "$picked" | paste -sd, -
+}
+
+pick_archive() {
+  local start=${1:-$HOME/imprints}
+  mkdir -p "$start"
+  if (( HAVE_GUM )); then
+    gum file --directory=false --height=16 --header="Choose an imprint archive" "$start"
+  else
+    ls -1 "$start"/imprint-*.tar.zst 2>/dev/null | tail -n 1
+  fi
+}
+
+confirm() {
+  local prompt=$1
+  if (( HAVE_GUM )); then
+    gum confirm "$prompt"
+  else
+    printf '%s [y/N] ' "$prompt"
+    read -r ans
+    [[ $ans == y || $ans == Y ]]
+  fi
+}
+
+do_save() {
+  local only=${1:-}
+  local output=${2:-}
+  local all=${3:-0}
+  banner
+  if [[ -z $only && $all -eq 0 ]]; then
+    only=$(choose_categories "What should this imprint carry?" "$(default_selected)") \
+      || die "cancelled"
+  fi
+  if [[ -z $output ]]; then
+    local host
+    host=$(hostname)
+    mkdir -p "$HOME/imprints"
+    output="$HOME/imprints/imprint-${host}-$(date +%Y%m%d-%H%M).tar.zst"
+    if (( HAVE_GUM )); then
+      output=$(gum input --header="Write archive to" --value="$output")
+    fi
+  fi
+  [[ -n $output ]] || die "no output path"
+  say "Saving $( [[ $all -eq 1 ]] && echo all categories || echo "$only" )"
+  say "→ $output"
+  if (( HAVE_GUM )); then
+    if [[ $all -eq 1 ]]; then
+      gum spin --spinner dot --title "Collecting this machine…" -- \
+        python3 "$ENGINE" save --all -o "$output"
+    else
+      gum spin --spinner dot --title "Collecting this machine…" -- \
+        python3 "$ENGINE" save --only "$only" -o "$output"
+    fi
+  else
+    if [[ $all -eq 1 ]]; then
+      engine save --all -o "$output"
+    else
+      engine save --only "$only" -o "$output"
+    fi
+  fi
+  say "Wrote $output"
+  if command -v du >/dev/null; then
+    say "Size $(du -h "$output" | awk '{print $1}')"
+  fi
+}
+
+do_restore() {
+  local archive=${1:-}
+  local only=${2:-}
+  local dry=${3:-0}
+  banner
+  if [[ -z $archive ]]; then
+    archive=$(pick_archive) || die "cancelled"
+  fi
+  [[ -n $archive && -e $archive ]] || die "archive not found: $archive"
+  say "Archive $archive"
+  engine verify "$archive" >/dev/null || die "archive failed verify"
+  if (( HAVE_GUM )); then
+    engine info "$archive" | gum pager --timeout=0s || true
+  else
+    engine info "$archive"
+  fi
+  if [[ -z $only ]]; then
+    only=$(choose_categories "What should land on this machine?" "$(ids_from_archive_defaults "$archive")" "$archive") \
+      || die "cancelled"
+  fi
+  if printf '%s' "$only" | grep -q 'identity'; then
+    warn "Identity will rename this host. Restore still needs --confirm-hostname."
+  fi
+  if printf '%s' "$only" | grep -q 'secrets'; then
+    warn "Secrets copies SSH public keys and config, not private keys."
+  fi
+  local extra=()
+  (( dry == 1 )) && extra+=(--dry-run)
+  if [[ $dry -eq 0 ]]; then
+    confirm "Restore selected categories onto this machine?" || die "cancelled"
+  fi
+  say "Restoring $only"
+  if (( HAVE_GUM )) && [[ $dry -eq 0 ]]; then
+    gum spin --spinner dot --title "Applying imprint…" -- \
+      python3 "$ENGINE" restore "$archive" --only "$only" "${extra[@]}"
+  else
+    engine restore "$archive" --only "$only" "${extra[@]}"
+  fi
+}
+
+do_list() {
+  mkdir -p "$HOME/imprints"
+  banner
+  local files
+  files=$(ls -1t "$HOME/imprints"/imprint-*.tar.zst 2>/dev/null || true)
+  if [[ -z $files ]]; then
+    say "No archives in ~/imprints yet. Run imprint save."
+    return 0
+  fi
+  if (( HAVE_GUM )); then
+    printf '%s\n' "$files" | while read -r f; do
+      printf '%s  %s\n' "$(du -h "$f" | awk '{print $1}')" "$f"
+    done | gum style --foreground "$text" --border rounded --padding "1 2" --border-foreground "$accent"
+  else
+    ls -lh "$HOME/imprints"/imprint-*.tar.zst
+  fi
+}
+
+main_menu() {
+  banner
+  need gum
+  local choice
+  choice=$(gum choose --header="What do you want to do?" \
+    --cursor="▸ " --height=10 \
+    "Save this machine" \
+    "Restore onto this machine" \
+    "Inspect an imprint" \
+    "Diff against this machine" \
+    "Undo last restore" \
+    "List archives" \
+    "Quit") || exit 0
+  case $choice in
+    "Save this machine") do_save ;;
+    "Restore onto this machine") do_restore ;;
+    "Inspect an imprint")
+      local f
+      f=$(pick_archive) || exit 0
+      engine info "$f" | gum pager --timeout=0s
+      ;;
+    "Diff against this machine")
+      local f
+      f=$(pick_archive) || exit 0
+      engine diff "$f" | gum pager --timeout=0s
+      ;;
+    "Undo last restore")
+      confirm "Put back files from the last restore?" || exit 0
+      engine undo
+      ;;
+    "List archives") do_list ;;
+    "Quit") exit 0 ;;
+  esac
+}
+
+cmd=${1:-}
+shift || true
+
+case $cmd in
+  "" ) main_menu ;;
+  -h|--help|help) usage ;;
+  save)
+    only=""
+    output=""
+    all=0
+    while [[ $# -gt 0 ]]; do
+      case $1 in
+        --only) only=$2; shift 2 ;;
+        --all) all=1; shift ;;
+        -o|--output) output=$2; shift 2 ;;
+        --yes) shift ;;
+        *) die "unknown save flag: $1" ;;
+      esac
+    done
+    if [[ -n $only || $all -eq 1 || $HAVE_GUM -eq 0 ]]; then
+      [[ $all -eq 1 ]] || [[ -n $only ]] || only=$(default_selected)
+      args=(save)
+      [[ $all -eq 1 ]] && args+=(--all)
+      [[ -n $only && $all -eq 0 ]] && args+=(--only "$only")
+      [[ -n $output ]] && args+=(-o "$output")
+      engine "${args[@]}"
+    else
+      do_save "$only" "$output" "$all"
+    fi
+    ;;
+  restore)
+    archive=""
+    only=""
+    dry=0
+    confirm_host=""
+    while [[ $# -gt 0 ]]; do
+      case $1 in
+        --only) only=$2; shift 2 ;;
+        --dry-run) dry=1; shift ;;
+        --confirm-hostname) confirm_host=$2; shift 2 ;;
+        --yes) shift ;;
+        -*) die "unknown restore flag: $1" ;;
+        *) archive=$1; shift ;;
+      esac
+    done
+    extra=()
+    [[ $dry -eq 1 ]] && extra+=(--dry-run)
+    [[ -n $confirm_host ]] && extra+=(--confirm-hostname "$confirm_host")
+    if [[ -n $only && -n $archive ]]; then
+      engine restore "$archive" --only "$only" "${extra[@]}"
+    else
+      do_restore "$archive" "$only" "$dry"
+    fi
+    ;;
+  info|brief)
+    [[ $# -ge 1 ]] || die "usage: imprint info FILE"
+    engine info "$@"
+    ;;
+  diff)
+    [[ $# -ge 1 ]] || die "usage: imprint diff FILE"
+    engine diff "$1"
+    ;;
+  verify)
+    [[ $# -ge 1 ]] || die "usage: imprint verify FILE"
+    engine verify "$1"
+    ;;
+  undo)
+    engine undo "$@"
+    ;;
+  list)
+    do_list
+    ;;
+  categories)
+    engine categories
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
