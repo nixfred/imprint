@@ -95,6 +95,7 @@ Usage:
   imprint save --only look,bar,plugins
   imprint restore [FILE]      Choose categories from an archive
   imprint restore FILE --only bar,plugins --dry-run
+  imprint restore FILE --upgrade      Run `omarchy update -y` first, then restore
   imprint info FILE           Show the machine brief (AI-readable)
   imprint diff FILE           What drifted since this imprint
   imprint verify FILE         Check the archive
@@ -248,6 +249,8 @@ do_restore() {
   local archive=${1:-}
   local only=${2:-}
   local dry=${3:-0}
+  local confirm_host=${4:-}
+  local upgrade=${5:-0}
   banner
   if [[ -z $archive ]]; then
     archive=$(pick_archive) || die "cancelled"
@@ -272,6 +275,9 @@ do_restore() {
   fi
   local extra=()
   (( dry == 1 )) && extra+=(--dry-run)
+  (( upgrade == 1 )) && extra+=(--upgrade)
+  # These were parsed and then thrown away on the interactive path.
+  [[ -n $confirm_host ]] && extra+=(--confirm-hostname "$confirm_host")
   if [[ $dry -eq 0 ]]; then
     confirm "Restore selected categories onto this machine?" || die "cancelled"
   fi
@@ -371,11 +377,13 @@ case $cmd in
     archive=""
     only=""
     dry=0
+    upgrade=0
     confirm_host=""
     while [[ $# -gt 0 ]]; do
       case $1 in
         --only) [[ $# -ge 2 ]] || die "--only needs a value"; only=$2; shift 2 ;;
         --dry-run) dry=1; shift ;;
+        --upgrade) upgrade=1; shift ;;
         --confirm-hostname) [[ $# -ge 2 ]] || die "--confirm-hostname needs a value"; confirm_host=$2; shift 2 ;;
         --yes) shift ;;
         -*) die "unknown restore flag: $1" ;;
@@ -384,11 +392,12 @@ case $cmd in
     done
     extra=()
     [[ $dry -eq 1 ]] && extra+=(--dry-run)
+    [[ $upgrade -eq 1 ]] && extra+=(--upgrade)
     [[ -n $confirm_host ]] && extra+=(--confirm-hostname "$confirm_host")
     if [[ -n $only && -n $archive ]]; then
       engine restore "$archive" --only "$only" "${extra[@]}"
     else
-      do_restore "$archive" "$only" "$dry"
+      do_restore "$archive" "$only" "$dry" "$confirm_host" "$upgrade"
     fi
     ;;
   info|brief)

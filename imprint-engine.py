@@ -318,6 +318,31 @@ def git_dirty(path: Path) -> bool:
     return bool(run_ok(["git", "-C", str(path), "status", "--porcelain"]).strip())
 
 
+def git_changed_files(path: Path) -> list[str]:
+    """Tracked modifications plus untracked authored files, relative to the repo.
+
+    Upstream has no copy of these, so a from-source reinstall would silently
+    discard them. Deletions are not represented; re-adding a file upstream
+    still has is the safe direction.
+    """
+    if not (path / ".git").exists():
+        return []
+    out = run_ok(["git", "-C", str(path), "status", "--porcelain", "-z", "--untracked-files=all"])
+    names: list[str] = []
+    for entry in out.split("\0"):
+        if len(entry) < 4:
+            continue
+        code, name = entry[:2], entry[3:]
+        if code[0] == "D" or code[1] == "D":
+            continue
+        if is_skipped_name(Path(name).name):
+            continue
+        if any(is_skipped_name(part) for part in Path(name).parts):
+            continue
+        names.append(name)
+    return names
+
+
 def omarchy_version() -> str:
     text = run_ok(["omarchy", "version"]).strip()
     return text.splitlines()[0] if text else "unknown"
@@ -391,9 +416,51 @@ def extra_packages() -> dict:
 
 
 def rewrite_text(text: str, old_home: str, new_home: str) -> str:
+    """Replace the old home path only at a path boundary.
+
+    A plain substring swap turned /home/pip/shared into /home/alicep/shared
+    when migrating /home/pi -> /home/alice.
+    """
     if not old_home or old_home == new_home:
         return text
-    return text.replace(old_home, new_home)
+    pattern = re.escape(old_home) + r"(?=$|[^A-Za-z0-9_.-])"
+    return re.sub(pattern, new_home.replace("\\", "\\\\"), text)
+
+
+FAILURES: list[str] = []
+
+
+def fail(message: str) -> str:
+    """Record a real failure and return it for the action log.
+
+    Restore used to fold every failed command into a string and still report
+    ok:true with exit 0, so an unattended restore looked clean while packages,
+    services and the bar config had all refused.
+    """
+    FAILURES.append(message)
+    return message
+
+
+class UnsafePath(Exception):
+    """An archive asked to touch a path outside where its category may write."""
+
+
+def safe_segment(name: str) -> bool:
+    """A single path component with no separators and no traversal."""
+    if not name or name in {".", ".."}:
+        return False
+    if "/" in name or "\\" in name or "\0" in name:
+        return False
+    return True
+
+
+def contained(base: Path, candidate: Path) -> Path:
+    """Resolve candidate and refuse anything that escapes base."""
+    base_r = base.resolve()
+    cand_r = candidate.resolve()
+    if cand_r != base_r and base_r not in cand_r.parents:
+        raise UnsafePath(f"{candidate} escapes {base}")
+    return cand_r
 
 
 def copy_file(src: Path, dest: Path) -> None:
@@ -452,7 +519,10 @@ def iter_files(root: Path):
         for name in filenames:
             if is_skipped_name(name):
                 continue
-            yield Path(dirpath) / name
+            candidate = Path(dirpath) / name
+            if not packable_symlink(candidate):
+                continue
+            yield candidate
 
 
 def rel_under_home(path: Path, home: Path) -> str:
@@ -472,8 +542,20 @@ def stage_path(cat_dir: Path, rel: str) -> Path:
     return cat_dir / "files" / rel
 
 
+def packable_symlink(src: Path) -> bool:
+    """tarfile's `data` extraction filter rejects absolute link targets, so an
+    archive containing one cannot be extracted at all. Refuse to pack those."""
+    if not src.is_symlink():
+        return True
+    if src.exists():
+        return True  # dereferenced into a regular file
+    return not os.readlink(src).startswith("/")
+
+
 def copy_into_category(cat_dir: Path, src: Path, home: Path) -> str | None:
     if not src.exists() and not src.is_symlink():
+        return None
+    if not packable_symlink(src):
         return None
     rel = rel_under_home(src, home)
     dest = stage_path(cat_dir, rel)
@@ -678,8 +760,26 @@ def collect_plugins(cat_dir: Path, home: Path) -> dict:
             # from source at restore. Only trees with no upstream get packed,
             # because nothing else could bring them back.
             if info["kind"] == "git" and info["url"]:
+                # ...except uncommitted local work, which upstream does not have.
+                # Pack just the changed files as an overlay, not the whole tree.
+                changed = git_changed_files(real)
+                if changed:
+                    overlay_rel = Path("overlays") / info["id"]
+                    dest_root = cat_dir / overlay_rel
+                    copied = 0
+                    for inner in changed:
+                        src = real / inner
+                        if not src.is_file():
+                            continue
+                        copy_file(src, dest_root / inner)
+                        copied += 1
+                    info["overlay"] = str(overlay_rel)
+                    info["overlayFiles"] = sorted(changed)
+                    info["files"] = copied
+                else:
+                    info["overlay"] = ""
+                    info["files"] = 0
                 info["tree"] = ""
-                info["files"] = 0
                 info["packed"] = False
                 records.append(info)
                 continue
@@ -1206,7 +1306,18 @@ def backup_existing(src: Path, undo: Path, home: Path) -> None:
     rel = rel_under_home(src, home)
     dest = undo / rel
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if src.is_dir() and not src.is_symlink():
+    if src.is_symlink():
+        # A symlink -- to a directory or a missing target -- must be recorded as
+        # a link. copy2(follow_symlinks=True) on a directory symlink raises
+        # IsADirectoryError, which aborted restore partway through.
+        if dest.exists() or dest.is_symlink():
+            if dest.is_dir() and not dest.is_symlink():
+                shutil.rmtree(dest)
+            else:
+                dest.unlink()
+        dest.symlink_to(os.readlink(src))
+        return
+    if src.is_dir():
         shutil.copytree(src, dest, dirs_exist_ok=True, symlinks=True)
     else:
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -1221,6 +1332,11 @@ def restore_file_tree(cat_dir: Path, home: Path, old_home: str, undo: Path, dry:
     for path in iter_files(files_root):
         rel = path.relative_to(files_root)
         dest = home / rel
+        try:
+            contained(home, dest.parent)
+        except UnsafePath:
+            done.append(f"refused {rel} (escapes home)")
+            continue
         if dry:
             done.append(str(rel))
             continue
@@ -1243,9 +1359,27 @@ def restore_plugins(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: b
         pid = plug.get("id")
         if not pid:
             continue
+        # An archive is untrusted input: an id like "../../../Documents" would
+        # otherwise be rmtree'd and replaced.
+        if not safe_segment(pid):
+            actions.append(f"refused unsafe plugin id {pid!r}")
+            continue
         target = plugins_root / pid
         if dry:
-            actions.append(f"plugin {pid} ({plug.get('kind')})")
+            # Say exactly what apply would run, not just the category name.
+            if plug.get("kind") == "git" and plug.get("url"):
+                enable = " --enable" if plug.get("enabled") else ""
+                actions.append(f"omarchy plugin add {plug['url']} --yes{enable}")
+                n = len(plug.get("overlayFiles") or [])
+                if n:
+                    actions.append(f"  then reapply {n} local edits to {pid}: "
+                                   + ", ".join((plug.get("overlayFiles") or [])[:4]))
+            elif plug.get("tree"):
+                actions.append(f"replace tree {pid} ({plug.get('files', 0)} packed files)")
+            elif plug.get("clonedFrom"):
+                actions.append(f"omarchy plugin clone {plug['clonedFrom']}")
+            else:
+                actions.append(f"plugin {pid} ({plug.get('kind')}) - nothing to install")
             continue
         if target.exists() or target.is_symlink():
             backup_existing(target, undo, home)
@@ -1255,14 +1389,30 @@ def restore_plugins(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: b
                 cmd.append("--enable")
             proc = run(cmd)
             if proc.returncode != 0 and "already" not in (proc.stdout + proc.stderr).lower():
-                actions.append(f"plugin add failed {pid}: {(proc.stderr or proc.stdout).strip()[:200]}")
+                actions.append(fail(f"plugin add failed {pid}: {(proc.stderr or proc.stdout).strip()[:200]}"))
             else:
                 actions.append(f"plugin add {pid} from source")
+            rel_overlay = plug.get("overlay") or ""
+            if rel_overlay:
+                try:
+                    overlay = contained(cat_dir, cat_dir / rel_overlay)
+                except UnsafePath:
+                    actions.append(f"refused unsafe overlay {rel_overlay!r} for {pid}")
+                    continue
+                if overlay.is_dir():
+                    overlay_tree(overlay, target, old_home, home)
+                    actions.append(f"reapplied {len(plug.get('overlayFiles') or [])} local edits to {pid}")
         else:
             # A bare cat_dir is a directory too, so an empty tree must not
             # overlay the whole category onto the plugin path.
             rel_tree = plug.get("tree") or ""
-            tree = (cat_dir / rel_tree) if rel_tree else None
+            tree = None
+            if rel_tree:
+                try:
+                    tree = contained(cat_dir, cat_dir / rel_tree)
+                except UnsafePath:
+                    actions.append(f"refused unsafe plugin tree {rel_tree!r} for {pid}")
+                    continue
             if tree is not None and tree.is_dir():
                 if target.exists() or target.is_symlink():
                     if target.is_dir() and not target.is_symlink():
@@ -1303,14 +1453,16 @@ def restore_packages(cat_dir: Path, dry: bool) -> list[str]:
         return actions
     if repo:
         proc = run(["omarchy", "pkg", "add", *repo])
-        actions.append("pkg add " + ("ok" if proc.returncode == 0 else "failed"))
-        if proc.returncode != 0:
-            actions.append((proc.stderr or proc.stdout).strip()[:400])
+        if proc.returncode == 0:
+            actions.append("pkg add ok")
+        else:
+            actions.append(fail("pkg add failed: " + (proc.stderr or proc.stdout).strip()[:400]))
     if aur:
         proc = run(["omarchy", "pkg", "aur", "add", *aur])
-        actions.append("pkg aur add " + ("ok" if proc.returncode == 0 else "failed"))
-        if proc.returncode != 0:
-            actions.append((proc.stderr or proc.stdout).strip()[:400])
+        if proc.returncode == 0:
+            actions.append("pkg aur add ok")
+        else:
+            actions.append(fail("pkg aur add failed: " + (proc.stderr or proc.stdout).strip()[:400]))
     return actions
 
 
@@ -1324,11 +1476,19 @@ def restore_themes(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bo
                 if dry:
                     actions.append(f"theme install {theme['url']}")
                 else:
+                    tid = theme.get("id") or ""
+                    # omarchy-theme-install rm -rf's the destination BEFORE it
+                    # clones, so an offline install destroys the existing theme
+                    # with nothing to put back. Take an undo copy first.
+                    if safe_segment(tid):
+                        existing = home / ".config/omarchy/themes" / tid
+                        if existing.exists() or existing.is_symlink():
+                            backup_existing(existing, undo, home)
                     proc = run(["omarchy", "theme", "install", theme["url"]])
-                    actions.append(
-                        f"theme install {theme['id']} "
-                        + ("ok" if proc.returncode == 0 or "already" in (proc.stdout + proc.stderr).lower() else "failed")
-                    )
+                    if proc.returncode == 0 or "already" in (proc.stdout + proc.stderr).lower():
+                        actions.append(f"theme install {tid} ok")
+                    else:
+                        actions.append(fail(f"theme install {tid} failed: " + (proc.stderr or proc.stdout).strip()[:200]))
     actions.extend(restore_file_tree(cat_dir, home, old_home, undo, dry))
     return actions
 
@@ -1350,11 +1510,15 @@ def restore_look(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool
         return actions
     if theme:
         proc = run(["omarchy", "theme", "set", theme])
-        actions.append("theme set " + ("ok" if proc.returncode == 0 else theme + " missing"))
+        actions.append("theme set ok" if proc.returncode == 0 else fail(f"theme set {theme} failed (missing?)"))
     if font:
         proc = run(["omarchy", "font", "set", font])
-        actions.append("font set " + ("ok" if proc.returncode == 0 else font + " missing"))
+        actions.append("font set ok" if proc.returncode == 0 else fail(f"font set {font} failed (missing?)"))
     return actions
+
+
+def shell_is_running() -> bool:
+    return run(["omarchy", "shell", "-q", "shell", "ping"]).returncode == 0
 
 
 def restore_bar(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool) -> list[str]:
@@ -1398,8 +1562,13 @@ def restore_bar(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool)
             if apply.returncode == 0:
                 return ["shell.json via config-edit"]
             detail = (apply.stderr or apply.stdout).strip()[:200]
-            return [f"shell.json NOT applied, config-edit refused: {detail}"]
-        # Shell is not running, so there is no live state to lose.
+            return [fail(f"shell.json NOT applied, config-edit refused: {detail}")]
+        # A failed snapshot is not proof the shell is stopped -- it could be an
+        # IPC error or a timeout. Only write directly when the shell really is
+        # down, otherwise refuse and say so.
+        if shell_is_running():
+            detail = (snap_proc.stderr or snap_proc.stdout).strip()[:200]
+            return [fail(f"shell.json NOT applied: shell is up but snapshot failed: {detail}")]
         if dest.exists():
             backup_existing(dest, undo, home)
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -1426,7 +1595,10 @@ def restore_services(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: 
             continue
         if unit.get("enabled"):
             proc = run(["systemctl", "--user", "enable", "--now", name])
-            actions.append(f"enable {name} " + ("ok" if proc.returncode == 0 else "failed"))
+            if proc.returncode == 0:
+                actions.append(f"enable {name} ok")
+            else:
+                actions.append(fail(f"enable {name} failed: " + (proc.stderr or proc.stdout).strip()[:200]))
     return actions
 
 
@@ -1443,7 +1615,9 @@ def restore_identity(cat_dir: Path, dry: bool, confirm_host: str | None) -> list
     if confirm_host != wanted:
         return [f"skipped hostname {wanted} (pass --confirm-hostname {wanted})"]
     proc = run(["hostnamectl", "set-hostname", wanted])
-    return ["hostname " + ("ok" if proc.returncode == 0 else "failed")]
+    if proc.returncode == 0:
+        return ["hostname ok"]
+    return [fail("hostname failed: " + (proc.stderr or proc.stdout).strip()[:200])]
 
 
 def restore_category(
@@ -1503,7 +1677,27 @@ def cmd_restore(args) -> int:
         if not dry:
             undo.mkdir(parents=True, exist_ok=False)
             write_json(undo / "source.json", {"archive": str(archive), "manifest": manifest, "categories": ids})
+        FAILURES.clear()
         report = {"ok": True, "dryRun": dry, "categories": {}, "undo": None if dry else str(undo)}
+        if getattr(args, "upgrade", False):
+            if dry:
+                report["upgrade"] = "omarchy update -y"
+            else:
+                print("  upgrading the machine first", file=sys.stderr)
+                proc = run(["omarchy", "update", "-y"])
+                if proc.returncode == 0:
+                    report["upgrade"] = "omarchy update ok"
+                else:
+                    # Arch does not support partial upgrades; installing on top
+                    # of a failed update is how you get a broken machine.
+                    report["upgrade"] = fail(
+                        "omarchy update failed: " + (proc.stderr or proc.stdout).strip()[:300]
+                    )
+                    report["ok"] = False
+                    report["categories"] = {}
+                    json.dump(report, sys.stdout, indent=2)
+                    sys.stdout.write("\n")
+                    return 1
         # Plugins and packages before bar/look so the layout has somewhere to land.
         order = [cid for cid in ("packages", "themes", "plugins", "scripts", "hyprland", "look", "bar") if cid in ids]
         order += [cid for cid in ids if cid not in order]
@@ -1521,11 +1715,21 @@ def cmd_restore(args) -> int:
             )
             report["categories"][cid] = actions
         if not dry:
-            run(["hyprctl", "reload"])
-            run(["omarchy", "restart", "shell"])
+            reload_proc = run(["hyprctl", "reload"])
+            if reload_proc.returncode != 0:
+                report["categories"].setdefault("_final", []).append(
+                    fail("hyprctl reload failed: " + (reload_proc.stderr or reload_proc.stdout).strip()[:200])
+                )
+            shell_proc = run(["omarchy", "restart", "shell"])
+            if shell_proc.returncode != 0:
+                report["categories"].setdefault("_final", []).append(
+                    fail("omarchy restart shell failed: " + (shell_proc.stderr or shell_proc.stdout).strip()[:200])
+                )
+        report["ok"] = not FAILURES
+        report["failures"] = list(FAILURES)
         json.dump(report, sys.stdout, indent=2)
         sys.stdout.write("\n")
-    return 0
+    return 0 if not FAILURES else 1
 
 
 def cmd_info(args) -> int:
@@ -1555,10 +1759,26 @@ def cmd_verify(args) -> int:
         root = open_imprint(archive, Path(tmp) / "open")
         manifest = load_manifest(root)
         missing = []
+        problems = []
+        schema = manifest.get("schema")
+        if not isinstance(schema, int) or schema > SCHEMA:
+            problems.append(f"unsupported schema {schema!r} (this build understands {SCHEMA})")
+        if not manifest.get("hostname"):
+            problems.append("manifest has no hostname")
         for cid in manifest.get("categories") or {}:
-            if not (root / "categories" / cid).exists():
+            cat_dir = root / "categories" / cid
+            if not cat_dir.exists():
                 missing.append(cid)
-        result = {"ok": not missing, "schema": manifest.get("schema"), "missing": missing, "hostname": manifest.get("hostname")}
+                continue
+            if not any(cat_dir.iterdir()):
+                problems.append(f"category {cid} is present but empty")
+        result = {
+            "ok": not missing and not problems,
+            "schema": schema,
+            "missing": missing,
+            "problems": problems,
+            "hostname": manifest.get("hostname"),
+        }
         json.dump(result, sys.stdout, indent=2)
         sys.stdout.write("\n")
         return 0 if result["ok"] else 1
@@ -1648,6 +1868,8 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("--only", default="")
     restore.add_argument("--dry-run", action="store_true")
     restore.add_argument("--confirm-hostname", default="")
+    restore.add_argument("--upgrade", action="store_true",
+                         help="run `omarchy update -y` before restoring anything")
     info = sub.add_parser("info")
     info.add_argument("archive")
     info.add_argument("--json", action="store_true")
