@@ -496,5 +496,111 @@ class EnabledStateTests(unittest.TestCase):
         self.assertTrue(any("enabled a.widget at left[2]" in a for a in actions), actions)
 
 
+class DisableAndUnitTests(unittest.TestCase):
+    def test_plugin_units_are_discovered_from_execstart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            units = home / ".config/systemd/user"; units.mkdir(parents=True)
+            (units / "net-pulse.service").write_text(
+                "[Service]\nExecStart=/usr/bin/python3 %h/.config/omarchy/plugins/"
+                "nixfred.net-pulse/net_pulse.py daemon\n", encoding="utf-8")
+            (units / "unrelated.service").write_text(
+                "[Service]\nExecStart=/usr/bin/true\n", encoding="utf-8")
+            found = engine.plugin_units(home)
+            self.assertEqual(found, {"nixfred.net-pulse": ["net-pulse.service"]})
+
+    def test_missing_backing_unit_is_a_failure_naming_the_category(self):
+        import types
+        real_run, real_list = engine.run, engine.plugin_list
+        engine.plugin_list = lambda: []
+        def fake(cmd, **kw):
+            if cmd[:3] == ["systemctl", "--user", "cat"]:
+                return types.SimpleNamespace(returncode=1, stdout="", stderr="No files found")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        engine.run = fake
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                t = Path(tmp); cat = t / "cat"; cat.mkdir()
+                home = t / "home"; (home / ".config/omarchy/plugins").mkdir(parents=True)
+                (cat / "meta.json").write_text(json.dumps({"plugins": [
+                    {"id": "n.pulse", "kind": "git", "url": "https://x/n.git",
+                     "enabled": False, "units": ["net-pulse.service"]}]}), encoding="utf-8")
+                undo = t / "undo"; undo.mkdir()
+                engine.FAILURES.clear()
+                actions = engine.restore_plugins(cat, home, "", undo, False)
+                self.assertTrue(any("needs user unit net-pulse.service" in a for a in actions), actions)
+                self.assertTrue(any("not in this archive" in f for f in engine.FAILURES), engine.FAILURES)
+        finally:
+            engine.run, engine.plugin_list = real_run, real_list
+            engine.FAILURES.clear()
+
+    def test_ids_disabled_on_the_source_get_disabled_on_the_target(self):
+        import types
+        calls = []
+        real_run, real_list = engine.run, engine.plugin_list
+        state = {"pi.workspaces": True, "vic.only": True}
+        def fake_list():
+            return [{"id": k, "enabled": v} for k, v in state.items()]
+        def fake(cmd, **kw):
+            calls.append(cmd)
+            if cmd[:3] == ["omarchy", "plugin", "disable"]:
+                state[cmd[3]] = False
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        engine.plugin_list, engine.run = fake_list, fake
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                t = Path(tmp); cat = t / "cat"; cat.mkdir()
+                home = t / "home"; (home / ".config/omarchy/plugins").mkdir(parents=True)
+                (cat / "meta.json").write_text(json.dumps({
+                    "plugins": [], "disabledIds": ["pi.workspaces"]}), encoding="utf-8")
+                undo = t / "undo"; undo.mkdir()
+                engine.FAILURES.clear()
+                actions = engine.restore_plugins(cat, home, "", undo, False)
+        finally:
+            engine.plugin_list, engine.run = real_list, real_run
+            engine.FAILURES.clear()
+        disables = [c[3] for c in calls if c[:3] == ["omarchy", "plugin", "disable"]]
+        self.assertEqual(disables, ["pi.workspaces"])
+        # A plugin the source never knew about must be left alone.
+        self.assertNotIn("vic.only", disables)
+        self.assertTrue(any("disabled pi.workspaces" in a for a in actions), actions)
+
+
+class PackedUnitTests(unittest.TestCase):
+    def test_a_packed_unit_is_installed_rather_than_only_reported(self):
+        import types
+        calls = []
+        real_run, real_list = engine.run, engine.plugin_list
+        engine.plugin_list = lambda: []
+        def fake(cmd, **kw):
+            calls.append(cmd)
+            if cmd[:3] == ["systemctl", "--user", "cat"]:
+                return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        engine.run = fake
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                t = Path(tmp); cat = t / "cat"; (cat / "units").mkdir(parents=True)
+                (cat / "units/net-pulse.service").write_text(
+                    "[Service]\nExecStart=/usr/bin/python3 /home/old/x.py daemon\n", encoding="utf-8")
+                home = t / "home"; (home / ".config/omarchy/plugins").mkdir(parents=True)
+                (cat / "meta.json").write_text(json.dumps({"plugins": [
+                    {"id": "n.pulse", "kind": "local", "enabled": False,
+                     "units": ["net-pulse.service"]}]}), encoding="utf-8")
+                undo = t / "undo"; undo.mkdir()
+                engine.FAILURES.clear()
+                actions = engine.restore_plugins(cat, home, "/home/old", undo, False)
+                dest = home / ".config/systemd/user/net-pulse.service"
+                self.assertTrue(dest.is_file(), actions)
+                # the home path inside the unit is rewritten for this machine
+                self.assertIn(str(home), dest.read_text(encoding="utf-8"))
+                self.assertEqual(engine.FAILURES, [])
+                self.assertTrue(any("installed and enabled net-pulse.service" in a for a in actions), actions)
+        finally:
+            engine.run, engine.plugin_list = real_run, real_list
+            engine.FAILURES.clear()
+        self.assertIn(["systemctl", "--user", "enable", "--now", "net-pulse.service"], calls)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -809,11 +809,38 @@ def shell_plugin_state(home: Path) -> tuple[dict, set, set, bool]:
     return placement, referenced, disabled, True
 
 
+def plugin_units(home: Path) -> dict:
+    """Map plugin id -> user units that run code from that plugin's directory.
+
+    A widget can be backed by a systemd --user daemon. Restoring the plugin
+    without its unit leaves a widget with nothing feeding it.
+    """
+    units: dict[str, list[str]] = {}
+    root = home / ".config/systemd/user"
+    if not root.is_dir():
+        return units
+    for unit in sorted(root.glob("*.service")):
+        text = read_text(unit)
+        if "omarchy/plugins" not in text:
+            continue
+        for line in text.splitlines():
+            if "omarchy/plugins/" not in line:
+                continue
+            tail = line.split("omarchy/plugins/", 1)[1]
+            pid = tail.split("/", 1)[0].strip().strip('"').strip("'")
+            if pid:
+                units.setdefault(pid, [])
+                if unit.name not in units[pid]:
+                    units[pid].append(unit.name)
+    return units
+
+
 def collect_plugins(cat_dir: Path, home: Path) -> dict:
     plugins_root = home / ".config/omarchy/plugins"
     listing = {item.get("id"): item for item in plugin_list() if item.get("id")}
     placement, referenced, disabled, have_shell = shell_plugin_state(home)
     live = bool(listing)
+    unit_map = plugin_units(home)
     records = []
     if plugins_root.is_dir():
         for plugin_dir in sorted(plugins_root.iterdir()):
@@ -837,6 +864,14 @@ def collect_plugins(cat_dir: Path, home: Path) -> dict:
                 else:
                     info["enabled"] = key in referenced or pid_name in referenced
             info["placement"] = placement.get(info["id"]) or placement.get(pid_name) or {}
+            info["units"] = unit_map.get(info["id"]) or unit_map.get(pid_name) or []
+            # Carry the unit itself. Restoring the whole `services` category to
+            # get one daemon would also drag over machine-specific units that
+            # must not run on another box.
+            for unit_name in info["units"]:
+                src = home / ".config/systemd/user" / unit_name
+                if src.is_file():
+                    copy_file(src, cat_dir / "units" / unit_name)
             real = Path(info["source"])
             # Recipe, not payload: anything with a git remote is re-installed
             # from source at restore. Only trees with no upstream get packed,
@@ -886,6 +921,10 @@ def collect_plugins(cat_dir: Path, home: Path) -> dict:
         "packed": sorted(p["id"] for p in records if p.get("packed")),
         "enabled": sorted(p["id"] for p in records if p.get("enabled")),
         "enabledSource": "plugin list" if live else ("shell.json" if have_shell else "unknown"),
+        # Every id the source shell reports as OFF, built-ins included. Without
+        # this the target keeps its own copy of a widget the source turned off,
+        # which is how vic ended up with two workspace indicators.
+        "disabledIds": sorted(i for i, item in listing.items() if not item.get("enabled")) if live else [],
     }
     if not live and not have_shell:
         print("  WARNING: could not determine which plugins are enabled", file=sys.stderr)
@@ -1841,6 +1880,66 @@ def restore_plugins(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: b
             actions.append(f"enabled {pid}" + (f" at {place['section']}[{place['index']}]" if place else ""))
         else:
             actions.append(fail(f"could not enable {pid}: " + (proc.stderr or proc.stdout).strip()[:200]))
+
+    # Turn OFF what the source had off. Only ids the source shell actually
+    # reported are touched, so plugins unique to this machine are left alone.
+    # Disabling a clone hands the bar slot back to its built-in source, so this
+    # settles over a couple of rounds rather than one.
+    want_off = set(meta.get("disabledIds") or [])
+    if want_off and not dry:
+        for _round in range(3):
+            current = {item.get("id"): item for item in plugin_list() if item.get("id")}
+            turn_off = [i for i in sorted(want_off) if current.get(i, {}).get("enabled")]
+            if not turn_off:
+                break
+            for pid in turn_off:
+                if not safe_segment(pid):
+                    continue
+                proc = run(["omarchy", "plugin", "disable", pid])
+                if proc.returncode == 0:
+                    actions.append(f"disabled {pid} (off on the source machine)")
+                else:
+                    actions.append(fail(f"could not disable {pid}: "
+                                        + (proc.stderr or proc.stdout).strip()[:200]))
+    elif want_off and dry:
+        actions.append(f"would disable up to {len(want_off)} ids the source has off")
+
+    # A widget backed by a user daemon is dead without its unit.
+    for plug in meta.get("plugins") or []:
+        for unit in plug.get("units") or []:
+            if not safe_segment(unit):
+                continue
+            if dry:
+                actions.append(f"{plug.get('id')} needs user unit {unit}")
+                continue
+            if run(["systemctl", "--user", "cat", unit]).returncode != 0:
+                packed = cat_dir / "units" / unit
+                if packed.is_file():
+                    dest = home / ".config/systemd/user" / unit
+                    backup_existing(dest, undo, home)
+                    copy_file(packed, dest)
+                    rewrite_in_place(dest, old_home, str(home))
+                    run(["systemctl", "--user", "daemon-reload"])
+                    proc = run(["systemctl", "--user", "enable", "--now", unit])
+                    actions.append(f"installed and enabled {unit} for {plug.get('id')}"
+                                   if proc.returncode == 0 else
+                                   fail(f"installed {unit} but could not enable it: "
+                                        + (proc.stderr or proc.stdout).strip()[:200]))
+                    continue
+                actions.append(fail(
+                    f"{plug.get('id')} needs user unit {unit}, which is not installed here"
+                    " and is not in this archive"))
+            elif run(["systemctl", "--user", "is-active", unit]).returncode != 0:
+                proc = run(["systemctl", "--user", "restart", unit])
+                actions.append(f"started {unit} for {plug.get('id')}" if proc.returncode == 0
+                               else fail(f"{unit} for {plug.get('id')} would not start: "
+                                         + (proc.stderr or proc.stdout).strip()[:200]))
+            else:
+                # New code on disk, old daemon in memory: restart or it serves stale data.
+                proc = run(["systemctl", "--user", "restart", unit])
+                actions.append(f"restarted {unit} onto the restored {plug.get('id')} code"
+                               if proc.returncode == 0 else
+                               fail(f"could not restart {unit}: " + (proc.stderr or proc.stdout).strip()[:200]))
     return actions
 
 
