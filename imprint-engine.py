@@ -1693,10 +1693,23 @@ def restore_plugins(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: b
             if plug.get("enabled"):
                 cmd.append("--enable")
             proc = run(cmd)
-            if proc.returncode != 0 and "already" not in (proc.stdout + proc.stderr).lower():
-                actions.append(fail(f"plugin add failed {pid}: {(proc.stderr or proc.stdout).strip()[:200]}"))
+            blob = (proc.stdout + proc.stderr).lower()
+            if proc.returncode == 0:
+                actions.append(f"installed {pid} from source")
+            elif "already" in blob:
+                # Do not claim an install we did not perform. Say what is there,
+                # and whether it actually came from the recorded source.
+                have = git_remote(target)
+                want = plug["url"]
+                if have and have.rstrip("/").removesuffix(".git") != want.rstrip("/").removesuffix(".git"):
+                    actions.append(fail(
+                        f"{pid} already installed from a DIFFERENT source: {have} (imprint recorded {want})"))
+                elif have:
+                    actions.append(f"{pid} already installed from the same source, left as is")
+                else:
+                    actions.append(f"{pid} already present (no git remote to compare), left as is")
             else:
-                actions.append(f"plugin add {pid} from source")
+                actions.append(fail(f"plugin add failed {pid}: {(proc.stderr or proc.stdout).strip()[:200]}"))
             rel_overlay = plug.get("overlay") or ""
             if rel_overlay:
                 try:

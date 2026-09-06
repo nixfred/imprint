@@ -386,5 +386,43 @@ class RecipeCategoryTests(unittest.TestCase):
             self.assertFalse((home / ".local/state/imprint").exists())
 
 
+class PluginInstallReportingTests(unittest.TestCase):
+    """A restore must not report an install it did not perform."""
+
+    def _run(self, rc, out, remote):
+        import types
+        calls = []
+        real_run, real_remote = engine.run, engine.git_remote
+        engine.run = lambda cmd, **kw: (calls.append(cmd), types.SimpleNamespace(
+            returncode=rc, stdout=out, stderr=""))[1]
+        engine.git_remote = lambda path: remote
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                t = Path(tmp); cat = t / "cat"; cat.mkdir()
+                home = t / "home"; (home / ".config/omarchy/plugins").mkdir(parents=True)
+                (cat / "meta.json").write_text(json.dumps({"plugins": [
+                    {"id": "a.plug", "kind": "git", "url": "https://example/a.git",
+                     "enabled": True}]}), encoding="utf-8")
+                undo = t / "undo"; undo.mkdir()
+                engine.FAILURES.clear()
+                return engine.restore_plugins(cat, home, "", undo, False)
+        finally:
+            engine.run, engine.git_remote = real_run, real_remote
+            engine.FAILURES.clear()
+
+    def test_fresh_install_is_reported_as_installed(self):
+        actions = self._run(0, "", "https://example/a.git")
+        self.assertTrue(any("installed a.plug from source" in a for a in actions), actions)
+
+    def test_already_present_is_not_reported_as_an_install(self):
+        actions = self._run(1, "plugin already exists", "https://example/a.git")
+        self.assertFalse(any("installed a.plug from source" in a for a in actions), actions)
+        self.assertTrue(any("already installed from the same source" in a for a in actions), actions)
+
+    def test_already_present_from_a_different_source_is_a_failure(self):
+        actions = self._run(1, "plugin already exists", "https://evil/other.git")
+        self.assertTrue(any("DIFFERENT source" in a for a in actions), actions)
+
+
 if __name__ == "__main__":
     unittest.main()
