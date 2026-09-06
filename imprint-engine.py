@@ -67,7 +67,7 @@ CATEGORIES = [
     {
         "id": "plugins",
         "title": "Plugins",
-        "summary": "Git URLs, first-party clones, local plugin trees",
+        "summary": "Reinstalled from git source; only local-only trees are packed",
         "default": True,
         "risk": "portable",
     },
@@ -231,6 +231,18 @@ def now_stamp() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M")
 
 
+def new_undo_dir(root: Path) -> Path:
+    """Second resolution plus a counter: two restores a minute apart must not
+    share an undo directory, or the second overwrites the first's originals."""
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    candidate = root / f"undo-{stamp}"
+    suffix = 1
+    while candidate.exists():
+        candidate = root / f"undo-{stamp}-{suffix}"
+        suffix += 1
+    return candidate
+
+
 def iso_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -386,10 +398,47 @@ def rewrite_text(text: str, old_home: str, new_home: str) -> str:
 
 def copy_file(src: Path, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if src.is_symlink() and not src.exists():
+    broken_link = src.is_symlink() and not src.exists()
+    # Never write through a symlink at the destination, and never symlink onto
+    # an existing path -- both raise or corrupt an unrelated file.
+    if dest.is_symlink() or (broken_link and dest.exists()):
+        dest.unlink()
+    if broken_link:
         dest.symlink_to(os.readlink(src))
         return
     shutil.copy2(src, dest, follow_symlinks=True)
+
+
+def read_text_safe(path: Path, limit: int = TEXT_LIMIT * 4) -> str | None:
+    """Whole-file text read. None when binary, undecodable, oversized or unreadable."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        if path.stat().st_size > limit:
+            return None
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    if b"\0" in raw:
+        return None
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def rewrite_in_place(dest: Path, old_home: str, new_home: str) -> None:
+    if not old_home or old_home == new_home:
+        return
+    text = read_text_safe(dest)
+    if text is None:
+        return
+    rewritten = rewrite_text(text, old_home, new_home)
+    if rewritten != text:
+        try:
+            dest.write_text(rewritten, encoding="utf-8")
+        except OSError:
+            pass
 
 
 def iter_files(root: Path):
@@ -625,6 +674,15 @@ def collect_plugins(cat_dir: Path, home: Path) -> dict:
                 continue
             info = classify_plugin(plugin_dir, listing.get(plugin_dir.name))
             real = Path(info["source"])
+            # Recipe, not payload: anything with a git remote is re-installed
+            # from source at restore. Only trees with no upstream get packed,
+            # because nothing else could bring them back.
+            if info["kind"] == "git" and info["url"]:
+                info["tree"] = ""
+                info["files"] = 0
+                info["packed"] = False
+                records.append(info)
+                continue
             tree_rel = Path("trees") / info["id"]
             dest_root = cat_dir / tree_rel
             copied = 0
@@ -637,8 +695,14 @@ def collect_plugins(cat_dir: Path, home: Path) -> dict:
                 copied += 1
             info["tree"] = str(tree_rel)
             info["files"] = copied
+            info["packed"] = True
             records.append(info)
-    meta = {"plugins": records, "count": len(records)}
+    meta = {
+        "plugins": records,
+        "count": len(records),
+        "fromSource": sorted(p["id"] for p in records if not p.get("packed")),
+        "packed": sorted(p["id"] for p in records if p.get("packed")),
+    }
     write_json(cat_dir / "meta.json", meta)
     return meta
 
@@ -966,12 +1030,14 @@ def render_brief(manifest: dict) -> str:
         for plug in plugins:
             if plug.get("kind") == "git" and plug.get("url"):
                 enable = " --enable" if plug.get("enabled") else ""
-                lines.append(f"- `{plug['id']}` git `{plug['url']}`")
+                commit = (plug.get("commit") or "")[:12]
+                seen = f" (saved at {commit})" if commit else ""
+                lines.append(f"- `{plug['id']}` installed from source{seen}")
                 lines.append(f"  `omarchy plugin add {plug['url']}{enable}`")
             elif plug.get("kind") == "clone":
                 lines.append(f"- `{plug['id']}` cloned from `{plug.get('clonedFrom')}`")
             else:
-                lines.append(f"- `{plug['id']}` local tree")
+                lines.append(f"- `{plug['id']}` local tree, packed in this archive")
     pkgs = cats.get("packages") or {}
     if pkgs.get("repo") or pkgs.get("aur"):
         lines += ["", "## Extra packages", ""]
@@ -1161,11 +1227,7 @@ def restore_file_tree(cat_dir: Path, home: Path, old_home: str, undo: Path, dry:
         backup_existing(dest, undo, home)
         dest.parent.mkdir(parents=True, exist_ok=True)
         copy_file(path, dest)
-        if is_probably_text(dest):
-            text = dest.read_text(encoding="utf-8")
-            rewritten = rewrite_text(text, old_home, str(home))
-            if rewritten != text:
-                dest.write_text(rewritten, encoding="utf-8")
+        rewrite_in_place(dest, old_home, str(home))
         done.append(str(rel))
     return done
 
@@ -1188,18 +1250,20 @@ def restore_plugins(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: b
         if target.exists() or target.is_symlink():
             backup_existing(target, undo, home)
         if plug.get("kind") == "git" and plug.get("url"):
-            proc = run(["omarchy", "plugin", "add", plug["url"], "--yes"])
+            cmd = ["omarchy", "plugin", "add", plug["url"], "--yes"]
+            if plug.get("enabled"):
+                cmd.append("--enable")
+            proc = run(cmd)
             if proc.returncode != 0 and "already" not in (proc.stdout + proc.stderr).lower():
                 actions.append(f"plugin add failed {pid}: {(proc.stderr or proc.stdout).strip()[:200]}")
             else:
-                actions.append(f"plugin add {pid}")
-            # Overlay saved tree so local edits survive.
-            tree = cat_dir / plug.get("tree", "")
-            if tree.is_dir():
-                overlay_tree(tree, target, old_home, home)
+                actions.append(f"plugin add {pid} from source")
         else:
-            tree = cat_dir / plug.get("tree", "")
-            if tree.is_dir():
+            # A bare cat_dir is a directory too, so an empty tree must not
+            # overlay the whole category onto the plugin path.
+            rel_tree = plug.get("tree") or ""
+            tree = (cat_dir / rel_tree) if rel_tree else None
+            if tree is not None and tree.is_dir():
                 if target.exists() or target.is_symlink():
                     if target.is_dir() and not target.is_symlink():
                         shutil.rmtree(target)
@@ -1220,11 +1284,7 @@ def overlay_tree(src: Path, dest: Path, old_home: str, new_home: Path) -> None:
         target = dest / inner
         target.parent.mkdir(parents=True, exist_ok=True)
         copy_file(file_path, target)
-        if is_probably_text(target):
-            text = target.read_text(encoding="utf-8")
-            rewritten = rewrite_text(text, old_home, str(new_home))
-            if rewritten != text:
-                target.write_text(rewritten, encoding="utf-8")
+        rewrite_in_place(target, old_home, str(new_home))
 
 
 def restore_packages(cat_dir: Path, dry: bool) -> list[str]:
@@ -1303,20 +1363,27 @@ def restore_bar(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool)
         # packed relative without leading handling
         matches = list((cat_dir / "files").rglob("shell.json")) if (cat_dir / "files").is_dir() else []
         shell_src = matches[0] if matches else shell_src
+    if not shell_src.is_file():
+        return ["no shell.json in this imprint, bar left alone"]
     dest = home / ".config/omarchy/shell.json"
     if dry:
-        return ["shell.json"]
-    if dest.exists():
-        backup_existing(dest, undo, home)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    text = shell_src.read_text(encoding="utf-8")
-    dest.write_text(rewrite_text(text, old_home, str(home)), encoding="utf-8")
-    snap = Path(tempfile.mkstemp(prefix="imprint-snap-", suffix=".json")[1])
-    edited = Path(tempfile.mkstemp(prefix="imprint-edit-", suffix=".json")[1])
+        return ["shell.json via config-edit"]
+    text = rewrite_text(shell_src.read_text(encoding="utf-8"), old_home, str(home))
+
+    # Never write dest directly while the shell is up. `config-edit` exists to
+    # merge against a live snapshot; writing first would make the snapshot
+    # reflect our own clobber and silently drop every concurrent edit.
+    snap_fd, snap_name = tempfile.mkstemp(prefix="imprint-snap-", suffix=".json")
+    edit_fd, edit_name = tempfile.mkstemp(prefix="imprint-edit-", suffix=".json")
+    os.close(snap_fd)
+    os.close(edit_fd)
+    snap, edited = Path(snap_name), Path(edit_name)
     try:
-        shutil.copy2(dest, edited)
+        edited.write_text(text, encoding="utf-8")
         snap_proc = run(["omarchy", "shell", "config-edit", "snapshot", str(snap)])
         if snap_proc.returncode == 0:
+            if dest.exists():
+                backup_existing(dest, undo, home)
             apply = run(
                 [
                     "omarchy",
@@ -1330,8 +1397,14 @@ def restore_bar(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool)
             )
             if apply.returncode == 0:
                 return ["shell.json via config-edit"]
-            return ["shell.json copied; config-edit apply failed, file is in place"]
-        return ["shell.json copied (shell not running or snapshot failed)"]
+            detail = (apply.stderr or apply.stdout).strip()[:200]
+            return [f"shell.json NOT applied, config-edit refused: {detail}"]
+        # Shell is not running, so there is no live state to lose.
+        if dest.exists():
+            backup_existing(dest, undo, home)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(text, encoding="utf-8")
+        return ["shell.json written directly (shell not running)"]
     finally:
         for path in (snap, edited):
             try:
@@ -1397,7 +1470,14 @@ def restore_category(
         return restore_services(cat_dir, home, old_home, undo, dry)
     if cid == "identity":
         return restore_identity(cat_dir, dry, getattr(args, "confirm_hostname", None))
-    return restore_file_tree(cat_dir, home, old_home, undo, dry)
+    actions = restore_file_tree(cat_dir, home, old_home, undo, dry)
+    if cid == "secrets" and not dry:
+        ssh = home / ".ssh"
+        if ssh.is_dir():
+            # mkdir used the ambient umask; sshd and ssh both want 0700 here.
+            os.chmod(ssh, 0o700)
+            actions.append("chmod 700 ~/.ssh")
+    return actions
 
 
 def cmd_restore(args) -> int:
@@ -1418,9 +1498,10 @@ def cmd_restore(args) -> int:
         if not ids:
             raise SystemExit("no selected categories are present in this imprint")
         old_home = manifest.get("home") or ""
-        undo = home / ".local/state/imprint" / f"undo-{now_stamp()}"
+        undo_root = home / ".local/state/imprint"
+        undo = new_undo_dir(undo_root)
         if not dry:
-            undo.mkdir(parents=True, exist_ok=True)
+            undo.mkdir(parents=True, exist_ok=False)
             write_json(undo / "source.json", {"archive": str(archive), "manifest": manifest, "categories": ids})
         report = {"ok": True, "dryRun": dry, "categories": {}, "undo": None if dry else str(undo)}
         # Plugins and packages before bar/look so the layout has somewhere to land.
@@ -1501,13 +1582,16 @@ def cmd_diff(args) -> int:
                 if not live.exists():
                     changed.append(f"  missing  {rel}")
                     continue
-                if is_probably_text(path) and is_probably_text(live):
-                    a = rewrite_text(path.read_text(encoding="utf-8"), manifest.get("home") or "", str(home))
-                    b = live.read_text(encoding="utf-8")
-                    if a != b:
+                packed = read_text_safe(path)
+                current = read_text_safe(live)
+                if packed is not None and current is not None:
+                    if rewrite_text(packed, manifest.get("home") or "", str(home)) != current:
                         changed.append(f"  changed  {rel}")
                 else:
-                    if path.stat().st_size != live.stat().st_size:
+                    try:
+                        if path.stat().st_size != live.stat().st_size:
+                            changed.append(f"  changed  {rel}")
+                    except OSError:
                         changed.append(f"  changed  {rel}")
             if changed:
                 lines.append(f"[{cid}]")
@@ -1530,7 +1614,11 @@ def cmd_undo(args) -> int:
         raise SystemExit(f"missing undo dir {chosen}")
     home = Path.home()
     restored = []
-    for path in iter_files(chosen):
+    # Deliberately not iter_files: its skip list (.bak, .git, __pycache__ ...)
+    # would silently drop files that backup_existing genuinely saved.
+    for path in sorted(chosen.rglob("*")):
+        if path.is_dir() and not path.is_symlink():
+            continue
         if path.name == "source.json" and path.parent == chosen:
             continue
         try:

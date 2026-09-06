@@ -53,7 +53,7 @@ banner() {
     gum style --foreground "$accent" --bold --align center --width 92 "$logo"
     gum style --foreground "$text" --bold --align center --width 92 "IMPRINT"
     gum style --foreground "$muted" --italic --align center --width 92 \
-      "Stamp one Omarchy onto another · space selects · enter confirms"
+      "Stamp one Omarchy onto another · tab or x toggles · a all · enter confirms"
     echo
   else
     printf '%s\n' "$logo"
@@ -91,6 +91,7 @@ Usage:
   imprint                     Interactive menu
   imprint save                Choose categories, write an archive
   imprint save --all -o FILE
+  imprint save --only scripts,cli      Just the scripts, no plugins
   imprint save --only look,bar,plugins
   imprint restore [FILE]      Choose categories from an archive
   imprint restore FILE --only bar,plugins --dry-run
@@ -100,94 +101,84 @@ Usage:
   imprint undo                Put back files from the last restore
   imprint list                Archives in ~/imprints
 
-Space toggles categories. Enter confirms. Identity, monitors, input,
+In the picker: tab or x toggles a category, a selects all, enter confirms.
+Space does nothing -- gum 2.x does not bind it. Identity, monitors, input
 and secrets stay off unless you turn them on.
 EOF
 }
 
+catalog_rows() {
+  # id <TAB> display label <TAB> default(1/0), optionally filtered to an archive.
+  local archive=${1:-}
+  python3 - "$ENGINE" "$archive" <<'PY'
+import json, subprocess, sys
+engine = sys.argv[1]
+archive = sys.argv[2] if len(sys.argv) > 2 else ""
+catalog = json.loads(subprocess.check_output(["python3", engine, "categories"], text=True))
+present = None
+if archive:
+    man = json.loads(subprocess.check_output(["python3", engine, "info", archive, "--json"], text=True))
+    present = set((man.get("categories") or {}).keys())
+note = {"host": "  [this machine]", "identity": "  [hostname]", "secrets": "  [keys]"}
+for item in catalog:
+    if present is not None and item["id"] not in present:
+        continue
+    # gum --selected is a comma separated list, so labels must carry no commas.
+    summary = item["summary"].replace(",", " \u00b7")
+    label = f"{item['title']} \u2014 {summary}{note.get(item.get('risk') or '', '')}"
+    print("\t".join([item["id"], label, "1" if item.get("default") else "0"]))
+PY
+}
+
+default_ids() {
+  catalog_rows "${1:-}" | awk -F'\t' '$3=="1"{print $1}' | paste -sd, -
+}
+
 default_selected() {
-  engine categories | python3 -c '
-import json, sys
-cats = json.load(sys.stdin)
-print(",".join(item["id"] for item in cats if item.get("default")))
-'
+  default_ids ""
 }
 
 ids_from_archive_defaults() {
-  local archive=$1
-  python3 - "$ENGINE" "$archive" <<'PY'
-import json, subprocess, sys
-engine, archive = sys.argv[1], sys.argv[2]
-catalog = json.loads(subprocess.check_output(["python3", engine, "categories"], text=True))
-defaults = {c["id"] for c in catalog if c.get("default")}
-man = json.loads(subprocess.check_output(["python3", engine, "info", archive, "--json"], text=True))
-present = [cid for cid in (man.get("categories") or {}) if cid in defaults]
-print(",".join(present))
-PY
+  default_ids "$1"
 }
 
 choose_categories() {
   local header=$1
-  local selected=$2
+  local preselect=$2
   local archive=${3:-}
   need gum
+  local rows
+  rows=$(catalog_rows "$archive") || return 1
+  [[ -n $rows ]] || die "no categories to choose"
+
+  # Options are the display labels only. Passing "label<TAB>id" via
+  # --label-delimiter makes gum re-sort the list alphabetically, which throws
+  # away the catalog order that puts host-bound and secret categories last.
+  local labels selected
+  labels=$(printf '%s\n' "$rows" | awk -F'\t' '{print $2}')
+  selected=$(printf '%s\n' "$rows" \
+    | awk -F'\t' -v want=",$preselect," 'index(want, "," $1 ",") {print $2}' \
+    | paste -sd, -)
+
   local args=(
-    choose --no-limit --ordered
+    choose --no-limit
     --height=18
+    --show-help
     --cursor="▸ "
-    --cursor-prefix="▸ "
+    --cursor-prefix="○ "
     --selected-prefix="◉ "
     --unselected-prefix="○ "
-    --header="$header"
-    --label-delimiter=$'\t'
+    --header="$header  (tab or x toggles · a selects all · enter confirms)"
   )
   if [[ -n $selected ]]; then
     args+=(--selected="$selected")
   fi
-  local lines
-  if [[ -n $archive ]]; then
-    lines=$(python3 - "$ENGINE" "$archive" <<'PY'
-import json, subprocess, sys
-engine, archive = sys.argv[1], sys.argv[2]
-catalog = json.loads(subprocess.check_output(["python3", engine, "categories"], text=True))
-man = json.loads(subprocess.check_output(["python3", engine, "info", archive, "--json"], text=True))
-present = set((man.get("categories") or {}).keys())
-for item in catalog:
-    if item["id"] not in present:
-        continue
-    extra = ""
-    risk = item.get("risk") or "portable"
-    if risk == "host":
-        extra = "  [this machine]"
-    elif risk == "identity":
-        extra = "  [hostname]"
-    elif risk == "secrets":
-        extra = "  [keys]"
-    print(f"{item['id']}\t{item['title']} — {item['summary']}{extra}")
-PY
-)
-  else
-    lines=$(python3 - "$ENGINE" <<'PY'
-import json, subprocess, sys
-engine = sys.argv[1]
-catalog = json.loads(subprocess.check_output(["python3", engine, "categories"], text=True))
-for item in catalog:
-    extra = ""
-    risk = item.get("risk") or "portable"
-    if risk == "host":
-        extra = "  [this machine]"
-    elif risk == "identity":
-        extra = "  [hostname]"
-    elif risk == "secrets":
-        extra = "  [keys]"
-    print(f"{item['id']}\t{item['title']} — {item['summary']}{extra}")
-PY
-)
-  fi
-  [[ -n $lines ]] || die "no categories to choose"
   local picked
-  picked=$(printf '%s\n' "$lines" | gum "${args[@]}") || return 1
-  printf '%s\n' "$picked" | paste -sd, -
+  picked=$(printf '%s\n' "$labels" | gum "${args[@]}") || return 1
+  [[ -n $picked ]] || return 1
+  # Map chosen labels back to ids, emitted in catalog order.
+  awk -F'\t' 'NR==FNR{sel[$0]=1; next} sel[$2]{print $1}' \
+    <(printf '%s\n' "$picked") <(printf '%s\n' "$rows") | paste -sd, -
 }
 
 pick_archive() {
@@ -358,9 +349,9 @@ case $cmd in
     all=0
     while [[ $# -gt 0 ]]; do
       case $1 in
-        --only) only=$2; shift 2 ;;
+        --only) [[ $# -ge 2 ]] || die "--only needs a value"; only=$2; shift 2 ;;
         --all) all=1; shift ;;
-        -o|--output) output=$2; shift 2 ;;
+        -o|--output) [[ $# -ge 2 ]] || die "--output needs a value"; output=$2; shift 2 ;;
         --yes) shift ;;
         *) die "unknown save flag: $1" ;;
       esac
@@ -383,9 +374,9 @@ case $cmd in
     confirm_host=""
     while [[ $# -gt 0 ]]; do
       case $1 in
-        --only) only=$2; shift 2 ;;
+        --only) [[ $# -ge 2 ]] || die "--only needs a value"; only=$2; shift 2 ;;
         --dry-run) dry=1; shift ;;
-        --confirm-hostname) confirm_host=$2; shift 2 ;;
+        --confirm-hostname) [[ $# -ge 2 ]] || die "--confirm-hostname needs a value"; confirm_host=$2; shift 2 ;;
         --yes) shift ;;
         -*) die "unknown restore flag: $1" ;;
         *) archive=$1; shift ;;

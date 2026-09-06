@@ -4,7 +4,10 @@ Stamp one Omarchy machine onto another.
 
 Imprint writes a single archive of the desktop personality — theme, bar,
 plugins, bindings, extra packages, user scripts, services — then restores
-it onto a new box or an existing one. You space-select what travels.
+it onto a new box or an existing one. You pick what travels.
+
+Software is saved as a **recipe, not a payload**: plugins and themes that have
+a git remote are recorded as URLs and reinstalled from source on restore.
 
 ```
 imprint
@@ -47,8 +50,11 @@ That links `imprint` into `~/.local/bin`. Omarchy already has `gum`, `python3`,
 
 ## Use
 
-Run `imprint` for the menu. The OMARCHY wordmark sits at the top. Space
-toggles a category, Enter confirms.
+Run `imprint` for the menu. The OMARCHY wordmark sits at the top.
+
+**In the picker, `tab` or `x` toggles a category, `a` selects all, `enter`
+confirms. Space does nothing** — gum 2.x does not bind it, so if you are
+hitting space and seeing no change, that is why.
 
 ```
 imprint save                         # picker, writes ~/imprints/imprint-$host-$time.tar.zst
@@ -76,7 +82,8 @@ On by default (safe to take to another machine):
 - **Look** — theme name, font, gaps, branding
 - **Hyprland** — bindings, autostart, extra Lua (not monitors/input)
 - **Bar and shell** — `shell.json` layout, idle, disabled plugins
-- **Plugins** — git URLs plus local/clone trees, without `.git` / `node_modules`
+- **Plugins** — git-backed plugins are recorded as URLs and reinstalled from
+  source; only plugins with no upstream are packed as trees
 - **Themes** — git remotes via `omarchy theme install`; local themes copied
 - **Hooks and menu**
 - **Terminals**
@@ -100,8 +107,13 @@ passwordless sudo, sshd.
 On restore, `/home/olduser` inside text files becomes the new `$HOME`. Git
 remotes of the form `git@github.com:...` are saved as `https://` so the new
 box does not need your SSH key. Plugins land before `shell.json`, so the bar
-has somewhere to put them. A live shell uses `omarchy shell config-edit apply
---allow-layout-change`; if the shell is not up, the file is copied.
+has somewhere to put them.
+
+`shell.json` is never written directly while the shell is running. Imprint
+snapshots the live config first, then hands the archived file to
+`omarchy shell config-edit apply --allow-layout-change`, so concurrent edits
+from other sessions survive. Only when no shell is running is the file copied
+into place.
 
 Every restore first copies overwritten files to
 `~/.local/state/imprint/undo-<time>/`. `imprint undo` puts them back.
@@ -126,11 +138,11 @@ tool/imprint
 tool/imprint-engine.py
 categories/<id>/meta.json
 categories/<id>/files/...
-categories/plugins/trees/<plugin-id>/
+categories/plugins/trees/<plugin-id>/     # local-only plugins; git ones are URLs
 ```
 
 ## Tests
 
 ```bash
-python3 tests/test_engine.py
+python3 -m unittest discover -s tests
 ```

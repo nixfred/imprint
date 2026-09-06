@@ -128,5 +128,75 @@ class SaveRestoreRoundtrip(unittest.TestCase):
             self.assertEqual(packed.read_text(encoding="utf-8"), "gaps = 1\n")
 
 
+class RegressionTests(unittest.TestCase):
+    def test_rewrite_skips_partially_binary_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            cat = t / "cat"; (cat / "files/.config").mkdir(parents=True)
+            home = t / "home"; home.mkdir()
+            undo = t / "undo"; undo.mkdir()
+            (cat / "files/.config/thing.conf").write_bytes(b"a" * 5000 + b"\xff not utf8")
+            done = engine.restore_file_tree(cat, home, "/home/old", undo, False)
+            self.assertEqual(done, [".config/thing.conf"])
+            self.assertTrue((home / ".config/thing.conf").is_file())
+
+    def test_broken_symlink_over_existing_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            cat = t / "cat"; (cat / "files/bin").mkdir(parents=True)
+            home = t / "home"; (home / "bin").mkdir(parents=True)
+            undo = t / "undo"; undo.mkdir()
+            (cat / "files/bin/gone").symlink_to("/nonexistent/target")
+            (home / "bin/gone").write_text("existing\n", encoding="utf-8")
+            engine.restore_file_tree(cat, home, "", undo, False)
+            self.assertTrue((home / "bin/gone").is_symlink())
+
+    def test_never_writes_through_a_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            outsider = t / "outsider.txt"; outsider.write_text("keep me\n", encoding="utf-8")
+            src = t / "src.txt"; src.write_text("new\n", encoding="utf-8")
+            dest = t / "dest.txt"; dest.symlink_to(outsider)
+            engine.copy_file(src, dest)
+            self.assertEqual(outsider.read_text(encoding="utf-8"), "keep me\n")
+            self.assertEqual(dest.read_text(encoding="utf-8"), "new\n")
+
+    def test_bar_without_shell_json_is_a_noop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            cat = t / "cat"; cat.mkdir()
+            home = t / "home"; home.mkdir()
+            undo = t / "undo"; undo.mkdir()
+            actions = engine.restore_bar(cat, home, "", undo, False)
+            self.assertIn("bar left alone", actions[0])
+            self.assertFalse((home / ".config/omarchy/shell.json").exists())
+
+    def test_undo_dirs_do_not_collide(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = engine.new_undo_dir(root); first.mkdir(parents=True)
+            second = engine.new_undo_dir(root)
+            self.assertNotEqual(first, second)
+
+    def test_undo_returns_files_iter_files_would_skip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            chosen = t / "undo-x"; chosen.mkdir()
+            (chosen / ".config").mkdir()
+            (chosen / ".config/keep.bak").write_text("original\n", encoding="utf-8")
+            self.assertTrue(engine.is_skipped_name("keep.bak"))
+            names = [p.name for p in sorted(chosen.rglob("*")) if p.is_file()]
+            self.assertIn("keep.bak", names)
+
+    def test_git_plugins_are_a_recipe_not_a_payload(self):
+        recs = [
+            {"id": "a", "kind": "git", "url": "https://x/y.git", "packed": False, "tree": ""},
+            {"id": "b", "kind": "local", "packed": True, "tree": "trees/b"},
+        ]
+        self.assertEqual(sorted(r["id"] for r in recs if not r["packed"]), ["a"])
+        # An empty tree must never resolve to the category directory itself.
+        self.assertEqual(recs[0]["tree"], "")
+
+
 if __name__ == "__main__":
     unittest.main()
