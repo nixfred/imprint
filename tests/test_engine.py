@@ -13,6 +13,19 @@ sys.modules["imprint_engine"] = engine
 spec.loader.exec_module(engine)
 
 
+class RelPathTests(unittest.TestCase):
+    def test_keeps_symlink_location(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "bin").mkdir()
+            (home / "Projects/plonk").mkdir(parents=True)
+            target = home / "Projects/plonk/plonk"
+            target.write_text("#!/bin/sh\n", encoding="utf-8")
+            link = home / "bin/plonk"
+            link.symlink_to(target)
+            self.assertEqual(engine.rel_under_home(link, home), "bin/plonk")
+
+
 class RewriteTests(unittest.TestCase):
     def test_rewrites_home(self):
         text = "exec /home/pi/bin/plonk\nHOME=/home/pi\n"

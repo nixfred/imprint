@@ -2,13 +2,19 @@
 # Imprint — stamp one Omarchy machine onto another.
 set -euo pipefail
 
-ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE=${BASH_SOURCE[0]}
+while [[ -L $SOURCE ]]; do
+  dir=$(cd -- "$(dirname -- "$SOURCE")" && pwd)
+  SOURCE=$(readlink -- "$SOURCE")
+  [[ $SOURCE == /* ]] || SOURCE="$dir/$SOURCE"
+done
+ROOT="$(cd -- "$(dirname -- "$SOURCE")" && pwd)"
 if [[ -f $ROOT/imprint-engine.py ]]; then
   ENGINE="$ROOT/imprint-engine.py"
 elif [[ -f $ROOT/tool/imprint-engine.py ]]; then
   ENGINE="$ROOT/tool/imprint-engine.py"
 else
-  echo "imprint: cannot find imprint-engine.py next to $0" >&2
+  echo "imprint: cannot find imprint-engine.py next to $SOURCE" >&2
   exit 1
 fi
 

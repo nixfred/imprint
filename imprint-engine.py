@@ -200,6 +200,26 @@ def run(cmd: list[str], cwd: Path | None = None, check: bool = False) -> subproc
     )
 
 
+def ensure_session_env() -> None:
+    os.environ.setdefault("OMARCHY_PATH", "/usr/share/omarchy")
+    uid = os.getuid()
+    os.environ.setdefault("XDG_RUNTIME_DIR", f"/run/user/{uid}")
+    runtime = Path(os.environ["XDG_RUNTIME_DIR"])
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        for sock in sorted(runtime.glob("wayland-*")):
+            if sock.name.endswith(".lock"):
+                continue
+            os.environ["WAYLAND_DISPLAY"] = sock.name
+            break
+    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return
+    proc = run(["hyprctl", "instances"])
+    for line in proc.stdout.splitlines():
+        if line.startswith("instance "):
+            os.environ["HYPRLAND_INSTANCE_SIGNATURE"] = line.split()[1].rstrip(":")
+            break
+
+
 def run_ok(cmd: list[str], cwd: Path | None = None) -> str:
     proc = run(cmd, cwd=cwd)
     if proc.returncode != 0:
@@ -387,10 +407,16 @@ def iter_files(root: Path):
 
 
 def rel_under_home(path: Path, home: Path) -> str:
+    """Keep symlink locations. Resolving would pack ~/bin/plonk as Projects/plonk/plonk."""
+    home_abs = home if home.is_absolute() else home.resolve()
+    candidate = path if path.is_absolute() else (home_abs / path)
     try:
-        return str(path.resolve().relative_to(home.resolve()))
+        return str(candidate.absolute().relative_to(home_abs))
     except ValueError:
-        return str(path)
+        try:
+            return str(candidate.resolve().relative_to(home_abs.resolve()))
+        except ValueError:
+            return str(path)
 
 
 def stage_path(cat_dir: Path, rel: str) -> Path:
@@ -1375,6 +1401,7 @@ def restore_category(
 
 
 def cmd_restore(args) -> int:
+    ensure_session_env()
     archive = Path(args.archive).expanduser()
     if not archive.exists():
         raise SystemExit(f"missing archive: {archive}")
