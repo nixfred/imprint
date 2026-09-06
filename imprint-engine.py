@@ -641,7 +641,11 @@ def classify_plugin(plugin_dir: Path, listing: dict | None) -> dict:
         kind = "clone"
     else:
         kind = "local"
+    kinds = manifest.get("kinds") if isinstance(manifest.get("kinds"), list) else []
+    if not kinds and isinstance(listing.get("kinds"), list):
+        kinds = listing["kinds"]
     return {
+        "kinds": kinds,
         "id": listing.get("id") or manifest.get("id") or plugin_dir.name,
         "name": listing.get("name") or manifest.get("name") or plugin_dir.name,
         "kind": kind,
@@ -766,9 +770,50 @@ def collect_bar(cat_dir: Path, home: Path) -> dict:
     return meta
 
 
+def shell_plugin_state(home: Path) -> tuple[dict, set, set, bool]:
+    """Placement and disabled set straight from shell.json.
+
+    `omarchy plugin list` needs a live session; over SSH it returns nothing and
+    every plugin then looks disabled. shell.json is readable either way, so it
+    is the fallback and the source of bar placement.
+    """
+    path = home / ".config/omarchy/shell.json"
+    if not path.is_file():
+        return {}, set(), set(), False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}, set(), set(), False
+    placement = {}
+    layout = ((data.get("bar") or {}).get("layout")) or {}
+    for section, items in layout.items():
+        for index, item in enumerate(items or []):
+            pid = item.get("id") if isinstance(item, dict) else item
+            if pid:
+                placement[pid] = {"section": section, "index": index}
+    # Per Omarchy's PluginRegistry: enabled means the id is referenced in
+    # shell.json -- a bar.layout entry, a top-level plugins[] entry, or bar.id.
+    # Only checking the layout misses panels, overlays and services.
+    referenced = set(placement)
+    for item in data.get("plugins") or []:
+        pid = item.get("id") if isinstance(item, dict) else item
+        if pid:
+            referenced.add(pid)
+    bar_id = (data.get("bar") or {}).get("id")
+    if bar_id:
+        referenced.add(bar_id)
+    disabled = set()
+    for pid in data.get("disabledPlugins") or []:
+        if isinstance(pid, str):
+            disabled.add(pid)
+    return placement, referenced, disabled, True
+
+
 def collect_plugins(cat_dir: Path, home: Path) -> dict:
     plugins_root = home / ".config/omarchy/plugins"
     listing = {item.get("id"): item for item in plugin_list() if item.get("id")}
+    placement, referenced, disabled, have_shell = shell_plugin_state(home)
+    live = bool(listing)
     records = []
     if plugins_root.is_dir():
         for plugin_dir in sorted(plugins_root.iterdir()):
@@ -777,6 +822,21 @@ def collect_plugins(cat_dir: Path, home: Path) -> dict:
             if is_skipped_name(plugin_dir.name):
                 continue
             info = classify_plugin(plugin_dir, listing.get(plugin_dir.name))
+            pid_name = plugin_dir.name
+            if not live and have_shell:
+                # No live session: derive enabled the way PluginRegistry does.
+                # A bar-widget counts only when it sits in bar.layout; panels,
+                # overlays and services count from plugins[]. Being listed in
+                # plugins[] does not enable a bar widget.
+                key = info["id"] or pid_name
+                kinds = info.get("kinds") or []
+                if pid_name in disabled or key in disabled:
+                    info["enabled"] = False
+                elif "bar-widget" in kinds:
+                    info["enabled"] = key in placement or pid_name in placement
+                else:
+                    info["enabled"] = key in referenced or pid_name in referenced
+            info["placement"] = placement.get(info["id"]) or placement.get(pid_name) or {}
             real = Path(info["source"])
             # Recipe, not payload: anything with a git remote is re-installed
             # from source at restore. Only trees with no upstream get packed,
@@ -824,7 +884,11 @@ def collect_plugins(cat_dir: Path, home: Path) -> dict:
         "count": len(records),
         "fromSource": sorted(p["id"] for p in records if not p.get("packed")),
         "packed": sorted(p["id"] for p in records if p.get("packed")),
+        "enabled": sorted(p["id"] for p in records if p.get("enabled")),
+        "enabledSource": "plugin list" if live else ("shell.json" if have_shell else "unknown"),
     }
+    if not live and not have_shell:
+        print("  WARNING: could not determine which plugins are enabled", file=sys.stderr)
     write_json(cat_dir / "meta.json", meta)
     return meta
 
@@ -1660,6 +1724,7 @@ def restore_plugins(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: b
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     plugins_root = home / ".config/omarchy/plugins"
     actions = []
+    live = {item.get("id"): item for item in plugin_list() if item.get("id")}
     for plug in meta.get("plugins") or []:
         pid = plug.get("id")
         if not pid:
@@ -1689,10 +1754,10 @@ def restore_plugins(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: b
         if target.exists() or target.is_symlink():
             backup_existing(target, undo, home)
         if plug.get("kind") == "git" and plug.get("url"):
-            cmd = ["omarchy", "plugin", "add", plug["url"], "--yes"]
-            if plug.get("enabled"):
-                cmd.append("--enable")
-            proc = run(cmd)
+            # Deliberately no --enable: `plugin add --enable` appends the widget
+            # wherever it likes. The reconcile pass below enables every plugin
+            # uniformly, with the section and index recorded from the source.
+            proc = run(["omarchy", "plugin", "add", plug["url"], "--yes"])
             blob = (proc.stdout + proc.stderr).lower()
             if proc.returncode == 0:
                 actions.append(f"installed {pid} from source")
@@ -1742,6 +1807,40 @@ def restore_plugins(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: b
             elif plug.get("kind") == "clone" and plug.get("clonedFrom"):
                 run(["omarchy", "plugin", "clone", plug["clonedFrom"]])
                 actions.append(f"plugin clone {plug['clonedFrom']}")
+
+    # Installing the code is not the same as showing it. Enabled state and bar
+    # placement live in shell.json, so an installed-but-disabled plugin is
+    # invisible. Reconcile through the shell's own IPC, which mutates inside
+    # the owning process instead of rewriting the file underneath it.
+    if not dry:
+        run(["omarchy-shell", "shell", "rescanPlugins"])
+        live = {item.get("id"): item for item in plugin_list() if item.get("id")}
+    wanted = [p for p in (meta.get("plugins") or []) if p.get("enabled") and safe_segment(p.get("id") or "")]
+    for plug in wanted:
+        pid = plug["id"]
+        if dry:
+            place = plug.get("placement") or {}
+            where = f" --section {place['section']} --index {place['index']}" if place else ""
+            actions.append(f"omarchy plugin enable {pid}{where}")
+            continue
+        place = plug.get("placement") or {}
+        if live.get(pid, {}).get("enabled"):
+            # Deliberately not repositioning. Absolute indices from the source
+            # bar cannot converge onto a target bar holding a different set of
+            # widgets -- each move shifts the rest, so it oscillates instead of
+            # settling. Whole-bar order is the `bar` category's job.
+            actions.append(f"{pid} already enabled")
+            continue
+        cmd = ["omarchy", "plugin", "enable", pid]
+        if place.get("section"):
+            cmd += ["--section", str(place["section"])]
+            if isinstance(place.get("index"), int):
+                cmd += ["--index", str(place["index"])]
+        proc = run(cmd)
+        if proc.returncode == 0:
+            actions.append(f"enabled {pid}" + (f" at {place['section']}[{place['index']}]" if place else ""))
+        else:
+            actions.append(fail(f"could not enable {pid}: " + (proc.stderr or proc.stdout).strip()[:200]))
     return actions
 
 

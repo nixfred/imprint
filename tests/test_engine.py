@@ -424,5 +424,77 @@ class PluginInstallReportingTests(unittest.TestCase):
         self.assertTrue(any("DIFFERENT source" in a for a in actions), actions)
 
 
+class EnabledStateTests(unittest.TestCase):
+    """Installing plugin code is not the same as showing it."""
+
+    def _shell(self, tmp, **cfg):
+        home = Path(tmp) / "home"
+        (home / ".config/omarchy").mkdir(parents=True)
+        (home / ".config/omarchy/shell.json").write_text(json.dumps(cfg), encoding="utf-8")
+        return home
+
+    def test_bar_widget_is_enabled_only_when_placed_in_the_layout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._shell(tmp,
+                bar={"id": "omarchy.bar", "layout": {"left": [{"id": "a.widget"}]}},
+                plugins=[{"id": "b.widget"}])
+            placement, referenced, disabled, ok = engine.shell_plugin_state(home)
+            self.assertTrue(ok)
+            self.assertEqual(placement["a.widget"], {"section": "left", "index": 0})
+            # b.widget sits in plugins[] but not in the layout: for a bar widget
+            # that is NOT enabled, which is what the live registry reports.
+            self.assertIn("b.widget", referenced)
+            self.assertNotIn("b.widget", placement)
+
+    def test_panels_and_services_count_from_the_plugins_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._shell(tmp, bar={"id": "pi.bar", "layout": {}},
+                               plugins=[{"id": "x.panel"}], disabledPlugins=["y.svc"])
+            _placement, referenced, disabled, _ok = engine.shell_plugin_state(home)
+            self.assertIn("x.panel", referenced)
+            self.assertIn("pi.bar", referenced)
+            self.assertIn("y.svc", disabled)
+
+    def test_missing_shell_json_is_reported_not_guessed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"; home.mkdir()
+            placement, referenced, disabled, ok = engine.shell_plugin_state(home)
+            self.assertFalse(ok)
+            self.assertEqual((placement, referenced, disabled), ({}, set(), set()))
+
+    def test_restore_enables_recorded_plugins_with_placement(self):
+        import types
+        calls = []
+        real_run, real_list = engine.run, engine.plugin_list
+        engine.plugin_list = lambda: []          # nothing enabled on the target
+        engine.run = lambda cmd, **kw: (calls.append(cmd),
+                                        types.SimpleNamespace(returncode=0, stdout="", stderr=""))[1]
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                t = Path(tmp); cat = t / "cat"; cat.mkdir()
+                home = t / "home"; (home / ".config/omarchy/plugins").mkdir(parents=True)
+                (cat / "meta.json").write_text(json.dumps({"plugins": [
+                    {"id": "a.widget", "kind": "git", "url": "https://x/a.git",
+                     "enabled": True, "placement": {"section": "left", "index": 2}},
+                    {"id": "b.off", "kind": "git", "url": "https://x/b.git", "enabled": False},
+                ]}), encoding="utf-8")
+                undo = t / "undo"; undo.mkdir()
+                engine.FAILURES.clear()
+                actions = engine.restore_plugins(cat, home, "", undo, False)
+        finally:
+            engine.run, engine.plugin_list = real_run, real_list
+            engine.FAILURES.clear()
+        enables = [c for c in calls if c[:3] == ["omarchy", "plugin", "enable"]]
+        self.assertEqual(len(enables), 1, enables)
+        self.assertEqual(enables[0],
+                         ["omarchy", "plugin", "enable", "a.widget", "--section", "left", "--index", "2"])
+        # plugin add must not carry --enable, or it places the widget itself.
+        adds = [c for c in calls if c[:3] == ["omarchy", "plugin", "add"]]
+        self.assertTrue(adds)
+        for c in adds:
+            self.assertNotIn("--enable", c)
+        self.assertTrue(any("enabled a.widget at left[2]" in a for a in actions), actions)
+
+
 if __name__ == "__main__":
     unittest.main()
