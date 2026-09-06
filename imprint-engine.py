@@ -324,8 +324,32 @@ def https_git_url(url: str) -> str:
 def git_remote(path: Path) -> str:
     if not (path / ".git").exists():
         return ""
-    url = run_ok(["git", "-C", str(path), "remote", "get-url", "origin"]).strip()
+    remote = tracking_remote(path)
+    url = run_ok(["git", "-C", str(path), "remote", "get-url", remote]).strip()
+    if not url and remote != "origin":
+        url = run_ok(["git", "-C", str(path), "remote", "get-url", "origin"]).strip()
     return https_git_url(url)
+
+
+def tracking_remote(path: Path) -> str:
+    """The remote the current branch tracks, else origin.
+
+    A plugin can sit on a branch that only exists on a fork while `origin`
+    still points at the upstream it was forked from. Recording origin would
+    send a restore looking for a branch that is not there.
+    """
+    upstream = run_ok(["git", "-C", str(path), "rev-parse", "--abbrev-ref",
+                       "--symbolic-full-name", "@{upstream}"]).strip()
+    if upstream and "/" in upstream:
+        name = upstream.split("/", 1)[0]
+        if name:
+            return name
+    return "origin"
+
+
+def git_branch_of(path: Path) -> str:
+    name = run_ok(["git", "-C", str(path), "rev-parse", "--abbrev-ref", "HEAD"]).strip()
+    return "" if name in {"", "HEAD"} else name
 
 
 def git_head(path: Path) -> str:
@@ -634,6 +658,7 @@ def classify_plugin(plugin_dir: Path, listing: dict | None) -> dict:
             real = plugin_dir
     url = git_remote(real)
     commit = git_head(real)
+    branch = git_branch_of(real)
     dirty = git_dirty(real)
     if url:
         kind = "git"
@@ -651,6 +676,7 @@ def classify_plugin(plugin_dir: Path, listing: dict | None) -> dict:
         "kind": kind,
         "url": url,
         "commit": commit,
+        "branch": branch,
         "dirty": dirty,
         "clonedFrom": cloned_from,
         "enabled": bool(listing.get("enabled")),
@@ -835,6 +861,36 @@ def plugin_units(home: Path) -> dict:
     return units
 
 
+def bundle_unpushed(repo: Path, branch: str, cat_dir: Path, pid: str) -> tuple[str, int]:
+    """Pack commits that exist only on this machine into a git bundle.
+
+    A plugin parked on a local branch cannot be re-cloned from anywhere. The
+    bundle makes it reproducible without forcing a push to someone's remote.
+    """
+    if not branch:
+        return "", 0
+    base = run_ok(["git", "-C", str(repo), "rev-parse", "--abbrev-ref",
+                   "--symbolic-full-name", "@{upstream}"]).strip()
+    if not base:
+        base = run_ok(["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "origin/HEAD"]).strip()
+    if not base:
+        return "", 0
+    count = run_ok(["git", "-C", str(repo), "rev-list", "--count", f"{base}..{branch}"]).strip()
+    ahead = int(count) if count.isdigit() else 0
+    if ahead <= 0:
+        return "", 0
+    rel = Path("bundles") / f"{pid}.bundle"
+    dest = cat_dir / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    proc = run(["git", "-C", str(repo), "bundle", "create", str(dest), f"{base}..{branch}"])
+    if proc.returncode != 0 or not dest.is_file():
+        # Fall back to a self-contained bundle of the whole branch.
+        proc = run(["git", "-C", str(repo), "bundle", "create", str(dest), branch])
+    if not dest.is_file():
+        return "", ahead
+    return str(rel), ahead
+
+
 def collect_plugins(cat_dir: Path, home: Path) -> dict:
     plugins_root = home / ".config/omarchy/plugins"
     listing = {item.get("id"): item for item in plugin_list() if item.get("id")}
@@ -879,6 +935,9 @@ def collect_plugins(cat_dir: Path, home: Path) -> dict:
             if info["kind"] == "git" and info["url"]:
                 # ...except uncommitted local work, which upstream does not have.
                 # Pack just the changed files as an overlay, not the whole tree.
+                bundle_rel, ahead = bundle_unpushed(real, info.get("branch") or "", cat_dir, info["id"])
+                info["bundle"] = bundle_rel
+                info["unpushed"] = ahead
                 changed = git_changed_files(real)
                 if changed:
                     overlay_rel = Path("overlays") / info["id"]
@@ -1756,6 +1815,83 @@ def restore_file_tree(cat_dir: Path, home: Path, old_home: str, undo: Path, dry:
     return done
 
 
+def sync_git_checkout(target: Path, plug: dict, cat_dir: Path | None = None) -> str:
+    """Bring an already-installed git plugin to the branch/commit recorded.
+
+    `omarchy plugin add` refuses an id that is already in use, so without this
+    an out-of-date plugin stays out of date while the restore reports success.
+    """
+    want_commit = (plug.get("commit") or "").strip()
+    want_branch = (plug.get("branch") or "").strip()
+    url = (plug.get("url") or "").strip()
+    pid = plug.get("id")
+    if not (target / ".git").exists():
+        return f"{pid} is not a git checkout here, left as is"
+    have = git_head(target)
+    if want_commit and have == want_commit:
+        return f"{pid} already at {want_commit[:12]}"
+    has_overlay = bool(plug.get("overlay"))
+    if git_dirty(target) and not has_overlay:
+        return fail(f"{pid} is at {have[:12]} but the imprint has {want_commit[:12]}; "
+                    "it has uncommitted changes here, so it was left alone")
+    if not url:
+        return fail(f"{pid} is out of date and has no recorded source to update from")
+
+    # The wanted branch may live on a fork while origin points at upstream.
+    remote = "imprint-src"
+    existing = run_ok(["git", "-C", str(target), "remote", "get-url", remote]).strip()
+    if existing != url:
+        if existing:
+            run(["git", "-C", str(target), "remote", "set-url", remote, url])
+        else:
+            run(["git", "-C", str(target), "remote", "add", remote, url])
+    fetched = run(["git", "-C", str(target), "fetch", remote, "--quiet"])
+    if fetched.returncode != 0:
+        return fail(f"{pid}: could not fetch {url}: "
+                    + (fetched.stderr or fetched.stdout).strip()[:160])
+
+    def have_commit() -> bool:
+        return bool(want_commit) and run(
+            ["git", "-C", str(target), "cat-file", "-e", want_commit + "^{commit}"]).returncode == 0
+
+    rel_bundle = plug.get("bundle") or ""
+    if rel_bundle and cat_dir is not None and not have_commit():
+        try:
+            bundle = contained(cat_dir, cat_dir / rel_bundle)
+        except UnsafePath:
+            bundle = None
+        if bundle is not None and bundle.is_file():
+            ref = want_branch or "HEAD"
+            run(["git", "-C", str(target), "fetch", str(bundle),
+                 f"{ref}:refs/remotes/imprint-bundle/{ref}", "--force"])
+
+    if have_commit():
+        target_ref = want_commit
+    elif want_branch and run(["git", "-C", str(target), "rev-parse", "--verify", "--quiet",
+                              f"{remote}/{want_branch}"]).returncode == 0:
+        target_ref = f"{remote}/{want_branch}"
+    else:
+        return fail(
+            f"{pid}: commit {want_commit[:12]} is not on {url}"
+            + (f" and branch {want_branch!r} is not published there" if want_branch else "")
+            + " -- the source machine has unpushed work; push it to make this reproducible")
+
+    # With an overlay the local modifications are the source machine's own work,
+    # reapplied right after this, so discarding them here is safe and required
+    # to move the checkout at all. The pre-restore copy is in the undo dir.
+    force = ["--force"] if has_overlay else []
+    if want_branch:
+        proc = run(["git", "-C", str(target), "checkout", *force, "-B", want_branch, target_ref])
+    else:
+        proc = run(["git", "-C", str(target), "checkout", *force, "--detach", target_ref])
+    if proc.returncode != 0:
+        return fail(f"{pid}: checkout of {target_ref} failed: "
+                    + (proc.stderr or proc.stdout).strip()[:160])
+    now = git_head(target)
+    return (f"updated {pid} {have[:12]} -> {now[:12]}"
+            + (f" on {want_branch}" if want_branch else ""))
+
+
 def restore_plugins(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool) -> list[str]:
     meta_path = cat_dir / "meta.json"
     if not meta_path.is_file():
@@ -1779,6 +1915,8 @@ def restore_plugins(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: b
             if plug.get("kind") == "git" and plug.get("url"):
                 enable = " --enable" if plug.get("enabled") else ""
                 actions.append(f"omarchy plugin add {plug['url']} --yes{enable}")
+                if plug.get("branch"):
+                    actions.append(f"  then checkout {plug['branch']} @ {(plug.get('commit') or '')[:12]}")
                 n = len(plug.get("overlayFiles") or [])
                 if n:
                     actions.append(f"  then reapply {n} local edits to {pid}: "
@@ -1800,16 +1938,23 @@ def restore_plugins(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: b
             blob = (proc.stdout + proc.stderr).lower()
             if proc.returncode == 0:
                 actions.append(f"installed {pid} from source")
+                if plug.get("branch") or plug.get("commit"):
+                    moved = sync_git_checkout(target, plug, cat_dir)
+                    if not moved.endswith("already at " + (plug.get("commit") or "")[:12]):
+                        actions.append(moved)
             elif "already" in blob:
                 # Do not claim an install we did not perform. Say what is there,
                 # and whether it actually came from the recorded source.
                 have = git_remote(target)
                 want = plug["url"]
                 if have and have.rstrip("/").removesuffix(".git") != want.rstrip("/").removesuffix(".git"):
-                    actions.append(fail(
-                        f"{pid} already installed from a DIFFERENT source: {have} (imprint recorded {want})"))
+                    # Not necessarily wrong: the source machine may track a fork
+                    # while this one still points at upstream. The recorded URL
+                    # wins, and sync fetches from it under its own remote.
+                    actions.append(f"{pid} points at {have} here, imprint recorded {want}; syncing from the recorded one")
+                    actions.append(sync_git_checkout(target, plug, cat_dir))
                 elif have:
-                    actions.append(f"{pid} already installed from the same source, left as is")
+                    actions.append(sync_git_checkout(target, plug, cat_dir))
                 else:
                     actions.append(f"{pid} already present (no git remote to compare), left as is")
             else:

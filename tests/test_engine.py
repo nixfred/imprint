@@ -417,11 +417,15 @@ class PluginInstallReportingTests(unittest.TestCase):
     def test_already_present_is_not_reported_as_an_install(self):
         actions = self._run(1, "plugin already exists", "https://example/a.git")
         self.assertFalse(any("installed a.plug from source" in a for a in actions), actions)
-        self.assertTrue(any("already installed from the same source" in a for a in actions), actions)
+        # It now goes through the version sync instead of shrugging.
+        self.assertTrue(any("a.plug" in a for a in actions), actions)
 
-    def test_already_present_from_a_different_source_is_a_failure(self):
-        actions = self._run(1, "plugin already exists", "https://evil/other.git")
-        self.assertTrue(any("DIFFERENT source" in a for a in actions), actions)
+    def test_a_different_recorded_url_is_reported_and_wins(self):
+        # The source machine may track a fork while this one points at upstream.
+        # That is the weather-plugin case; refusing it would block the update.
+        actions = self._run(1, "plugin already exists", "https://upstream/a.git")
+        self.assertTrue(any("imprint recorded https://example/a.git" in a for a in actions), actions)
+        self.assertTrue(any("syncing from the recorded one" in a for a in actions), actions)
 
 
 class EnabledStateTests(unittest.TestCase):
@@ -600,6 +604,95 @@ class PackedUnitTests(unittest.TestCase):
             engine.run, engine.plugin_list = real_run, real_list
             engine.FAILURES.clear()
         self.assertIn(["systemctl", "--user", "enable", "--now", "net-pulse.service"], calls)
+
+
+class GitSyncTests(unittest.TestCase):
+    """An already-installed git plugin must be brought to the recorded version."""
+
+    def _repo(self, root: Path) -> Path:
+        import subprocess
+        root.mkdir(parents=True, exist_ok=True)
+        run = lambda *a: subprocess.run(a, cwd=root, capture_output=True, text=True)
+        run("git", "init", "-q", "-b", "main")
+        run("git", "config", "user.email", "t@t"); run("git", "config", "user.name", "t")
+        return root
+
+    def test_up_to_date_checkout_is_left_alone(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._repo(Path(tmp) / "p")
+            (r / "f.txt").write_text("v1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=r, capture_output=True)
+            subprocess.run(["git", "commit", "-qm", "v1"], cwd=r, capture_output=True)
+            head = engine.git_head(r)
+            msg = engine.sync_git_checkout(r, {"id": "a", "commit": head, "branch": "main"})
+            self.assertIn("already at", msg)
+
+    def test_dirty_checkout_is_never_clobbered(self):
+        import subprocess
+        engine.FAILURES.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._repo(Path(tmp) / "p")
+            (r / "f.txt").write_text("v1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=r, capture_output=True)
+            subprocess.run(["git", "commit", "-qm", "v1"], cwd=r, capture_output=True)
+            (r / "f.txt").write_text("my local edit\n", encoding="utf-8")
+            msg = engine.sync_git_checkout(r, {"id": "a", "commit": "0" * 40, "branch": "main",
+                                               "url": "https://example/a.git"})
+            self.assertIn("uncommitted changes here", msg)
+            self.assertEqual((r / "f.txt").read_text(encoding="utf-8"), "my local edit\n")
+            self.assertEqual(len(engine.FAILURES), 1)
+        engine.FAILURES.clear()
+
+    def test_out_of_date_checkout_is_moved_to_the_recorded_commit(self):
+        import subprocess
+        engine.FAILURES.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self._repo(Path(tmp) / "src")
+            (src / "f.txt").write_text("v1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=src, capture_output=True)
+            subprocess.run(["git", "commit", "-qm", "v1"], cwd=src, capture_output=True)
+            subprocess.run(["git", "checkout", "-qb", "feature/x"], cwd=src, capture_output=True)
+            (src / "f.txt").write_text("v2\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "-qam", "v2"], cwd=src, capture_output=True)
+            want = engine.git_head(src)
+
+            dst = Path(tmp) / "dst"
+            subprocess.run(["git", "clone", "-q", str(src), str(dst)], capture_output=True)
+            subprocess.run(["git", "checkout", "-q", "main"], cwd=dst, capture_output=True)
+            self.assertEqual((dst / "f.txt").read_text(encoding="utf-8"), "v1\n")
+
+            msg = engine.sync_git_checkout(dst, {"id": "a", "commit": want,
+                                                 "branch": "feature/x", "url": str(src)})
+            self.assertIn("updated a", msg)
+            self.assertEqual(engine.git_head(dst), want)
+            self.assertEqual((dst / "f.txt").read_text(encoding="utf-8"), "v2\n")
+            self.assertEqual(engine.git_branch_of(dst), "feature/x")
+            self.assertEqual(engine.FAILURES, [])
+        engine.FAILURES.clear()
+
+    def test_branch_on_a_fork_is_recorded_not_origin(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            up = self._repo(Path(tmp) / "upstream")
+            (up / "f.txt").write_text("x\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=up, capture_output=True)
+            subprocess.run(["git", "commit", "-qm", "x"], cwd=up, capture_output=True)
+            fork = Path(tmp) / "fork"
+            subprocess.run(["git", "clone", "-q", str(up), str(fork)], capture_output=True)
+            subprocess.run(["git", "checkout", "-qb", "side"], cwd=fork, capture_output=True)
+            subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "s"], cwd=fork, capture_output=True)
+
+            work = Path(tmp) / "work"
+            subprocess.run(["git", "clone", "-q", str(up), str(work)], capture_output=True)
+            subprocess.run(["git", "remote", "add", "myfork", str(fork)], cwd=work, capture_output=True)
+            subprocess.run(["git", "fetch", "-q", "myfork"], cwd=work, capture_output=True)
+            subprocess.run(["git", "checkout", "-qb", "side", "--track", "myfork/side"],
+                           cwd=work, capture_output=True)
+            # origin is upstream, but the branch only exists on the fork
+            self.assertEqual(engine.tracking_remote(work), "myfork")
+            self.assertIn("fork", engine.git_remote(work))
+            self.assertEqual(engine.git_branch_of(work), "side")
 
 
 if __name__ == "__main__":
