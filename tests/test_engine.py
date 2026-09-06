@@ -695,5 +695,80 @@ class GitSyncTests(unittest.TestCase):
             self.assertEqual(engine.git_branch_of(work), "side")
 
 
+class GapClosureTests(unittest.TestCase):
+    def test_guarded_source_lines_are_followed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".config/bash").mkdir(parents=True)
+            (home / ".config/bash/aliases.sh").write_text("alias x=y\n", encoding="utf-8")
+            (home / ".bashrc").write_text(
+                "source /usr/share/pkg/rc\n"                       # outside home, skipped
+                'source "$OMARCHY_PATH/default/bash/rc"\n'          # unresolvable, skipped
+                "[[ -r ~/.config/bash/aliases.sh ]] && source ~/.config/bash/aliases.sh\n"
+                "[ -f ~/.config/bash/missing.sh ] && source ~/.config/bash/missing.sh\n",
+                encoding="utf-8")
+            found = [str(f.relative_to(home)) for f in engine.sourced_files(home / ".bashrc", home)]
+            self.assertEqual(found, [".config/bash/aliases.sh"])
+
+    def test_cli_collects_what_the_shell_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            (home / ".config/bash").mkdir(parents=True)
+            (home / ".config/bash/aliases.sh").write_text("alias x=y\n", encoding="utf-8")
+            (home / ".bashrc").write_text(
+                "[[ -r ~/.config/bash/aliases.sh ]] && source ~/.config/bash/aliases.sh\n",
+                encoding="utf-8")
+            cat = Path(tmp) / "cat"; cat.mkdir()
+            meta = engine.collect_cli(cat, home)
+            self.assertIn(".config/bash/aliases.sh", meta["sourcedByShell"])
+            self.assertTrue((cat / "files/.config/bash/aliases.sh").is_file())
+
+    def test_dconf_drops_display_specific_keys(self):
+        self.assertIn("text-scaling-factor", engine.DCONF_SKIP_KEYS)
+        self.assertIn("cursor-size", engine.DCONF_SKIP_KEYS)
+
+    def test_bar_restore_writes_the_other_omarchy_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            cat = t / "cat"
+            files = cat / "files/.config/omarchy"; files.mkdir(parents=True)
+            (files / "workspace-names.json").write_text('{"1":"web"}', encoding="utf-8")
+            home = t / "home"; home.mkdir(); undo = t / "undo"; undo.mkdir()
+            actions = engine.restore_bar(cat, home, "", undo, False)
+            self.assertTrue((home / ".config/omarchy/workspace-names.json").is_file())
+            self.assertTrue(any("bar left alone" in a for a in actions), actions)
+
+    def test_bar_restore_does_not_write_shell_json_as_a_plain_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            files = t / "cat/files/.config/omarchy"; files.mkdir(parents=True)
+            (files / "shell.json").write_text('{"bar":{}}', encoding="utf-8")
+            home = t / "home"; home.mkdir(); undo = t / "undo"; undo.mkdir()
+            done = engine.restore_file_tree_except(t / "cat", home, "", undo, False,
+                                                   skip_rel=".config/omarchy/shell.json")
+            self.assertEqual(done, [])
+            self.assertFalse((home / ".config/omarchy/shell.json").exists())
+
+    def test_source_repo_provenance_is_recovered_by_manifest_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            repo = home / "Projects/mything"; repo.mkdir(parents=True)
+            (repo / "manifest.json").write_text(json.dumps({"id": "me.thing"}), encoding="utf-8")
+            index = engine.source_repo_index(home)
+            self.assertEqual(index.get("me.thing"), [repo])
+
+    def test_trees_match_ignores_repo_only_extras(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            repo = t / "repo"; repo.mkdir()
+            live = t / "live"; live.mkdir()
+            for d in (repo, live):
+                (d / "Panel.qml").write_text("x" * 10, encoding="utf-8")
+            (repo / "README.md").write_text("docs", encoding="utf-8")   # repo-only
+            self.assertTrue(engine.trees_match(repo, live))
+            (live / "extra.qml").write_text("drift", encoding="utf-8")  # live-only = drift
+            self.assertFalse(engine.trees_match(repo, live))
+
+
 if __name__ == "__main__":
     unittest.main()

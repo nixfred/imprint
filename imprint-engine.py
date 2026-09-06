@@ -719,6 +719,27 @@ def machine_facts() -> dict:
     }
 
 
+DCONF_PATH = "/org/gnome/desktop/interface/"
+# Correct on this display, wrong on the next one.
+DCONF_SKIP_KEYS = {"text-scaling-factor", "cursor-size"}
+
+
+def collect_dconf(cat_dir: Path) -> list[str]:
+    dump = run_ok(["dconf", "dump", DCONF_PATH])
+    if not dump.strip():
+        return []
+    kept = []
+    for line in dump.splitlines():
+        key = line.split("=", 1)[0].strip()
+        if key in DCONF_SKIP_KEYS:
+            continue
+        kept.append(line)
+    if not any("=" in line for line in kept):
+        return []
+    (cat_dir / "dconf-interface.ini").write_text("\n".join(kept) + "\n", encoding="utf-8")
+    return [line.split("=", 1)[0].strip() for line in kept if "=" in line]
+
+
 def collect_look(cat_dir: Path, home: Path) -> dict:
     files = []
     for rel in (
@@ -734,6 +755,8 @@ def collect_look(cat_dir: Path, home: Path) -> dict:
         "theme": current_theme(),
         "font": current_font(),
         "files": files,
+        "dconfKeys": collect_dconf(cat_dir),
+        "dconfPath": DCONF_PATH,
     }
     write_json(cat_dir / "meta.json", meta)
     return meta
@@ -770,6 +793,16 @@ def collect_bar(cat_dir: Path, home: Path) -> dict:
     noted = copy_into_category(cat_dir, home / ".config/omarchy/shell.json", home)
     if noted:
         files.append(noted)
+    # shell.toml plus the per-plugin settings files (dock, sandman, workspace
+    # names, ...). These are settings you chose, not regenerable state.
+    omarchy = home / ".config/omarchy"
+    if omarchy.is_dir():
+        for extra in sorted(omarchy.glob("*.json")) + sorted(omarchy.glob("*.toml")):
+            if extra.name == "shell.json" or is_skipped_name(extra.name):
+                continue
+            noted = copy_into_category(cat_dir, extra, home)
+            if noted:
+                files.append(noted)
     shell = {}
     shell_path = home / ".config/omarchy/shell.json"
     if shell_path.is_file():
@@ -891,12 +924,56 @@ def bundle_unpushed(repo: Path, branch: str, cat_dir: Path, pid: str) -> tuple[s
     return str(rel), ahead
 
 
+def source_repo_index(home: Path) -> dict:
+    """manifest id -> checkouts under the project roots that build that plugin.
+
+    A plugin installed by copying files out of a repo loses all trace of where
+    it came from, so it gets packed as an opaque tree. The repo is usually
+    sitting right there in ~/Projects.
+    """
+    index: dict[str, list[Path]] = {}
+    for root_name in PROJECT_ROOTS:
+        root = home / root_name
+        if not root.is_dir():
+            continue
+        for entry in sorted(root.iterdir()):
+            manifest = entry / "manifest.json"
+            if not manifest.is_file():
+                continue
+            try:
+                pid = json.loads(manifest.read_text(encoding="utf-8")).get("id")
+            except (OSError, json.JSONDecodeError):
+                continue
+            if pid:
+                index.setdefault(pid, []).append(entry)
+    return index
+
+
+def trees_match(a: Path, b: Path) -> bool:
+    """Same deployed files and sizes. Repo-only extras (README, deploy.sh,
+    assets) are ignored, since they are not part of what gets installed."""
+    def snapshot(root: Path) -> dict:
+        out = {}
+        for f in iter_files(root):
+            try:
+                out[str(f.relative_to(root))] = f.stat().st_size
+            except (OSError, ValueError):
+                pass
+        return out
+    have, want = snapshot(b), snapshot(a)
+    shared = set(have) & set(want)
+    if not shared or set(have) - shared:
+        return False
+    return all(have[k] == want[k] for k in shared)
+
+
 def collect_plugins(cat_dir: Path, home: Path) -> dict:
     plugins_root = home / ".config/omarchy/plugins"
     listing = {item.get("id"): item for item in plugin_list() if item.get("id")}
     placement, referenced, disabled, have_shell = shell_plugin_state(home)
     live = bool(listing)
     unit_map = plugin_units(home)
+    repo_index = source_repo_index(home)
     records = []
     if plugins_root.is_dir():
         for plugin_dir in sorted(plugins_root.iterdir()):
@@ -959,6 +1036,17 @@ def collect_plugins(cat_dir: Path, home: Path) -> dict:
                 info["packed"] = False
                 records.append(info)
                 continue
+            # Recover provenance for a plugin that was copied out of a repo.
+            for candidate in repo_index.get(info["id"], []):
+                url = git_remote(candidate)
+                if not url:
+                    continue
+                info["sourceRepo"] = rel_under_home(candidate, home)
+                info["sourceRepoUrl"] = url
+                info["sourceRepoCommit"] = git_head(candidate)
+                info["sourceRepoMatches"] = trees_match(candidate, plugin_dir)
+                if info["sourceRepoMatches"]:
+                    break
             tree_rel = Path("trees") / info["id"]
             dest_root = cat_dir / tree_rel
             copied = 0
@@ -978,6 +1066,9 @@ def collect_plugins(cat_dir: Path, home: Path) -> dict:
         "count": len(records),
         "fromSource": sorted(p["id"] for p in records if not p.get("packed")),
         "packed": sorted(p["id"] for p in records if p.get("packed")),
+        "withSourceRepo": sorted(p["id"] for p in records if p.get("sourceRepoUrl")),
+        "packedWithNoSource": sorted(
+            p["id"] for p in records if p.get("packed") and not p.get("sourceRepoUrl")),
         "enabled": sorted(p["id"] for p in records if p.get("enabled")),
         "enabledSource": "plugin list" if live else ("shell.json" if have_shell else "unknown"),
         # Every id the source shell reports as OFF, built-ins included. Without
@@ -1159,6 +1250,40 @@ def collect_services(cat_dir: Path, home: Path) -> dict:
     return meta
 
 
+# `source x` is usually guarded: `[[ -r x ]] && source x`, so anchoring to the
+# start of the line finds nothing. Match after a line start or a shell operator.
+SOURCE_RE = re.compile(r"(?:^|&&|\|\||;|\bthen\b)\s*(?:source|\.)\s+(\S+)", re.MULTILINE)
+
+
+def sourced_files(path: Path, home: Path) -> list[Path]:
+    """Files a shell rc sources from under $HOME.
+
+    Copying .bashrc without these gives a restored shell that errors on every
+    login. Anything outside $HOME belongs to a package, not to this machine.
+    """
+    text = read_text(path)
+    if not text:
+        return []
+    found = []
+    for raw in SOURCE_RE.findall(text):
+        candidate = raw.strip().strip('"').strip("'")
+        if "$" in candidate and "$HOME" not in candidate:
+            continue  # unresolvable variable, e.g. $OMARCHY_PATH
+        candidate = candidate.replace("$HOME", str(home))
+        if candidate.startswith("~"):
+            candidate = str(home) + candidate[1:]
+        if not candidate.startswith("/"):
+            continue
+        target = Path(candidate)
+        try:
+            target.relative_to(home)
+        except ValueError:
+            continue
+        if target.is_file():
+            found.append(target)
+    return found
+
+
 def collect_cli(cat_dir: Path, home: Path) -> dict:
     files = []
     for rel in (
@@ -1170,12 +1295,46 @@ def collect_cli(cat_dir: Path, home: Path) -> dict:
         ".XCompose",
         ".bashrc",
         ".bash_profile",
+        ".bash_logout",
         ".inputrc",
+        ".config/tmux",
+        ".config/environment.d",
+        ".config/user-dirs.dirs",
     ):
         noted = copy_into_category(cat_dir, home / rel, home)
         if noted:
             files.append(noted)
-    meta = {"files": files}
+
+    followed = []
+    for rc in (".bashrc", ".bash_profile"):
+        for extra in sourced_files(home / rc, home):
+            noted = copy_into_category(cat_dir, extra, home)
+            if noted and noted not in files:
+                files.append(noted)
+                followed.append(noted)
+
+    # git hooks are configured by path, so the path is where to look
+    hooks_dir = run_ok(["git", "config", "--global", "--get", "core.hooksPath"]).strip()
+    hooks_rel = ""
+    if hooks_dir:
+        hooks_path = Path(hooks_dir.replace("~", str(home)))
+        if not hooks_path.is_absolute():
+            hooks_path = home / hooks_path
+        # An absolute hooksPath outside $HOME is not this user's to carry, and
+        # staging it would write outside the category tree.
+        try:
+            hooks_path.resolve().relative_to(home.resolve())
+            inside = True
+        except (ValueError, OSError):
+            inside = False
+        if inside:
+            noted = copy_into_category(cat_dir, hooks_path, home)
+            if noted:
+                files.append(noted)
+                hooks_rel = noted
+        else:
+            hooks_rel = f"{hooks_path} (outside home, not collected)"
+    meta = {"files": files, "sourcedByShell": followed, "gitHooks": hooks_rel}
     write_json(cat_dir / "meta.json", meta)
     return meta
 
@@ -1571,8 +1730,11 @@ def render_brief(manifest: dict) -> str:
                 lines.append(f"  `omarchy plugin add {plug['url']}{enable}`")
             elif plug.get("kind") == "clone":
                 lines.append(f"- `{plug['id']}` cloned from `{plug.get('clonedFrom')}`")
+            elif plug.get("sourceRepoUrl"):
+                match = "" if plug.get("sourceRepoMatches") else " (installed copy has drifted)"
+                lines.append(f"- `{plug['id']}` packed; source repo `{plug['sourceRepoUrl']}`{match}")
             else:
-                lines.append(f"- `{plug['id']}` local tree, packed in this archive")
+                lines.append(f"- `{plug['id']}` local tree, packed in this archive (no source repo found)")
     pkgs = cats.get("packages") or {}
     if pkgs.get("repo") or pkgs.get("aur"):
         lines += ["", "## Extra packages", ""]
@@ -1892,6 +2054,33 @@ def sync_git_checkout(target: Path, plug: dict, cat_dir: Path | None = None) -> 
             + (f" on {want_branch}" if want_branch else ""))
 
 
+def restore_file_tree_except(cat_dir: Path, home: Path, old_home: str, undo: Path,
+                             dry: bool, skip_rel: str) -> list[str]:
+    files_root = cat_dir / "files"
+    done = []
+    if not files_root.is_dir():
+        return done
+    for path in iter_files(files_root):
+        rel = path.relative_to(files_root)
+        if str(rel) == skip_rel:
+            continue
+        dest = home / rel
+        try:
+            contained(home, dest.parent)
+        except UnsafePath:
+            done.append(f"refused {rel} (escapes home)")
+            continue
+        if dry:
+            done.append(str(rel))
+            continue
+        backup_existing(dest, undo, home)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        copy_file(path, dest)
+        rewrite_in_place(dest, old_home, str(home))
+        done.append(str(rel))
+    return done
+
+
 def restore_plugins(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool) -> list[str]:
     meta_path = cat_dir / "meta.json"
     if not meta_path.is_file():
@@ -1987,7 +2176,11 @@ def restore_plugins(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: b
                     else:
                         target.unlink()
                 overlay_tree(tree, target, old_home, home)
-                actions.append(f"plugin tree {pid}")
+                note = ""
+                if plug.get("sourceRepoUrl"):
+                    note = (f" (source: {plug['sourceRepoUrl']}"
+                            + ("" if plug.get("sourceRepoMatches") else ", installed copy had drifted") + ")")
+                actions.append(f"plugin tree {pid}{note}")
             elif plug.get("kind") == "clone" and plug.get("clonedFrom"):
                 run(["omarchy", "plugin", "clone", plug["clonedFrom"]])
                 actions.append(f"plugin clone {plug['clonedFrom']}")
@@ -2156,6 +2349,18 @@ def restore_themes(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bo
 
 def restore_look(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool, manifest: dict) -> list[str]:
     actions = restore_file_tree(cat_dir, home, old_home, undo, dry)
+    dconf_file = cat_dir / "dconf-interface.ini"
+    if dconf_file.is_file():
+        if dry:
+            actions.append(f"dconf load {DCONF_PATH} ({len(dconf_file.read_text().splitlines())} lines)")
+        elif not shutil.which("dconf"):
+            actions.append("dconf not installed, GTK appearance skipped")
+        else:
+            proc = subprocess.run(["dconf", "load", DCONF_PATH],
+                                  input=dconf_file.read_text(encoding="utf-8"),
+                                  text=True, capture_output=True)
+            actions.append("dconf appearance loaded" if proc.returncode == 0
+                           else fail("dconf load failed: " + (proc.stderr or proc.stdout).strip()[:200]))
     meta_path = cat_dir / "meta.json"
     theme = manifest.get("theme")
     font = manifest.get("font")
@@ -2188,11 +2393,14 @@ def restore_bar(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool)
         # packed relative without leading handling
         matches = list((cat_dir / "files").rglob("shell.json")) if (cat_dir / "files").is_dir() else []
         shell_src = matches[0] if matches else shell_src
+    # Everything except shell.json is a plain file; shell.json needs config-edit.
+    others = restore_file_tree_except(cat_dir, home, old_home, undo, dry,
+                                      skip_rel=".config/omarchy/shell.json")
     if not shell_src.is_file():
-        return ["no shell.json in this imprint, bar left alone"]
+        return others + ["no shell.json in this imprint, bar left alone"]
     dest = home / ".config/omarchy/shell.json"
     if dry:
-        return ["shell.json via config-edit"]
+        return others + ["shell.json via config-edit"]
     text = rewrite_text(shell_src.read_text(encoding="utf-8"), old_home, str(home))
 
     # Never write dest directly while the shell is up. `config-edit` exists to
@@ -2221,20 +2429,20 @@ def restore_bar(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool)
                 ]
             )
             if apply.returncode == 0:
-                return ["shell.json via config-edit"]
+                return others + ["shell.json via config-edit"]
             detail = (apply.stderr or apply.stdout).strip()[:200]
-            return [fail(f"shell.json NOT applied, config-edit refused: {detail}")]
+            return others + [fail(f"shell.json NOT applied, config-edit refused: {detail}")]
         # A failed snapshot is not proof the shell is stopped -- it could be an
         # IPC error or a timeout. Only write directly when the shell really is
         # down, otherwise refuse and say so.
         if shell_is_running():
             detail = (snap_proc.stderr or snap_proc.stdout).strip()[:200]
-            return [fail(f"shell.json NOT applied: shell is up but snapshot failed: {detail}")]
+            return others + [fail(f"shell.json NOT applied: shell is up but snapshot failed: {detail}")]
         if dest.exists():
             backup_existing(dest, undo, home)
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(text, encoding="utf-8")
-        return ["shell.json written directly (shell not running)"]
+        return others + ["shell.json written directly (shell not running)"]
     finally:
         for path in (snap, edited):
             try:
