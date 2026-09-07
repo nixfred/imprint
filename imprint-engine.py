@@ -145,6 +145,27 @@ CATEGORIES = [
         "risk": "portable",
     },
     {
+        "id": "fonts",
+        "title": "Fonts and icons",
+        "summary": "Your own fonts, icon themes and cursors under ~/.local/share",
+        "default": True,
+        "risk": "portable",
+    },
+    {
+        "id": "home",
+        "title": "Home documents",
+        "summary": "Hand-written notes and instructions at the top of your home dir",
+        "default": True,
+        "risk": "portable",
+    },
+    {
+        "id": "configs",
+        "title": "Other app configs",
+        "summary": "Everything else under ~/.config that no other category claims",
+        "default": True,
+        "risk": "portable",
+    },
+    {
         "id": "wallpapers",
         "title": "Wallpaper overlays",
         "summary": "Extra images under ~/.config/omarchy/backgrounds — often huge",
@@ -211,8 +232,114 @@ CATEGORIES = [
 # watching, which is what is actually being collected.
 
 RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
-FG = {"green": "\033[38;5;114m", "blue": "\033[38;5;111m", "amber": "\033[38;5;179m",
-      "red": "\033[38;5;174m", "grey": "\033[38;5;245m"}
+_FALLBACK_FG = {"green": "\033[38;5;114m", "blue": "\033[38;5;111m", "amber": "\033[38;5;179m",
+                "red": "\033[38;5;174m", "grey": "\033[38;5;245m", "accent": "\033[38;5;111m"}
+
+
+def theme_dir() -> Path | None:
+    """Where the active Omarchy theme lives, user themes winning over stock."""
+    name = current_theme()
+    if not name:
+        return None
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    roots = [Path.home() / ".config/omarchy/themes",
+             Path(os.environ.get("OMARCHY_PATH", "/usr/share/omarchy")) / "themes"]
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for candidate in (root / slug, root / name):
+            if (candidate / "colors.toml").is_file():
+                return candidate
+        for entry in root.iterdir():
+            if entry.is_dir() and re.sub(r"[^a-z0-9]+", "-", entry.name.lower()).strip("-") == slug:
+                if (entry / "colors.toml").is_file():
+                    return entry
+    return None
+
+
+def theme_colours() -> dict:
+    """The active theme's palette, so imprint looks like the rest of the desktop."""
+    directory = theme_dir()
+    if directory is None:
+        return {}
+    try:
+        import tomllib
+        with (directory / "colors.toml").open("rb") as fh:
+            data = tomllib.load(fh)
+    except Exception:
+        return {}
+    return {k: v for k, v in data.items() if isinstance(v, str) and v.startswith("#")}
+
+
+def hex_rgb(value: str) -> tuple[int, int, int] | None:
+    value = (value or "").lstrip("#")
+    if len(value) != 6:
+        return None
+    try:
+        return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+    except ValueError:
+        return None
+
+
+def truecolour(value: str) -> str:
+    rgb = hex_rgb(value)
+    return f"\033[38;2;{rgb[0]};{rgb[1]};{rgb[2]}m" if rgb else ""
+
+
+def xterm256(value: str) -> int:
+    """Nearest xterm-256 index, for curses which cannot take a hex string."""
+    rgb = hex_rgb(value)
+    if not rgb:
+        return 4
+    r, g, b = rgb
+    if abs(r - g) < 10 and abs(g - b) < 10:
+        return max(232, min(255, 232 + round((r - 8) / 247 * 23)))
+    idx = lambda c: 0 if c < 48 else 1 if c < 115 else min(5, (c - 35) // 40)
+    return 16 + 36 * idx(r) + 6 * idx(g) + idx(b)
+
+
+def _build_palette() -> dict:
+    colours = theme_colours()
+    if not colours:
+        return dict(_FALLBACK_FG)
+    pick = lambda *names: next((colours[n] for n in names if n in colours), "")
+    out = {}
+    for key, names in (("green", ("green",)), ("red", ("red",)),
+                       ("amber", ("orange", "yellow")), ("blue", ("blue", "accent")),
+                       ("grey", ("dark_foreground", "muted")), ("accent", ("accent", "blue"))):
+        code = truecolour(pick(*names))
+        out[key] = code or _FALLBACK_FG.get(key, "")
+    return out
+
+
+class _Palette:
+    """Built on first use: the theme lookup needs helpers defined further down,
+    and shelling out to `omarchy theme current` at import time would be rude."""
+
+    def __init__(self):
+        self._resolved = None
+
+    def _load(self) -> dict:
+        if self._resolved is None:
+            try:
+                self._resolved = _build_palette()
+            except Exception:
+                self._resolved = dict(_FALLBACK_FG)
+        return self._resolved
+
+    def __getitem__(self, key):
+        return self._load()[key]
+
+    def get(self, key, default=""):
+        return self._load().get(key, default)
+
+
+FG = _Palette()
+
+
+def theme_accent() -> int:
+    colours = theme_colours()
+    return xterm256(colours.get("accent") or colours.get("blue") or "#5f87ff")
 TICK, CROSS, DOTS = "\u2713", "\u2717", "\u22ef"
 
 
@@ -673,11 +800,22 @@ def rewrite_in_place(dest: Path, old_home: str, new_home: str) -> None:
             pass
 
 
+def copyable(path: Path) -> bool:
+    """Regular files and symlinks only. A socket, fifo or device node cannot be
+    copied -- ~/.config/cliamp/cliamp.sock crashed a whole save."""
+    try:
+        mode = path.lstat().st_mode
+    except OSError:
+        return False
+    return stat.S_ISREG(mode) or stat.S_ISLNK(mode)
+
+
 def iter_files(root: Path):
-    if not root.exists():
+    if not root.exists() and not root.is_symlink():
         return
     if root.is_file() or root.is_symlink():
-        yield root
+        if copyable(root):
+            yield root
         return
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         dirnames[:] = [name for name in dirnames if not is_skipped_name(name)]
@@ -685,7 +823,7 @@ def iter_files(root: Path):
             if is_skipped_name(name):
                 continue
             candidate = Path(dirpath) / name
-            if not packable_symlink(candidate):
+            if not copyable(candidate) or not packable_symlink(candidate):
                 continue
             yield candidate
 
@@ -721,6 +859,8 @@ def copy_into_category(cat_dir: Path, src: Path, home: Path) -> str | None:
     if not src.exists() and not src.is_symlink():
         return None
     if not packable_symlink(src):
+        return None
+    if not src.is_dir() and not copyable(src):
         return None
     rel = rel_under_home(src, home)
     dest = stage_path(cat_dir, rel)
@@ -1204,26 +1344,50 @@ def collect_plugins(cat_dir: Path, home: Path) -> dict:
 
 
 def collect_themes(cat_dir: Path, home: Path) -> dict:
-    themes_root = home / ".config/omarchy/themes"
+    roots = [home / ".config/omarchy/themes"]
+    stock_root = Path(os.environ.get("OMARCHY_PATH", "/usr/share/omarchy")) / "themes"
+    # A stock theme is only collected when it was explicitly chosen: it normally
+    # arrives with Omarchy, but offering it in the picker and then quietly not
+    # capturing it would be a lie.
+    if SUBSELECT.get("themes") and stock_root.is_dir():
+        roots.append(stock_root)
     records = []
-    if themes_root.is_dir():
+    seen: set[str] = set()
+    for themes_root in roots:
+        if not themes_root.is_dir():
+            continue
         for theme_dir in sorted(themes_root.iterdir()):
-            if not theme_dir.is_dir():
+            if not theme_dir.is_dir() or theme_dir.name in seen:
                 continue
             if not wanted("themes", theme_dir.name):
                 continue
+            seen.add(theme_dir.name)
             url = git_remote(theme_dir)
+            is_stock = theme_dir.parent == stock_root
             rec = {
                 "id": theme_dir.name,
                 "url": url,
                 "commit": git_head(theme_dir),
-                "kind": "git" if url else "local",
+                "kind": "git" if url else ("stock" if is_stock else "local"),
+                "stock": is_stock,
             }
             if not url:
-                copied = copy_into_category(cat_dir, theme_dir, home)
-                rec["copied"] = copied
+                if is_stock:
+                    # Stock themes live outside $HOME, so stage them by hand.
+                    dest_root = cat_dir / "stock" / theme_dir.name
+                    count = 0
+                    for f in iter_files(theme_dir):
+                        try:
+                            copy_file(f, dest_root / f.relative_to(theme_dir))
+                            count += 1
+                        except (OSError, ValueError):
+                            pass
+                    rec["copied"] = f"stock/{theme_dir.name} ({count} files)"
+                else:
+                    rec["copied"] = copy_into_category(cat_dir, theme_dir, home)
             records.append(rec)
-    meta = {"themes": records, "current": current_theme()}
+    meta = {"themes": records, "current": current_theme(),
+            "stockIncluded": sorted(r["id"] for r in records if r.get("stock"))}
     write_json(cat_dir / "meta.json", meta)
     return meta
 
@@ -1531,10 +1695,17 @@ def collect_secrets(cat_dir: Path, home: Path) -> dict:
                     files.append(noted)
             elif path.is_file() and path.name not in {"known_hosts.old"}:
                 skipped.append(path.name)
+    # Shell history and the gh token live here rather than in a default save:
+    # history routinely contains pasted tokens and one-off passwords.
+    for rel in (".bash_history", ".zsh_history", ".python_history", ".config/gh"):
+        noted = copy_into_category(cat_dir, home / rel, home)
+        if noted:
+            files.append(noted)
     meta = {
         "files": files,
         "private_keys_present_not_copied": skipped,
-        "note": "Private keys stay on the source machine unless you copy them yourself.",
+        "note": "Private keys stay on the source machine unless you copy them yourself. "
+                "Shell history and gh credentials are here because they leak secrets.",
     }
     write_json(cat_dir / "meta.json", meta)
     return meta
@@ -1762,6 +1933,91 @@ def collect_toolchains(cat_dir: Path, home: Path) -> dict:
     return meta
 
 
+# ~/.config entries other categories already own, or that must never travel.
+CONFIG_CLAIMED = {
+    "hypr", "omarchy", "foot", "kitty", "alacritty", "ghostty", "mimeapps.list",
+    "xdg-terminals.list", "starship.toml", "git", "btop", "lazygit", "systemd",
+    "nvim", "mise", "bash", "environment.d", "tmux", "user-dirs.dirs",
+}
+# Browser profiles and credential stores: gigabytes, and full of live sessions.
+CONFIG_SKIP = {
+    "BraveSoftware", "chromium", "chromium-headless", "google-chrome",
+    "google-chrome-beta", "google-chrome-for-testing", "google-chrome-unstable",
+    "microsoft-edge", "microsoft-edge-dev", "mozilla", "opera", "vivaldi", "zen",
+    "gh", "rclone", "omarchy-tesla", "x-api", "Codex", "claude", "keyrings",
+}
+CONFIG_MAX_BYTES = 8 * 1024 * 1024
+
+
+def collect_configs(cat_dir: Path, home: Path) -> dict:
+    """The long tail of ~/.config. Skips what other categories own, browser
+    profiles, and credential stores; everything skipped is reported."""
+    root = home / ".config"
+    kept, skipped = [], []
+    if root.is_dir():
+        for entry in sorted(root.iterdir()):
+            name = entry.name
+            if name in CONFIG_CLAIMED or is_skipped_name(name):
+                continue
+            if not wanted("configs", name):
+                continue
+            if name in CONFIG_SKIP:
+                skipped.append({"path": name, "why": "browser profile or credential store"})
+                continue
+            size = dir_size(entry) if entry.is_dir() else (
+                entry.stat().st_size if entry.is_file() else 0)
+            if size > CONFIG_MAX_BYTES:
+                skipped.append({"path": name, "why": f"{human_size(size)}, over the cap"})
+                continue
+            noted = copy_into_category(cat_dir, entry, home)
+            if noted:
+                kept.append(noted)
+    meta = {"files": kept, "skipped": skipped, "cap": human_size(CONFIG_MAX_BYTES)}
+    write_json(cat_dir / "meta.json", meta)
+    return meta
+
+
+def collect_fonts(cat_dir: Path, home: Path) -> dict:
+    """dconf records an icon and cursor theme by name; without the assets a
+    restored machine silently falls back to defaults."""
+    files = []
+    for rel in (".local/share/fonts", ".local/share/icons", ".icons",
+                ".local/share/cursors", ".fonts", ".config/fontconfig"):
+        noted = copy_into_category(cat_dir, home / rel, home)
+        if noted:
+            files.append(noted)
+    meta = {"files": files}
+    write_json(cat_dir / "meta.json", meta)
+    return meta
+
+
+HOME_DOC_SUFFIXES = {".md", ".txt", ".org", ".rst"}
+
+
+def collect_home(cat_dir: Path, home: Path) -> dict:
+    """Hand-written files sitting loose in $HOME that nothing else backs up."""
+    files, skipped = [], []
+    for entry in sorted(home.iterdir()):
+        if not entry.is_file() or entry.name.startswith("."):
+            continue
+        if is_skipped_name(entry.name) or entry.suffix.lower() not in HOME_DOC_SUFFIXES:
+            continue
+        if not wanted("home", entry.name):
+            continue
+        try:
+            if entry.stat().st_size > TEXT_LIMIT * 4:
+                skipped.append(entry.name)
+                continue
+        except OSError:
+            continue
+        noted = copy_into_category(cat_dir, entry, home)
+        if noted:
+            files.append(noted)
+    meta = {"files": files, "skipped_oversized": skipped}
+    write_json(cat_dir / "meta.json", meta)
+    return meta
+
+
 COLLECTORS = {
     "look": collect_look,
     "wallpapers": collect_wallpapers,
@@ -1785,6 +2041,9 @@ COLLECTORS = {
     "projects": collect_projects,
     "toolchains": collect_toolchains,
     "system": collect_system,
+    "configs": collect_configs,
+    "fonts": collect_fonts,
+    "home": collect_home,
 }
 
 
@@ -2018,6 +2277,42 @@ def open_imprint(path: Path, tmp: Path) -> Path:
 def cmd_categories(_args) -> int:
     json.dump(catalog_payload(), sys.stdout, indent=2)
     sys.stdout.write("\n")
+    return 0
+
+
+def osc8(url: str, label: str = "") -> str:
+    """OSC 8 hyperlink: clickable in foot, kitty, ghostty, alacritty and others,
+    and degrades to plain text where it is not supported."""
+    label = label or url
+    if not sys.stdout.isatty():
+        return f"{label} ({url})" if label != url else url
+    return f"\033]8;;{url}\033\\{label}\033]8;;\033\\"
+
+
+REPO_URL = "https://github.com/nixfred/imprint"
+SITE_URL = "https://nixfred.com"
+
+
+def cmd_about(_args) -> int:
+    colours = theme_colours()
+    accent = truecolour(colours.get("accent") or "") or FG.get("blue", "")
+    grey = FG.get("grey", "")
+    tint = colour_ok(sys.stdout)
+    c = lambda code, text: f"{code}{text}{RESET}" if tint and code else text
+    lines = [
+        "",
+        c(BOLD, "Imprint"),
+        c(grey, "Stamp one Omarchy machine onto another."),
+        "",
+        "Fred Nix",
+        "  " + c(accent, osc8(REPO_URL, "github.com/nixfred/imprint")),
+        "  " + c(accent, osc8(SITE_URL, "nixfred.com")),
+        "",
+        c(grey, f"schema {SCHEMA}  ·  {len(CATEGORIES)} categories  ·  MIT"),
+        c(grey, f"this machine: {hostname()}  ·  Omarchy {omarchy_version()}  ·  theme {current_theme()}"),
+        "",
+    ]
+    sys.stdout.write("\n".join(lines) + "\n")
     return 0
 
 
@@ -3770,11 +4065,24 @@ def package_children() -> list[Node]:
 
 
 def theme_children(home: Path) -> list[Node]:
-    root = home / ".config/omarchy/themes"
-    if not root.is_dir():
-        return []
-    return [Node(d.name, d.name, "git" if git_remote(d) else "local", selected=True)
-            for d in sorted(root.iterdir()) if d.is_dir()]
+    """Every theme on the machine. Stock ones come back with Omarchy, so they
+    are listed but off -- previously they were not listed at all, which made it
+    look like themes were missing."""
+    out, seen = [], set()
+    user_root = home / ".config/omarchy/themes"
+    if user_root.is_dir():
+        for d in sorted(user_root.iterdir()):
+            if not d.is_dir() or is_skipped_name(d.name):
+                continue
+            seen.add(d.name)
+            out.append(Node(d.name, d.name, "git" if git_remote(d) else "yours", selected=True))
+    stock_root = Path(os.environ.get("OMARCHY_PATH", "/usr/share/omarchy")) / "themes"
+    if stock_root.is_dir():
+        for d in sorted(stock_root.iterdir()):
+            if not d.is_dir() or d.name in seen:
+                continue
+            out.append(Node(d.name, d.name, "stock, ships with Omarchy", selected=False))
+    return out
 
 
 def script_children(home: Path) -> list[Node]:
@@ -3840,23 +4148,43 @@ def _draw(stdscr, rows, cursor, top, trail, header, height, width):
             continue
         st = node.state()
         mark = {"on": MARK_ON, "off": MARK_OFF, "partial": MARK_PART}[st]
-        arrow = MARK_SUB if node.is_branch else " "
-        count = f" ({len(node.children)})" if node.is_branch else ""
+        branch = node.is_branch
+        count = f" ({len(node.children)})" if branch else ""
         if isinstance(node, SelectAll):
             count = ""
-        text = f" {mark} {node.label}{count} {arrow}"
+        # The arrow leads the label so a submenu reads as a submenu at a glance,
+        # and the label is highlighted rather than left looking like a leaf.
+        lead = f"{MARK_SUB} " if branch else "  "
+        label = f"{node.label}{count}"
+        text = f" {mark} {lead}{label}"
+        pad = max(1, 40 - len(text))
         if node.hint:
-            text += f"   {node.hint}"
+            text += " " * pad + node.hint
         attr = curses.A_REVERSE if idx == cursor else curses.A_NORMAL
+        if branch and idx != cursor:
+            attr |= curses.A_BOLD
         stdscr.addnstr(3 + i, 0, text[:width - 1].ljust(width - 1), width - 1, attr)
-    hints = ("space toggles \u00b7 space on \u25b8 opens the submenu \u00b7 \u2190 back \u00b7 "
-             "t whole group \u00b7 a all \u00b7 n none \u00b7 q cancel")
+        if branch and idx != cursor:
+            # Tint just the arrow. Wrapped because has_colors() raises unless a
+            # screen is up, and a narrow window makes chgat fail.
+            try:
+                if curses.has_colors():
+                    stdscr.chgat(3 + i, 3, 1, curses.color_pair(1) | curses.A_BOLD)
+            except (curses.error, AttributeError):
+                pass
+    hints = ("\u2192/\u2190 move \u00b7 space toggles \u00b7 space on \u25b8 opens a submenu \u00b7 "
+             "esc back \u00b7 t group \u00b7 a all \u00b7 n none \u00b7 q cancel")
     stdscr.addnstr(height - 1, 0, hints[:width - 1], width - 1, curses.A_DIM)
     stdscr.refresh()
 
 
 def _pick_loop(stdscr, roots, header):
     curses.curs_set(0)
+    try:
+        curses.use_default_colors()
+        curses.init_pair(1, theme_accent(), -1)
+    except curses.error:
+        pass
     stdscr.keypad(True)
     trail: list[Node] = []
     rows = roots
@@ -3905,7 +4233,11 @@ def _pick_loop(stdscr, roots, header):
             cursor = 0
         elif key == curses.KEY_END:
             cursor = len(rows) - 1
-        elif key in (ord(" "), curses.KEY_ENTER, 10, 13, curses.KEY_RIGHT, ord("l")):
+        elif key in (curses.KEY_RIGHT, ord("l")):
+            cursor += 1
+        elif key in (curses.KEY_LEFT, ord("h")):
+            cursor -= 1
+        elif key in (ord(" "), curses.KEY_ENTER, 10, 13):
             # Space and enter both mean "act on this row" and nothing else
             # confirms, so selecting everything cannot start the run.
             if node is None:
@@ -3915,11 +4247,9 @@ def _pick_loop(stdscr, roots, header):
             if node.is_branch:
                 trail.append(node)
                 rows, cursor, top = node.children, 0, 0
-            elif key in (curses.KEY_RIGHT, ord("l")):
-                continue
             else:
                 node.selected = not node.selected
-        elif key in (curses.KEY_LEFT, ord("h"), 27, curses.KEY_BACKSPACE, 127, 8):
+        elif key in (27, curses.KEY_BACKSPACE, 127, 8):
             if trail:
                 parent = trail.pop()
                 rows = trail[-1].children if trail else roots
@@ -4084,6 +4414,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("categories")
     sub.add_parser("facts")
+    sub.add_parser("about")
     save = sub.add_parser("save")
     save.add_argument("--json", action="store_true", help="print the machine-readable report")
     save.add_argument("--only", default="")
@@ -4143,6 +4474,7 @@ def main(argv: list[str] | None = None) -> int:
     dispatch = {
         "categories": cmd_categories,
         "facts": cmd_facts,
+        "about": cmd_about,
         "save": cmd_save,
         "restore": cmd_restore,
         "info": cmd_info,

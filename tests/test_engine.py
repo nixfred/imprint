@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import importlib.util
 import json
+import os
 import sys
 import shutil
 import tempfile
@@ -1208,6 +1209,108 @@ class ActionRowTests(unittest.TestCase):
         self.assertIn("\u25b6", line)                       # ▶
         for mark in (engine.MARK_ON, engine.MARK_OFF, engine.MARK_PART):
             self.assertNotIn(mark, line)
+
+
+class WiderCaptureTests(unittest.TestCase):
+    def test_sockets_and_fifos_are_never_copied(self):
+        import socket
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            regular = t / "ok.conf"; regular.write_text("x", encoding="utf-8")
+            sock_path = t / "app.sock"
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            srv.bind(str(sock_path))
+            fifo = t / "pipe"; os.mkfifo(fifo)
+            try:
+                self.assertTrue(engine.copyable(regular))
+                self.assertFalse(engine.copyable(sock_path))
+                self.assertFalse(engine.copyable(fifo))
+                found = {f.name for f in engine.iter_files(t)}
+                self.assertEqual(found, {"ok.conf"})
+            finally:
+                srv.close()
+
+    def test_stock_themes_are_listed_but_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            (home / ".config/omarchy/themes/mine").mkdir(parents=True)
+            stock = Path(tmp) / "share/themes"
+            (stock / "shipped").mkdir(parents=True)
+            old = os.environ.get("OMARCHY_PATH")
+            os.environ["OMARCHY_PATH"] = str(Path(tmp) / "share")
+            try:
+                rows = engine.theme_children(home)
+            finally:
+                if old is None: os.environ.pop("OMARCHY_PATH", None)
+                else: os.environ["OMARCHY_PATH"] = old
+            by = {r.label: r for r in rows}
+            self.assertIn("mine", by); self.assertIn("shipped", by)
+            self.assertTrue(by["mine"].selected)
+            self.assertFalse(by["shipped"].selected)      # ships with Omarchy
+            self.assertIn("stock", by["shipped"].hint)
+
+    def test_configs_sweep_skips_with_a_stated_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            cfg = home / ".config"
+            for name in ("hypr", "BraveSoftware", "littleapp"):
+                (cfg / name).mkdir(parents=True)
+            (cfg / "littleapp/conf.ini").write_text("a=1", encoding="utf-8")
+            (cfg / "BraveSoftware/profile").write_text("secrets", encoding="utf-8")
+            cat = Path(tmp) / "cat"; cat.mkdir()
+            meta = engine.collect_configs(cat, home)
+            kept = " ".join(meta["files"])
+            self.assertIn("littleapp", kept)
+            self.assertNotIn("hypr", kept)                # owned by another category
+            reasons = {x["path"]: x["why"] for x in meta["skipped"]}
+            self.assertIn("BraveSoftware", reasons)
+            self.assertIn("credential", reasons["BraveSoftware"])
+
+    def test_configs_sweep_caps_huge_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            big = home / ".config/hog"; big.mkdir(parents=True)
+            (big / "blob").write_bytes(b"0" * (engine.CONFIG_MAX_BYTES + 1024))
+            cat = Path(tmp) / "cat"; cat.mkdir()
+            meta = engine.collect_configs(cat, home)
+            reasons = {x["path"]: x["why"] for x in meta["skipped"]}
+            self.assertIn("hog", reasons)
+            self.assertIn("over the cap", reasons["hog"])
+
+    def test_home_documents_are_collected_but_not_dotfiles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"; home.mkdir(parents=True)
+            (home / "AGENTS.md").write_text("notes", encoding="utf-8")
+            (home / "list.txt").write_text("todo", encoding="utf-8")
+            (home / ".bashrc").write_text("shell", encoding="utf-8")
+            (home / "photo.png").write_bytes(b"\x89PNG")
+            cat = Path(tmp) / "cat"; cat.mkdir()
+            meta = engine.collect_home(cat, home)
+            self.assertEqual(sorted(meta["files"]), ["AGENTS.md", "list.txt"])
+
+    def test_shell_history_rides_with_secrets_not_a_default_save(self):
+        self.assertFalse(engine.category_by_id("secrets")["default"])
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            (home / ".ssh").mkdir(parents=True)
+            (home / ".ssh/id.pub").write_text("ssh-ed25519 AAA", encoding="utf-8")
+            (home / ".bash_history").write_text("export TOKEN=hunter2\n", encoding="utf-8")
+            cat = Path(tmp) / "cat"; cat.mkdir()
+            meta = engine.collect_secrets(cat, home)
+            self.assertIn(".bash_history", " ".join(meta["files"]))
+            self.assertTrue((cat / "files/.bash_history").is_file())
+
+    def test_about_links_are_clickable_or_degrade(self):
+        plain = engine.osc8("https://nixfred.com", "nixfred.com")
+        self.assertIn("nixfred.com", plain)
+        self.assertIn("https://nixfred.com", plain)       # visible when not a tty
+
+    def test_theme_palette_falls_back_when_no_theme(self):
+        for key in ("green", "red", "amber", "blue", "grey", "accent"):
+            self.assertIsInstance(engine.FG.get(key, ""), str)
+        self.assertEqual(engine.hex_rgb("#ff8000"), (255, 128, 0))
+        self.assertIsNone(engine.hex_rgb("nonsense"))
+        self.assertIsInstance(engine.theme_accent(), int)
 
 
 if __name__ == "__main__":

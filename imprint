@@ -133,6 +133,7 @@ Usage:
   imprint undo                Put back files from the last restore
   imprint list                Archives in ~/imprints
   imprint facts               This machine as JSON
+  imprint about               Version, author and links
 
 In the picker: space toggles the highlighted row. A row marked ▸ has a
 submenu -- space opens it, ← goes back. The top row selects everything and
@@ -327,6 +328,7 @@ main_menu() {
     "Diff against this machine" \
     "Undo last restore" \
     "List archives" \
+    "About" \
     "Quit") || exit 0
   case $choice in
     "Save this machine") do_save ;;
@@ -346,6 +348,7 @@ main_menu() {
       engine undo
       ;;
     "List archives") do_list ;;
+    "About") banner; engine about ;;
     "Quit") exit 0 ;;
   esac
 }
@@ -441,6 +444,9 @@ case $cmd in
     ;;
   facts)
     engine facts
+    ;;
+  about)
+    engine about
     ;;
   *)
     usage

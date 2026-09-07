@@ -76,7 +76,11 @@ there to keep editing. The run begins only when you pick the last row:
    ▶ Start backup   14 categories selected
 ```
 
-Other keys: `t` toggles a whole group, `a` all, `n` none, `q` cancels.
+`→` and `←` move down and up the list; `esc` leaves a submenu. Other keys:
+`t` toggles a whole group, `a` all, `n` none, `q` cancels.
+
+Colours come from your active Omarchy theme's `colors.toml`, so the picker and
+the progress output match the rest of the desktop.
 
 ```
 imprint save                         # picker, writes ~/imprints/imprint-$host-$time.tar.zst
@@ -187,7 +191,16 @@ On by default (safe to take to another machine):
   policy, pacman config, docker daemon) and the list of enabled system units.
   Off by default and never applied without `--allow-system`; credentials, host
   keys and wifi secrets are never collected
-- **Themes** — git remotes via `omarchy theme install`; local themes copied
+- **Themes** — every theme on the machine. Yours are on by default; the stock
+  ones that ship with Omarchy are listed but off, and are only packed if you
+  pick them
+- **Fonts and icons** — your own fonts, icon themes and cursors, so a restored
+  machine can honour the icon/cursor theme dconf asks for
+- **Home documents** — hand-written notes at the top of `~` (`AGENTS.md`, wish
+  lists) that nothing else backs up
+- **Other app configs** — the long tail of `~/.config` no other category claims.
+  Browser profiles, credential stores and anything over 8 MB are skipped, and
+  every skip is reported with its reason
 - **Hooks and menu**
 - **Terminals**
 - **Defaults** — MIME, browser, editor, agent
