@@ -746,8 +746,8 @@ class GapClosureTests(unittest.TestCase):
             files = t / "cat/files/.config/omarchy"; files.mkdir(parents=True)
             (files / "shell.json").write_text('{"bar":{}}', encoding="utf-8")
             home = t / "home"; home.mkdir(); undo = t / "undo"; undo.mkdir()
-            done = engine.restore_file_tree_except(t / "cat", home, "", undo, False,
-                                                   skip_rel=".config/omarchy/shell.json")
+            done = engine.restore_file_tree(t / "cat", home, "", undo, False,
+                                            skip_rel=".config/omarchy/shell.json")
             self.assertEqual(done, [])
             self.assertFalse((home / ".config/omarchy/shell.json").exists())
 
@@ -1427,6 +1427,84 @@ class ArrowKeyTests(unittest.TestCase):
             self.assertTrue(hasattr(engine.curses, name), param)
         self.assertEqual(engine.CSI_FINAL["B"], "KEY_DOWN")
         self.assertEqual(engine.CSI_FINAL["C"], "KEY_RIGHT")
+
+
+class NarrowedRestoreTests(unittest.TestCase):
+    """Picking a few items must not drag the whole category's parity with it."""
+
+    def _cat(self, tmp):
+        cat = Path(tmp) / "cat"; cat.mkdir()
+        (cat / "meta.json").write_text(json.dumps({
+            "plugins": [
+                {"id": "a.keep", "kind": "local", "tree": "trees/a", "enabled": False},
+                {"id": "b.drop", "kind": "local", "tree": "trees/b", "enabled": False,
+                 "units": ["b.service"]},
+            ],
+            "disabledIds": ["x.off", "y.off"],
+        }), encoding="utf-8")
+        for name in ("a", "b"):
+            d = cat / "trees" / name; d.mkdir(parents=True)
+            (d / "f.qml").write_text("x", encoding="utf-8")
+        return cat
+
+    def _run(self, cat, home):
+        undo = home.parent / "undo"; undo.mkdir(exist_ok=True)
+        engine.FAILURES.clear()
+        try:
+            return engine.restore_plugins(cat, home, "", undo, True)
+        finally:
+            engine.FAILURES.clear()
+
+    def test_narrowing_skips_the_sources_disabled_list(self):
+        engine.SUBSELECT.clear()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                cat = self._cat(tmp)
+                home = Path(tmp) / "home"; (home / ".config/omarchy/plugins").mkdir(parents=True)
+                engine.SUBSELECT["plugins"] = {"a.keep"}
+                actions = self._run(cat, home)
+                joined = " ".join(actions)
+                self.assertIn("a.keep", joined)
+                self.assertNotIn("b.drop", joined)
+                self.assertIn("narrowed", joined)
+                self.assertNotIn("would disable", joined)
+        finally:
+            engine.SUBSELECT.clear()
+
+    def test_whole_category_still_gets_full_parity(self):
+        engine.SUBSELECT.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            cat = self._cat(tmp)
+            home = Path(tmp) / "home"; (home / ".config/omarchy/plugins").mkdir(parents=True)
+            actions = self._run(cat, home)
+            joined = " ".join(actions)
+            self.assertIn("would disable", joined)
+            self.assertIn("b.drop", joined)
+
+    def test_unit_checks_respect_the_narrowing_too(self):
+        engine.SUBSELECT.clear()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                cat = self._cat(tmp)
+                home = Path(tmp) / "home"; (home / ".config/omarchy/plugins").mkdir(parents=True)
+                engine.SUBSELECT["plugins"] = {"a.keep"}
+                actions = self._run(cat, home)
+                # b.service belongs to the plugin that was not selected
+                self.assertNotIn("b.service", " ".join(actions))
+        finally:
+            engine.SUBSELECT.clear()
+
+    def test_one_file_tree_walker_handles_both_filters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cat = Path(tmp) / "cat"
+            files = cat / "files/.config/omarchy"; files.mkdir(parents=True)
+            (files / "shell.json").write_text("{}", encoding="utf-8")
+            (files / "other.json").write_text("{}", encoding="utf-8")
+            home = Path(tmp) / "home"; home.mkdir()
+            undo = Path(tmp) / "undo"; undo.mkdir()
+            done = engine.restore_file_tree(cat, home, "", undo, True,
+                                            skip_rel=".config/omarchy/shell.json")
+            self.assertEqual(done, [".config/omarchy/other.json"])
 
 
 if __name__ == "__main__":

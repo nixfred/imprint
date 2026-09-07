@@ -2411,13 +2411,15 @@ def backup_existing(src: Path, undo: Path, home: Path) -> None:
 
 
 def restore_file_tree(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool,
-                      category: str = "") -> list[str]:
+                      category: str = "", skip_rel: str = "") -> list[str]:
     files_root = cat_dir / "files"
     done = []
     if not files_root.is_dir():
         return done
     for path in iter_files(files_root):
         rel = path.relative_to(files_root)
+        if skip_rel and str(rel) == skip_rel:
+            continue
         if category and not wanted(category, str(rel)):
             continue
         dest = home / rel
@@ -2534,33 +2536,6 @@ def sync_git_checkout(target: Path, plug: dict, cat_dir: Path | None = None) -> 
     now = git_head(target)
     return (f"updated {pid} {have[:12]} -> {now[:12]}"
             + (f" on {want_branch}" if want_branch else ""))
-
-
-def restore_file_tree_except(cat_dir: Path, home: Path, old_home: str, undo: Path,
-                             dry: bool, skip_rel: str) -> list[str]:
-    files_root = cat_dir / "files"
-    done = []
-    if not files_root.is_dir():
-        return done
-    for path in iter_files(files_root):
-        rel = path.relative_to(files_root)
-        if str(rel) == skip_rel:
-            continue
-        dest = home / rel
-        try:
-            contained(home, dest.parent)
-        except UnsafePath:
-            done.append(f"refused {rel} (escapes home)")
-            continue
-        if dry:
-            done.append(str(rel))
-            continue
-        backup_existing(dest, undo, home)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        copy_file(path, dest)
-        rewrite_in_place(dest, old_home, str(home))
-        done.append(str(rel))
-    return done
 
 
 def restore_plugins(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool) -> list[str]:
@@ -2709,7 +2684,12 @@ def restore_plugins(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: b
     # reported are touched, so plugins unique to this machine are left alone.
     # Disabling a clone hands the bar slot back to its built-in source, so this
     # settles over a couple of rounds rather than one.
-    want_off = set(meta.get("disabledIds") or [])
+    # Only chase full parity when the whole category was taken. Someone who
+    # picked two plugins out of seventy did not ask for 55 unrelated disables.
+    narrowed = bool(SUBSELECT.get("plugins"))
+    want_off = set() if narrowed else set(meta.get("disabledIds") or [])
+    if narrowed and meta.get("disabledIds"):
+        actions.append("selection was narrowed, so the source's disabled list is not applied")
     if want_off and not dry:
         for _round in range(3):
             current = {item.get("id"): item for item in plugin_list() if item.get("id")}
@@ -2730,6 +2710,8 @@ def restore_plugins(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: b
 
     # A widget backed by a user daemon is dead without its unit.
     for plug in meta.get("plugins") or []:
+        if not wanted("plugins", plug.get("id") or ""):
+            continue
         for unit in plug.get("units") or []:
             if not safe_segment(unit):
                 continue
@@ -2882,8 +2864,8 @@ def restore_bar(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool)
         matches = list((cat_dir / "files").rglob("shell.json")) if (cat_dir / "files").is_dir() else []
         shell_src = matches[0] if matches else shell_src
     # Everything except shell.json is a plain file; shell.json needs config-edit.
-    others = restore_file_tree_except(cat_dir, home, old_home, undo, dry,
-                                      skip_rel=".config/omarchy/shell.json")
+    others = restore_file_tree(cat_dir, home, old_home, undo, dry,
+                               skip_rel=".config/omarchy/shell.json")
     if not shell_src.is_file():
         return others + ["no shell.json in this imprint, bar left alone"]
     dest = home / ".config/omarchy/shell.json"
@@ -4419,8 +4401,8 @@ def _draw(stdscr, rows, cursor, top, trail, header, height, width):
                     stdscr.chgat(3 + i, 3, 1, curses.color_pair(1) | curses.A_BOLD)
             except (curses.error, AttributeError):
                 pass
-    hints = ("\u2192/\u2190 move \u00b7 space toggles \u00b7 space on \u25b8 opens a submenu \u00b7 "
-             "esc back \u00b7 t group \u00b7 a all \u00b7 n none \u00b7 q cancel")
+    hints = ("\u2192 opens \u25b8 or moves down \u00b7 \u2190 backs out or moves up \u00b7 "
+             "space toggles \u00b7 t group \u00b7 a all \u00b7 n none \u00b7 q cancel")
     stdscr.addnstr(height - 1, 0, hints[:width - 1], width - 1, curses.A_DIM)
     stdscr.refresh()
 
@@ -4466,9 +4448,23 @@ def _pick_loop(stdscr, roots, header):
         elif key == curses.KEY_END:
             cursor = len(rows) - 1
         elif key in RIGHT_KEYS or key == ord("l") or arrow == "right":
-            cursor += 1
+            # → opens a submenu when the row has one, and otherwise moves down.
+            # Both behaviours were asked for; a row with ▸ has an obvious
+            # "go in here" affordance, a plain row has nothing to go into.
+            if node is not None and node.is_branch:
+                trail.append(node)
+                rows, cursor, top = node.children, 0, 0
+            else:
+                cursor += 1
         elif key in LEFT_KEYS or key == ord("h") or arrow == "left":
-            cursor -= 1
+            # Mirror of →: leave the submenu if we are in one, else move up.
+            if trail:
+                parent = trail.pop()
+                rows = trail[-1].children if trail else roots
+                cursor = rows.index(parent) if parent in rows else 0
+                top = 0
+            else:
+                cursor -= 1
         elif key in (ord(" "), curses.KEY_ENTER, 10, 13):
             # Space and enter both mean "act on this row" and nothing else
             # confirms, so selecting everything cannot start the run.
@@ -4814,7 +4810,10 @@ def cmd_undo(args) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="imprint-engine")
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub = parser.add_subparsers(
+        dest="cmd", required=True,
+        metavar="{save,restore,preview,plan,apply,info,diff,verify,undo,"
+                "categories,facts,about}")
     sub.add_parser("categories")
     sub.add_parser("facts")
     sub.add_parser("about")

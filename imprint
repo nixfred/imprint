@@ -265,7 +265,8 @@ do_restore() {
     warn "System layer needs root. Without --allow-system it only writes a script for you to review."
   fi
   if printf '%s' "$only" | grep -q 'secrets'; then
-    warn "Secrets copies SSH public keys and config, not private keys."
+    warn "Secrets carries SSH public keys and config, shell history and ~/.config/gh."
+    warn "Never private keys. History and gh tokens can expose credentials - handle with care."
   fi
   local extra=()
   (( dry == 1 )) && extra+=(--dry-run)

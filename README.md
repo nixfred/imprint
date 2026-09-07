@@ -45,8 +45,9 @@ cd imprint
 ./install.sh
 ```
 
-That links `imprint` into `~/.local/bin`. Omarchy already has `gum`, `python3`,
-`tar`, and `zstd`.
+That links `imprint` into `~/.local/bin`. It needs `python3` (3.14+, for
+`tarfile`'s zstd support) and `tar` — both already on an Omarchy box. There is
+no dependency on `gum`; the menus, pickers and prompts are built in.
 
 ## Use
 
@@ -76,7 +77,8 @@ there to keep editing. The run begins only when you pick the last row:
    ▶ Start backup   14 categories selected
 ```
 
-`→` and `←` move down and up the list; `esc` leaves a submenu. Other keys:
+`→` opens the submenu under the cursor, or moves down when the row has none;
+`←` backs out of a submenu, or moves up. `esc` also backs out. Other keys:
 `t` toggles a whole group, `a` all, `n` none, `q` cancels.
 
 Colours come from your active Omarchy theme's `colors.toml`, so the picker and
