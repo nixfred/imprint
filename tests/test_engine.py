@@ -936,6 +936,8 @@ class SystemLayerTests(unittest.TestCase):
         buf = io.StringIO()
         try:
             with tempfile.TemporaryDirectory() as tmp:
+                # An unpacked imprint, which is what need_archive lets through.
+                (Path(tmp) / "manifest.json").write_text("{}", encoding="utf-8")
                 args = SimpleNamespace(archive=tmp, only="packages", dry_run=False, upgrade=True)
                 with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
                     rc = engine.cmd_restore(args)
@@ -1584,6 +1586,122 @@ class DestinationTests(unittest.TestCase):
             self.assertIn("No space left on device", str(caught.exception))
             self.assertFalse(dest.exists())
             self.assertEqual(list(dest.parent.iterdir()), [])
+
+
+class UnreadableFileTests(unittest.TestCase):
+    def setUp(self):
+        engine.SKIPPED.clear()
+        engine.FAILURES.clear()
+
+    def tearDown(self):
+        engine.SKIPPED.clear()
+        engine.FAILURES.clear()
+
+    def test_one_unreadable_file_does_not_cost_the_rest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            (home / ".config/app").mkdir(parents=True)
+            (home / ".config/app/good.conf").write_text("ok", encoding="utf-8")
+            bad = home / ".config/app/secret.conf"
+            bad.write_text("nope", encoding="utf-8")
+            bad.chmod(0o000)
+            cat = Path(tmp) / "cat"
+            cat.mkdir()
+            try:
+                noted = engine.copy_into_category(cat, home / ".config/app", home)
+            finally:
+                bad.chmod(0o600)
+            self.assertEqual(noted, ".config/app/ (1 files)")
+            self.assertEqual([p.name for p in (cat / "files/.config/app").iterdir()],
+                             ["good.conf"])
+            self.assertEqual(len(engine.SKIPPED), 1)
+            self.assertEqual(engine.SKIPPED[0]["reason"], "Permission denied")
+            self.assertTrue(engine.SKIPPED[0]["path"].endswith("secret.conf"))
+
+    def test_a_full_staging_disk_stops_the_save(self):
+        real = engine.copy_file
+
+        def no_space(src, dest):
+            raise OSError(28, "No space left on device")
+
+        engine.copy_file = no_space
+        try:
+            with self.assertRaises(SystemExit) as caught:
+                engine.try_copy(Path("/etc/hostname"), Path("/tmp/x"))
+        finally:
+            engine.copy_file = real
+        self.assertIn("TMPDIR", str(caught.exception))
+        self.assertEqual(engine.SKIPPED, [])
+
+    def test_restore_reports_the_file_it_could_not_write_and_carries_on(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cat = Path(tmp) / "cat"
+            files = cat / "files/.config"
+            (files / "locked").mkdir(parents=True)
+            (files / "locked/a.conf").write_text("a", encoding="utf-8")
+            (files / "b.conf").write_text("b", encoding="utf-8")
+            home = Path(tmp) / "home"
+            (home / ".config/locked").mkdir(parents=True)
+            (home / ".config/locked").chmod(0o500)
+            undo = Path(tmp) / "undo"
+            undo.mkdir()
+            try:
+                done = engine.restore_file_tree(cat, home, "", undo, False)
+            finally:
+                (home / ".config/locked").chmod(0o700)
+            self.assertIn(".config/b.conf", done)
+            self.assertTrue(any("cannot write ~/.config/locked/a.conf" in line for line in done), done)
+            self.assertEqual(len(engine.FAILURES), 1)
+            self.assertEqual((home / ".config/b.conf").read_text(encoding="utf-8"), "b")
+
+    def test_the_brief_names_what_could_not_be_read(self):
+        brief = engine.render_brief({
+            "hostname": "dex", "categories": {},
+            "skipped": [{"path": "/home/pi/.config/a.sock", "reason": "Permission denied"}],
+            "skippedCount": 3,
+        })
+        self.assertIn("Not in this archive (3 unreadable)", brief)
+        self.assertIn("/home/pi/.config/a.sock", brief)
+
+
+class InputPathTests(unittest.TestCase):
+    def test_missing_archive_says_where_the_name_stopped_being_real(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit) as caught:
+                engine.need_archive(f"{tmp}/nowhere/nope.tar.zst")
+            message = str(caught.exception)
+            self.assertIn("no imprint archive at", message)
+            self.assertIn(f"the deepest part that exists is {tmp}", message)
+
+    def test_unpacked_imprint_directory_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "manifest.json").write_text("{}", encoding="utf-8")
+            self.assertEqual(engine.need_archive(tmp), Path(tmp))
+
+    def test_plain_directory_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit) as caught:
+                engine.need_archive(tmp)
+            self.assertIn("is a directory, not an imprint archive", str(caught.exception))
+
+    def test_empty_archive_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.tar.zst"
+            path.touch()
+            with self.assertRaises(SystemExit) as caught:
+                engine.need_archive(str(path))
+            self.assertIn("did not finish", str(caught.exception))
+
+    def test_need_dir_refuses_a_file_and_need_file_refuses_a_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.json"
+            path.write_text("{}", encoding="utf-8")
+            with self.assertRaises(SystemExit) as caught:
+                engine.need_dir(str(path), "cannot read the plan")
+            self.assertIn("is a file, not a directory", str(caught.exception))
+            with self.assertRaises(SystemExit) as caught:
+                engine.need_file(tmp, "cannot read the selection file")
+            self.assertIn("is a directory, not a file", str(caught.exception))
 
 
 if __name__ == "__main__":

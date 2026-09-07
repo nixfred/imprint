@@ -304,6 +304,33 @@ Every restore first copies overwritten files to
 
 It will not clone disk encryption, lock policy, or another machine’s TPM.
 
+## When a file gets in the way
+
+Paths are checked before any work starts, not after. A destination that cannot
+be written, an archive that is not there, a plan directory with no plan in it —
+each says where the name stopped being real and what is nearby:
+
+```
+$ imprint save -o /home/google/imprints/imprint-dex.tar.zst
+cannot create /home/google/imprints: Permission denied
+the deepest directory that exists is /home
+did you mean /home/pi/google/imprints/imprint-dex.tar.zst ?
+```
+
+Once a run is underway, one bad file never costs the rest of it:
+
+- A file that cannot be read is left out, and the archive says so — the count
+  and the reasons land in `manifest.json` and in a section of `BRIEF.md`, so
+  whoever restores it knows what is not there.
+- A file that cannot be written during a restore is reported and stepped over,
+  so a home directory is never left half from each machine. It counts as a
+  failure, so the exit code is honest.
+- A write that dies partway takes its `.partial` file with it. Half an archive
+  on a slow mount looks exactly like a backup.
+- A staging disk that fills is the one thing that does stop a save, because
+  skipping thousands of files would write a plausible archive with most of the
+  machine missing from it. Point `TMPDIR` at a bigger disk and run it again.
+
 ## Archive layout
 
 ```

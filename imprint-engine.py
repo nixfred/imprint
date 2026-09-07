@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import curses
+import errno
 import json
 import os
 import re
@@ -778,6 +779,47 @@ def copy_file(src: Path, dest: Path) -> None:
     shutil.copy2(src, dest, follow_symlinks=True)
 
 
+# Files that could not be read or written, with the reason. A save or a
+# restore that meets one bad file finishes the other few thousand and says so
+# at the end; neither dies partway and leaves the user guessing which half ran.
+SKIPPED: list[dict] = []
+
+
+def why(exc: BaseException) -> str:
+    return getattr(exc, "strerror", None) or str(exc) or exc.__class__.__name__
+
+
+def out_of_space(exc: OSError) -> bool:
+    return exc.errno in (errno.ENOSPC, errno.EDQUOT)
+
+
+def staging_is_full(exc: OSError) -> SystemExit:
+    """Never step over this one. Skipping a few thousand files because the
+    staging disk filled would write a plausible-looking archive with most of
+    the machine missing from it."""
+    return SystemExit(
+        f"no space left while staging the archive in {tempfile.gettempdir()}: {why(exc)}\n"
+        "free some room there, or put the staging directory on a bigger disk:\n"
+        "  TMPDIR=/var/tmp imprint save")
+
+
+def try_copy(src: Path, dest: Path) -> bool:
+    """One unreadable file must not cost a whole save. A root-owned file under
+    ~/.config, a file deleted while the walk was running, a mount that went
+    away mid-copy -- each is recorded and stepped over."""
+    try:
+        copy_file(src, dest)
+        return True
+    except OSError as exc:
+        if out_of_space(exc):
+            raise staging_is_full(exc)
+        SKIPPED.append({"path": str(src), "action": "read", "reason": why(exc)})
+        return False
+    except UnicodeError as exc:
+        SKIPPED.append({"path": str(src), "action": "read", "reason": why(exc)})
+        return False
+
+
 def read_text_safe(path: Path, limit: int = TEXT_LIMIT * 4) -> str | None:
     """Whole-file text read. None when binary, undecodable, oversized or unreadable."""
     try:
@@ -878,8 +920,8 @@ def copy_into_category(cat_dir: Path, src: Path, home: Path) -> str | None:
         count = 0
         for file_path in iter_files(src):
             file_rel = rel_under_home(file_path, home)
-            copy_file(file_path, stage_path(cat_dir, file_rel))
-            count += 1
+            if try_copy(file_path, stage_path(cat_dir, file_rel)):
+                count += 1
         return f"{rel}/ ({count} files)" if count else None
     if src.is_dir() and src.is_symlink():
         real = src.resolve()
@@ -888,10 +930,9 @@ def copy_into_category(cat_dir: Path, src: Path, home: Path) -> str | None:
                 inner = file_path.relative_to(real)
             except ValueError:
                 continue
-            copy_file(file_path, stage_path(cat_dir, str(Path(rel) / inner)))
+            try_copy(file_path, stage_path(cat_dir, str(Path(rel) / inner)))
         return f"{rel}/ (symlink -> {real})"
-    copy_file(src, dest)
-    return rel
+    return rel if try_copy(src, dest) else None
 
 
 def plugin_list() -> list[dict]:
@@ -2177,6 +2218,16 @@ def render_brief(manifest: dict) -> str:
         lines += ["", "## Themes from git", ""]
         for theme in git_themes:
             lines.append(f"- `{theme['id']}` `omarchy theme install {theme['url']}`")
+    skipped = manifest.get("skipped") or []
+    if skipped:
+        total = manifest.get("skippedCount") or len(skipped)
+        lines += ["", f"## Not in this archive ({total} unreadable)", "",
+                  "These files were on the machine but could not be read when it "
+                  "was saved. Nothing here restores them.", ""]
+        for item in skipped[:20]:
+            lines.append(f"- `{item.get('path')}` — {item.get('reason')}")
+        if total > 20:
+            lines.append(f"- ... {total - 20} more")
     lines += [
         "",
         "## Do not clone from this imprint",
@@ -2282,6 +2333,97 @@ def check_dest(dest: Path) -> None:
             probe.unlink()
         except OSError:
             pass
+
+
+def deepest_existing(path: Path) -> Path:
+    probe = path
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    return probe
+
+
+def path_advice(path: Path) -> list[str]:
+    """What to tell someone whose path is not there: where the name stopped
+    being real, and the same path under $HOME when that one does exist."""
+    lines = []
+    deepest = deepest_existing(path)
+    if deepest != path:
+        lines.append(f"the deepest part that exists is {deepest}")
+    hint = suggest_under_home(path)
+    if hint is not None and hint != path:
+        lines.append(f"did you mean {hint} ?")
+    return lines
+
+
+def known_archives() -> list[Path]:
+    found = []
+    for root in (Path.home() / "imprints", Path.home() / "backups"):
+        try:
+            if root.is_dir():
+                found += [p for p in root.glob("*.tar.zst") if p.is_file()]
+        except OSError:
+            continue
+    try:
+        found.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        pass
+    return found
+
+
+def archive_menu() -> list[str]:
+    """A wrong archive path is nearly always a typo of one that is right here."""
+    found = known_archives()
+    if not found:
+        return ["there are no archives in ~/imprints or ~/backups yet -- "
+                "`imprint save` makes one"]
+    lines = ["archives on this machine:"]
+    lines += [f"  {path}" for path in found[:5]]
+    if len(found) > 5:
+        lines.append(f"  ... {len(found) - 5} more in ~/imprints")
+    return lines
+
+
+def need_archive(raw: str) -> Path:
+    """A path the user typed for an imprint that should already exist.
+    Everything that can be wrong with it is said here, once, with what to do."""
+    path = Path(raw).expanduser()
+    if path.is_dir():
+        if (path / "manifest.json").is_file():
+            return path                      # an imprint already unpacked
+        raise SystemExit("\n".join(
+            [f"{path} is a directory, not an imprint archive"] + archive_menu()))
+    if not path.exists():
+        raise SystemExit("\n".join(
+            [f"no imprint archive at {path}"] + path_advice(path) + archive_menu()))
+    if not os.access(path, os.R_OK):
+        raise SystemExit(f"cannot read {path}: permission denied "
+                         f"(it belongs to uid {path.stat().st_uid})")
+    if path.stat().st_size == 0:
+        raise SystemExit(f"{path} is empty -- whatever wrote or copied it "
+                         "did not finish")
+    return path
+
+
+def need_file(raw: str, what: str) -> Path:
+    path = Path(raw).expanduser()
+    if path.is_dir():
+        raise SystemExit(f"{what}: {path} is a directory, not a file")
+    if not path.exists():
+        raise SystemExit("\n".join([f"{what}: no such file {path}"] + path_advice(path)))
+    if not os.access(path, os.R_OK):
+        raise SystemExit(f"{what}: cannot read {path}, permission denied")
+    return path
+
+
+def need_dir(raw: str, what: str) -> Path:
+    path = Path(raw).expanduser()
+    if path.exists() and not path.is_dir():
+        raise SystemExit(f"{what}: {path} is a file, not a directory")
+    if not path.exists():
+        raise SystemExit("\n".join([f"{what}: no such directory {path}"] + path_advice(path)))
+    if not os.access(path, os.R_OK | os.X_OK):
+        raise SystemExit(f"{what}: cannot read {path}, permission denied")
+    return path
 
 
 def write_archive(staging: Path, dest: Path) -> None:
@@ -2397,7 +2539,7 @@ def default_archive_path(home: Path, host: str) -> Path:
 def cmd_save(args) -> int:
     home = Path.home()
     if getattr(args, "select", ""):
-        path = Path(args.select).expanduser()
+        path = need_file(args.select, "cannot read the selection file")
         try:
             spec = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -2412,6 +2554,7 @@ def cmd_save(args) -> int:
     if dest.suffixes[-2:] != [".tar", ".zst"] and not str(dest).endswith(".tar.zst"):
         dest = dest.with_name(dest.name + ".tar.zst") if dest.suffix == "" else dest
     check_dest(dest)
+    SKIPPED.clear()
     with tempfile.TemporaryDirectory(prefix="imprint-") as tmp:
         staging = Path(tmp) / "imprint"
         staging.mkdir()
@@ -2420,6 +2563,11 @@ def cmd_save(args) -> int:
         manifest = machine_facts()
         manifest["categories"] = {cid: strip_heavy(categories[cid]) for cid in ids}
         manifest["archiveName"] = dest.name
+        # The archive says what it could not take. Nobody restoring it should
+        # have to discover the gap by finding the file missing months later.
+        if SKIPPED:
+            manifest["skipped"] = SKIPPED[:200]
+            manifest["skippedCount"] = len(SKIPPED)
         write_json(staging / "manifest.json", manifest)
         (staging / "BRIEF.md").write_text(render_brief(manifest), encoding="utf-8")
         copy_tool(staging)
@@ -2428,9 +2576,25 @@ def cmd_save(args) -> int:
         size_now = dest.stat().st_size
         progress.finish(f"Wrote {dest}",
                         f"{human_size(size_now)} \u00b7 {len(ids)} categories")
+    report_skipped()
     size = dest.stat().st_size
-    emit({"ok": True, "path": str(dest), "bytes": size, "categories": ids}, args)
+    result = {"ok": True, "path": str(dest), "bytes": size, "categories": ids}
+    if SKIPPED:
+        result["skipped"] = SKIPPED
+    emit(result, args)
     return 0
+
+
+def report_skipped() -> None:
+    if not SKIPPED:
+        return
+    count = len(SKIPPED)
+    noun = "file" if count == 1 else "files"
+    sys.stderr.write(f"\n  {count} {noun} could not be read and are not in the archive:\n")
+    for item in SKIPPED[:5]:
+        sys.stderr.write(f"    {item['path']} -- {item['reason']}\n")
+    if count > 5:
+        sys.stderr.write(f"    ... {count - 5} more, all listed in the manifest\n")
 
 
 def strip_heavy(meta: dict) -> dict:
@@ -2490,9 +2654,21 @@ def restore_file_tree(cat_dir: Path, home: Path, old_home: str, undo: Path, dry:
         if dry:
             done.append(str(rel))
             continue
-        backup_existing(dest, undo, home)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        copy_file(path, dest)
+        # A file that cannot be written must not abandon the restore halfway
+        # through and leave a home directory half from each machine. Say which
+        # one refused, keep going, and let FAILURES carry it to the exit code.
+        try:
+            backup_existing(dest, undo, home)
+        except OSError as exc:
+            done.append(fail(f"~/{rel} left as it was: what is there now could "
+                             f"not be backed up ({why(exc)})"))
+            continue
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            copy_file(path, dest)
+        except OSError as exc:
+            done.append(fail(f"cannot write ~/{rel}: {why(exc)}"))
+            continue
         rewrite_in_place(dest, old_home, str(home))
         done.append(str(rel))
     return done
@@ -3296,7 +3472,7 @@ def load_selection(args) -> None:
     spec_path = getattr(args, "select", "")
     if not spec_path:
         return
-    path = Path(spec_path).expanduser()
+    path = need_file(spec_path, "cannot read the selection file")
     try:
         spec = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -3436,9 +3612,7 @@ def render_preview(changes: dict, ids: list[str]) -> str:
 def cmd_preview(args) -> int:
     ensure_session_env()
     load_selection(args)
-    archive = Path(args.archive).expanduser()
-    if not archive.exists():
-        raise SystemExit(f"missing archive: {archive}")
+    archive = need_archive(args.archive)
     home = Path.home()
     with tempfile.TemporaryDirectory(prefix="imprint-preview-") as tmp:
         root = open_imprint(archive, Path(tmp) / "open")
@@ -3461,9 +3635,7 @@ def cmd_preview(args) -> int:
 def cmd_restore(args) -> int:
     ensure_session_env()
     load_selection(args)
-    archive = Path(args.archive).expanduser()
-    if not archive.exists():
-        raise SystemExit(f"missing archive: {archive}")
+    archive = need_archive(args.archive)
     home = Path.home()
     ids = parse_only(args.only) if args.only else None
     dry = bool(args.dry_run)
@@ -3554,7 +3726,7 @@ def cmd_restore(args) -> int:
 
 
 def cmd_info(args) -> int:
-    archive = Path(args.archive).expanduser()
+    archive = need_archive(args.archive)
     with tempfile.TemporaryDirectory(prefix="imprint-info-") as tmp:
         root = open_imprint(archive, Path(tmp) / "open")
         manifest = load_manifest(root)
@@ -3937,12 +4109,15 @@ def session_preamble() -> list[str]:
 
 
 def cmd_plan(args) -> int:
-    archive = Path(args.archive).expanduser()
-    if not archive.exists():
-        raise SystemExit(f"missing archive: {archive}")
+    archive = need_archive(args.archive)
     out_dir = Path(args.output).expanduser() if args.output else (
         Path.home() / ".local/state/imprint" / f"plan-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise SystemExit("\n".join(
+            [f"cannot create the plan directory {out_dir}: {why(exc)}"]
+            + path_advice(out_dir)))
     payload = out_dir / "payload"
     if archive.is_dir():
         root = archive
@@ -4024,10 +4199,11 @@ def failed_now(journal: dict) -> list:
 
 
 def cmd_apply(args) -> int:
-    plan_dir = Path(args.plan).expanduser()
+    plan_dir = need_dir(args.plan, "cannot read the plan")
     plan_file = plan_dir / "plan.json"
     if not plan_file.is_file():
-        raise SystemExit(f"not a plan directory (no plan.json): {plan_dir}")
+        raise SystemExit(f"{plan_dir} holds no plan.json, so it is not a plan "
+                         "directory -- `imprint plan <archive>` writes one")
     try:
         plan = json.loads(plan_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -4744,7 +4920,7 @@ def cmd_pick(args) -> int:
     present = None
     if args.archive:
         with tempfile.TemporaryDirectory(prefix="imprint-pick-") as tmp:
-            root = open_imprint(Path(args.archive).expanduser(), Path(tmp) / "open")
+            root = open_imprint(need_archive(args.archive), Path(tmp) / "open")
             present = set((load_manifest(root).get("categories") or {}).keys())
             categories = build_tree(home, present, archive_root=root)
     else:
@@ -4767,7 +4943,7 @@ def cmd_pick(args) -> int:
 
 
 def cmd_verify(args) -> int:
-    archive = Path(args.archive).expanduser()
+    archive = need_archive(args.archive)
     with tempfile.TemporaryDirectory(prefix="imprint-verify-") as tmp:
         root = open_imprint(archive, Path(tmp) / "open")
         manifest = load_manifest(root)
@@ -4798,7 +4974,7 @@ def cmd_verify(args) -> int:
 
 
 def cmd_diff(args) -> int:
-    archive = Path(args.archive).expanduser()
+    archive = need_archive(args.archive)
     home = Path.home()
     with tempfile.TemporaryDirectory(prefix="imprint-diff-") as tmp:
         root = open_imprint(archive, Path(tmp) / "open")
@@ -4842,9 +5018,7 @@ def cmd_undo(args) -> int:
     undos = sorted([p for p in root.iterdir() if p.is_dir() and p.name.startswith("undo-")])
     if not undos:
         raise SystemExit("no imprint undo history")
-    chosen = Path(args.undo_dir).expanduser() if args.undo_dir else undos[-1]
-    if not chosen.is_dir():
-        raise SystemExit(f"missing undo dir {chosen}")
+    chosen = need_dir(args.undo_dir, "cannot read the undo") if args.undo_dir else undos[-1]
     home = Path.home()
     restored = []
     # Deliberately not iter_files: its skip list (.bak, .git, __pycache__ ...)

@@ -186,12 +186,55 @@ pick_archive() {
   mkdir -p "$start"
   local found
   found=$(ls -1t "$start"/*.tar.zst "$HOME"/backups/*.tar.zst 2>/dev/null | awk '!seen[$0]++')
-  [[ -n $found ]] || { echo "no archives in $start or ~/backups" >&2; return 1; }
+  [[ -n $found ]] || {
+    echo "imprint: no archives in $start or ~/backups yet -- run \`imprint save\` to make one" >&2
+    return 1
+  }
   if (( HAVE_GUM )); then
     printf '%s\n' "$found" | engine menu --header "Choose an imprint archive"
   else
     printf '%s\n' "$found" | head -n 1
   fi
+}
+
+# The archives this machine actually has. A path that is wrong is nearly
+# always a typo of one of these.
+nearby_archives() {
+  local found
+  found=$(ls -1t "$HOME"/imprints/*.tar.zst "$HOME"/backups/*.tar.zst 2>/dev/null | head -n 5)
+  if [[ -z $found ]]; then
+    printf '\n  there are no archives in ~/imprints or ~/backups yet -- `imprint save` makes one'
+    return
+  fi
+  printf '\n  archives on this machine:'
+  printf '\n    %s' $found
+}
+
+# Everything that can be wrong with a path to an existing imprint, said once,
+# with what to do about it. Prints the problem and returns 0 when there is one.
+archive_problem() {
+  local path=$1
+  [[ -n $path ]] || { printf 'no archive given'; nearby_archives; return 0; }
+  if [[ -d $path ]]; then
+    [[ -f $path/manifest.json ]] && return 1   # an imprint already unpacked
+    printf '%s is a directory, not an imprint archive' "$path"
+    nearby_archives
+    return 0
+  fi
+  if [[ ! -e $path ]]; then
+    printf 'no imprint archive at %s' "$path"
+    nearby_archives
+    return 0
+  fi
+  if [[ ! -r $path ]]; then
+    printf 'cannot read %s: permission denied' "$path"
+    return 0
+  fi
+  if [[ ! -s $path ]]; then
+    printf '%s is empty -- whatever wrote or copied it did not finish' "$path"
+    return 0
+  fi
+  return 1
 }
 
 # A destination is checked here, at the prompt, because that is the only
@@ -285,8 +328,15 @@ do_restore() {
   if [[ -z $archive ]]; then
     archive=$(pick_archive) || die "cancelled"
   fi
-  [[ -n $archive && -e $archive ]] || die "archive not found: $archive"
-  engine verify "$archive" >/dev/null || die "archive failed verify"
+  local problem report
+  problem=$(archive_problem "$archive") && die "$problem"
+  # Whatever verify found is the reason; printing "failed verify" and throwing
+  # the report away tells the user nothing they can act on.
+  if ! report=$(engine verify "$archive"); then
+    warn "this archive did not verify, so nothing was restored from it:"
+    printf '%s\n' "$report" >&2
+    exit 1
+  fi
   say "Archive $archive"
   if [[ -z $only ]]; then
     if (( HAVE_GUM )); then
