@@ -1,6 +1,19 @@
+<div align="center">
+
+<img src="docs/banner.svg" alt="Imprint — stamp one Omarchy machine onto another" width="820">
+
+<p>
+  <a href="https://github.com/nixfred/imprint"><img alt="license" src="https://img.shields.io/badge/license-MIT-7d82d9?style=flat-square"></a>
+  <img alt="tests" src="https://img.shields.io/badge/tests-118%20passing-92c9a5?style=flat-square">
+  <img alt="deps" src="https://img.shields.io/badge/dependencies-python3%20%2B%20tar-6d7db6?style=flat-square">
+  <img alt="platform" src="https://img.shields.io/badge/platform-Omarchy-e0a86a?style=flat-square">
+</p>
+
+</div>
+
 # Imprint
 
-Stamp one Omarchy machine onto another.
+**Stamp one Omarchy machine onto another.**
 
 Imprint writes a single archive of the desktop personality — theme, bar,
 plugins, bindings, extra packages, user scripts, services — then restores

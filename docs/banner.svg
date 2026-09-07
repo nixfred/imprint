@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 560" width="1000" height="560" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">
+<defs>
+<linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+  <stop offset="0" stop-color="#8f95ee"/><stop offset="1" stop-color="#5d63c4"/>
+</linearGradient>
+<linearGradient id="glow" x1="0" y1="0" x2="0" y2="1">
+  <stop offset="0" stop-color="#7d82d9" stop-opacity="0.16"/>
+  <stop offset="1" stop-color="#7d82d9" stop-opacity="0"/>
+</linearGradient>
+</defs>
+<rect width="1000" height="560" rx="18" fill="#0b1020"/>
+<rect width="1000" height="200" rx="18" fill="url(#glow)"/>
+<rect x="16" y="16" width="968" height="528" rx="14" fill="#111834" stroke="#242c52"/>
+<circle cx="44" cy="42" r="5.5" fill="#e0656b"/>
+<circle cx="64" cy="42" r="5.5" fill="#e0a86a"/>
+<circle cx="84" cy="42" r="5.5" fill="#92c9a5"/>
+<text x="500.0" y="47" fill="#6d7db6" font-size="13" text-anchor="middle">imprint — dex</text>
+<g transform="translate(258.5,80)"><rect x="0.0" y="0.0" width="42.0" height="7.5" fill="url(#g)"/>
+<rect x="14.0" y="7.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="14.0" y="14.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="14.0" y="21.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="0.0" y="28.0" width="42.0" height="7.5" fill="url(#g)"/>
+<rect x="56.0" y="0.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="112.0" y="0.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="56.0" y="7.0" width="28.0" height="7.5" fill="url(#g)"/>
+<rect x="98.0" y="7.0" width="28.0" height="7.5" fill="url(#g)"/>
+<rect x="56.0" y="14.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="77.0" y="14.0" width="28.0" height="7.5" fill="url(#g)"/>
+<rect x="112.0" y="14.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="56.0" y="21.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="84.0" y="21.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="112.0" y="21.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="56.0" y="28.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="112.0" y="28.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="140.0" y="0.0" width="49.0" height="7.5" fill="url(#g)"/>
+<rect x="140.0" y="7.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="182.0" y="7.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="140.0" y="14.0" width="49.0" height="7.5" fill="url(#g)"/>
+<rect x="140.0" y="21.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="140.0" y="28.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="210.0" y="0.0" width="49.0" height="7.5" fill="url(#g)"/>
+<rect x="210.0" y="7.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="252.0" y="7.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="210.0" y="14.0" width="49.0" height="7.5" fill="url(#g)"/>
+<rect x="210.0" y="21.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="245.0" y="21.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="210.0" y="28.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="252.0" y="28.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="280.0" y="0.0" width="42.0" height="7.5" fill="url(#g)"/>
+<rect x="294.0" y="7.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="294.0" y="14.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="294.0" y="21.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="280.0" y="28.0" width="42.0" height="7.5" fill="url(#g)"/>
+<rect x="336.0" y="0.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="385.0" y="0.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="336.0" y="7.0" width="21.0" height="7.5" fill="url(#g)"/>
+<rect x="385.0" y="7.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="336.0" y="14.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="357.0" y="14.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="385.0" y="14.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="336.0" y="21.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="371.0" y="21.0" width="28.0" height="7.5" fill="url(#g)"/>
+<rect x="336.0" y="28.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="385.0" y="28.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="413.0" y="0.0" width="70.0" height="7.5" fill="url(#g)"/>
+<rect x="441.0" y="7.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="441.0" y="14.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="441.0" y="21.0" width="14.0" height="7.5" fill="url(#g)"/>
+<rect x="441.0" y="28.0" width="14.0" height="7.5" fill="url(#g)"/></g>
+<text x="500.0" y="150" fill="#6d7db6" font-size="14" text-anchor="middle">stamp one Omarchy machine onto another</text>
+<text x="52" y="196" fill="#d7dcf5" font-size="14" font-weight="600">What should this imprint carry?</text>
+<circle cx="62" cy="222" r="6.5" fill="none" stroke="#e0a86a" stroke-width="1.6"/><path d="M 62 217.1 A 4.9 4.9 0 0 0 62 226.9 Z" fill="#e0a86a"/>
+<text x="102" y="226" fill="#d7dcf5" font-size="14">Select ALL for backup</text>
+<text x="330" y="226" fill="#6d7db6" font-size="13">everything, including host-bound and secret categories</text>
+<circle cx="62" cy="252" r="6.5" fill="none" stroke="#92c9a5" stroke-width="1.6"/><circle cx="62" cy="252" r="3.5" fill="#92c9a5"/>
+<text x="102" y="256" fill="#d7dcf5" font-size="14">Look</text>
+<text x="330" y="256" fill="#6d7db6" font-size="13">theme, font, gaps, rounding, branding</text>
+<circle cx="62" cy="282" r="6.5" fill="none" stroke="#92c9a5" stroke-width="1.6"/><circle cx="62" cy="282" r="3.5" fill="#92c9a5"/>
+<path d="M 84 277 L 89.75 282 L 84 287 Z" fill="#7d82d9"/>
+<text x="102" y="286" fill="#d7dcf5" font-size="14">Plugins (70)</text>
+<text x="330" y="286" fill="#6d7db6" font-size="13">reinstalled from git source, local edits kept</text>
+<circle cx="62" cy="312" r="6.5" fill="none" stroke="#92c9a5" stroke-width="1.6"/><circle cx="62" cy="312" r="3.5" fill="#92c9a5"/>
+<path d="M 84 307 L 89.75 312 L 84 317 Z" fill="#7d82d9"/>
+<text x="102" y="316" fill="#d7dcf5" font-size="14">Themes (37)</text>
+<text x="330" y="316" fill="#6d7db6" font-size="13">yours on, the 22 that ship with Omarchy off</text>
+<circle cx="62" cy="342" r="6.5" fill="none" stroke="#e0a86a" stroke-width="1.6"/><path d="M 62 337.1 A 4.9 4.9 0 0 0 62 346.9 Z" fill="#e0a86a"/>
+<path d="M 84 337 L 89.75 342 L 84 347 Z" fill="#7d82d9"/>
+<text x="102" y="346" fill="#d7dcf5" font-size="14">Projects (87)</text>
+<text x="330" y="346" fill="#6d7db6" font-size="13">git clone recipes plus uncommitted patches</text>
+<circle cx="62" cy="372" r="6.5" fill="none" stroke="#92c9a5" stroke-width="1.6"/><circle cx="62" cy="372" r="3.5" fill="#92c9a5"/>
+<path d="M 84 367 L 89.75 372 L 84 377 Z" fill="#7d82d9"/>
+<text x="102" y="376" fill="#d7dcf5" font-size="14">Packages (24)</text>
+<text x="330" y="376" fill="#6d7db6" font-size="13">pacman and AUR, on top of a stock Omarchy</text>
+<circle cx="62" cy="402" r="6.5" fill="none" stroke="#6d7db6" stroke-width="1.6"/>
+<text x="102" y="406" fill="#d7dcf5" font-size="14">Secrets</text>
+<text x="330" y="406" fill="#6d7db6" font-size="13">SSH keys, shell history       [keys]</text>
+<rect x="52" y="423" width="896" height="30" rx="7" fill="#7d82d9" fill-opacity="0.14" stroke="#7d82d9" stroke-opacity="0.5"/>
+<path d="M 68 432 L 77 438 L 68 444 Z" fill="#7d82d9"/>
+<text x="88" y="442" fill="#d7dcf5" font-size="14" font-weight="600">Start backup</text>
+<text x="210" y="442" fill="#6d7db6" font-size="13">17 categories selected</text>
+<text x="52" y="484" fill="#6d7db6" font-size="12.5">&#8594; opens a submenu  ·  space toggles  ·  t whole group  ·  a all  ·  q cancel</text>
+</svg>
