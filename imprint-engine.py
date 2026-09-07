@@ -2814,6 +2814,326 @@ def cmd_brief(args) -> int:
     return cmd_info(args)
 
 
+
+def sh(value: str) -> str:
+    return shlex.quote(str(value))
+
+
+class Plan:
+    """An ordered list of shell steps, each one safe to re-run."""
+
+    def __init__(self) -> None:
+        self.steps: list[dict] = []
+
+    def add(self, phase: str, title: str, body: list[str], *, note: str = "") -> None:
+        self.steps.append({"phase": phase, "title": title, "body": body, "note": note})
+
+    def phases(self) -> list[str]:
+        seen = []
+        for step in self.steps:
+            if step["phase"] not in seen:
+                seen.append(step["phase"])
+        return seen
+
+
+def plan_packages(plan: Plan, meta: dict) -> None:
+    repo = meta.get("repo") or []
+    aur = meta.get("aur") or []
+    if repo:
+        plan.add("packages", f"{len(repo)} repo packages",
+                 ["omarchy pkg add " + " ".join(sh(x) for x in repo)],
+                 note="pkg add is already a no-op for packages that are present")
+    if aur:
+        plan.add("packages", f"{len(aur)} AUR packages",
+                 ["omarchy pkg aur add " + " ".join(sh(x) for x in aur)])
+
+
+def plan_toolchains(plan: Plan, meta: dict, root: Path) -> None:
+    src = root / "categories/toolchains/files/.config/mise/config.toml"
+    if src.is_file():
+        plan.add("toolchains", "mise tool versions", [
+            'mkdir -p "$HOME/.config/mise"',
+            f'cp {sh(src)} "$HOME/.config/mise/config.toml"',
+            "mise install --yes",
+        ])
+    for tool in meta.get("go") or []:
+        if tool.get("module"):
+            plan.add("toolchains", f"go tool {tool['name']}",
+                     [f"go install {sh(tool['module'])}@latest"])
+    for crate in meta.get("cargo") or []:
+        plan.add("toolchains", f"cargo {crate}", [f"cargo install {sh(crate)}"])
+    for pkg in meta.get("npmGlobal") or []:
+        plan.add("toolchains", f"npm -g {pkg}", [f"npm install -g {sh(pkg)}"])
+
+
+def plan_projects(plan: Plan, meta: dict, root: Path) -> None:
+    for repo in meta.get("repos") or []:
+        rel, url = repo.get("path"), repo.get("url")
+        if not rel:
+            continue
+        if not url:
+            plan.add("projects", f"{rel} (NO REMOTE)", [
+                f'echo "cannot restore ~/{rel}: no git remote recorded" >&2',
+            ], note="this checkout exists nowhere else")
+            continue
+        branch = repo.get("branch") or ""
+        body = [f'if [ ! -d "$HOME"/{sh(rel)}/.git ]; then',
+                f'  git clone {"-b " + sh(branch) + " " if branch else ""}{sh(url)} "$HOME"/{sh(rel)}',
+                'else',
+                f'  echo "~/{rel} already present, left alone"',
+                'fi']
+        patch = repo.get("patch")
+        if patch:
+            pfile = root / "categories/projects" / patch
+            body += [f'if [ -f {sh(pfile)} ]; then',
+                     f'  git -C "$HOME"/{sh(rel)} apply --3way {sh(pfile)} || '
+                     f'echo "patch for {rel} did not apply cleanly" >&2',
+                     'fi']
+        plan.add("projects", rel, body)
+
+
+def plan_themes(plan: Plan, meta: dict) -> None:
+    for theme in meta.get("themes") or []:
+        if theme.get("url"):
+            plan.add("themes", f"theme {theme.get('id')}",
+                     [f"omarchy theme install {sh(theme['url'])} || true"])
+
+
+def plan_plugins(plan: Plan, meta: dict, root: Path) -> None:
+    cat = root / "categories/plugins"
+    for plug in meta.get("plugins") or []:
+        pid = plug.get("id")
+        if not pid or not safe_segment(pid):
+            continue
+        dest = f'"$HOME"/.config/omarchy/plugins/{pid}'
+        body: list[str] = []
+        if plug.get("kind") == "git" and plug.get("url"):
+            # plugin add clones into a temp dir before noticing the id is taken,
+            # so skip it outright when the plugin is already there.
+            body.append(f'[ -d {dest} ] || omarchy plugin add {sh(plug["url"])} --yes || true')
+            branch, commit = plug.get("branch") or "", plug.get("commit") or ""
+            if branch or commit:
+                body.append(f'git -C {dest} remote get-url imprint-src >/dev/null 2>&1 '
+                            f'|| git -C {dest} remote add imprint-src {sh(plug["url"])}')
+                bundle = plug.get("bundle")
+                if bundle:
+                    bfile = cat / bundle
+                    body.append(f'[ -f {sh(bfile)} ] && git -C {dest} fetch {sh(bfile)} '
+                                f'{sh(branch)}:refs/remotes/imprint-bundle/{sh(branch)} --force || true')
+                body.append(f'git -C {dest} fetch imprint-src --quiet || true')
+                ref = commit or f"imprint-src/{branch}"
+                body.append(f'git -C {dest} checkout -B {sh(branch)} {sh(ref)} || '
+                            f'echo "could not put {pid} on {branch}" >&2')
+            overlay = plug.get("overlay")
+            if overlay:
+                body.append(f'cp -a {sh(cat / overlay)}/. {dest}/')
+        else:
+            tree = plug.get("tree")
+            if tree:
+                body += [f'mkdir -p {dest}', f'cp -a {sh(cat / tree)}/. {dest}/']
+            elif plug.get("clonedFrom"):
+                body.append(f'omarchy plugin clone {sh(plug["clonedFrom"])} || true')
+        for unit in plug.get("units") or []:
+            if not safe_segment(unit):
+                continue
+            ufile = cat / "units" / unit
+            body += [f'if [ -f {sh(ufile)} ]; then',
+                     f'  install -Dm644 {sh(ufile)} "$HOME/.config/systemd/user/{unit}"',
+                     f'  systemctl --user daemon-reload',
+                     f'  systemctl --user enable --now {sh(unit)}',
+                     f'  systemctl --user restart {sh(unit)}',
+                     'fi']
+        if body:
+            plan.add("plugins", pid, body)
+
+    enable = [p for p in (meta.get("plugins") or []) if p.get("enabled") and safe_segment(p.get("id") or "")]
+    if enable:
+        body = ['omarchy shell -q shell ping >/dev/null 2>&1 || '
+                '{ echo "shell unreachable, enabled state NOT applied" >&2; exit 1; }',
+                'omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true']
+        for plug in enable:
+            place = plug.get("placement") or {}
+            extra = ""
+            if place.get("section"):
+                extra = f" --section {sh(place['section'])}"
+                if isinstance(place.get("index"), int):
+                    extra += f" --index {place['index']}"
+            body.append(f'omarchy plugin enable {sh(plug["id"])}{extra} >/dev/null 2>&1 || true')
+        plan.add("activate", f"enable {len(enable)} plugins where the source had them", body)
+    off = [i for i in (meta.get("disabledIds") or []) if safe_segment(i)]
+    if off:
+        body = ['omarchy shell -q shell ping >/dev/null 2>&1 || '
+                '{ echo "shell unreachable, disables NOT applied" >&2; exit 1; }',
+                "for _ in 1 2 3; do"]
+        for pid in off:
+            body.append(f'  omarchy plugin disable {sh(pid)} >/dev/null 2>&1 || true')
+        body.append("done")
+        plan.add("activate", f"disable {len(off)} ids the source had off", body,
+                 note="repeated because disabling a clone hands the slot back to its built-in")
+
+
+def plan_files(plan: Plan, cid: str, root: Path) -> None:
+    files_root = root / "categories" / cid / "files"
+    if not files_root.is_dir():
+        return
+    count = sum(1 for _ in iter_files(files_root))
+    if not count:
+        return
+    plan.add("files", f"{cid}: {count} files", [
+        f'cp -a {sh(files_root)}/. "$HOME"/',
+    ], note="home paths inside these are rewritten by `imprint restore`, not by this script")
+
+
+def build_plan(root: Path, manifest: dict, ids: list[str]) -> Plan:
+    plan = Plan()
+    cats = manifest.get("categories") or {}
+    plan.add("preflight", "check this is an Omarchy machine", [
+        'command -v omarchy >/dev/null || { echo "omarchy not found" >&2; exit 1; }',
+        'command -v git >/dev/null || { echo "git not found" >&2; exit 1; }',
+    ])
+    plan.add("preflight", "check the Omarchy shell is reachable", [
+        'if ! omarchy shell -q shell ping >/dev/null 2>&1; then',
+        '  echo "the Omarchy shell is not answering; plugin enable/disable cannot take effect" >&2',
+        '  echo "run this from inside the desktop session, not over a bare ssh login" >&2',
+        '  exit 1',
+        'fi',
+    ], note="enable/disable go through the shell's IPC, so a dead shell means silent no-ops")
+    if "packages" in ids:
+        plan.add("upgrade", "bring the machine up to date first", [
+            "omarchy update -y",
+        ], note="Arch does not support partial upgrades; installing onto a stale system is how it breaks")
+    order = ["packages", "toolchains", "projects", "themes", "plugins"]
+    for cid in order:
+        if cid not in ids:
+            continue
+        meta = cats.get(cid) or {}
+        if cid == "packages":
+            plan_packages(plan, meta)
+        elif cid == "toolchains":
+            plan_toolchains(plan, meta, root)
+            plan_files(plan, cid, root)
+        elif cid == "projects":
+            plan_projects(plan, meta, root)
+        elif cid == "themes":
+            plan_themes(plan, meta)
+            plan_files(plan, cid, root)
+        elif cid == "plugins":
+            plan_plugins(plan, meta, root)
+    for cid in ids:
+        if cid in order or cid in {"system", "identity", "secrets"}:
+            continue
+        plan_files(plan, cid, root)
+    if "system" in ids:
+        plan.add("system", "root-owned changes", [
+            'echo "run: imprint restore <archive> --only system --allow-system" >&2',
+        ], note="/etc and systemctl enable need root and are deliberately not inlined here")
+    plan.add("activate", "reload the desktop", [
+        "hyprctl reload || true",
+        "omarchy restart shell || true",
+    ])
+    return plan
+
+
+def render_plan_script(plan: Plan, manifest: dict, archive: Path, root: Path) -> str:
+    out = [
+        "#!/usr/bin/env bash",
+        "# Generated by imprint. Review before running -- this changes your machine.",
+        f"# Source machine : {manifest.get('hostname')} ({manifest.get('omarchy')})",
+        f"# Imprint created: {manifest.get('created')}",
+        f"# Archive        : {archive}",
+        f"# Payload        : {root}",
+        "#",
+        "# Every step is written to be safe to re-run. Steps that may legitimately",
+        "# fail end in `|| true`; anything else failing is counted and reported.",
+        "set -uo pipefail",
+        "",
+        "# The omarchy CLI and the shell IPC need a desktop session. Without this",
+        "# every enable/disable silently does nothing, which is easy to miss.",
+        ': "${OMARCHY_PATH:=/usr/share/omarchy}"; export OMARCHY_PATH',
+        ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; export XDG_RUNTIME_DIR',
+        'if [ -z "${WAYLAND_DISPLAY:-}" ]; then',
+        '  for _s in "$XDG_RUNTIME_DIR"/wayland-*; do',
+        '    case "$_s" in *.lock) continue ;; esac',
+        '    [ -e "$_s" ] || continue',
+        '    WAYLAND_DISPLAY=$(basename "$_s"); export WAYLAND_DISPLAY; break',
+        '  done',
+        'fi',
+        'if [ -z "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] && command -v hyprctl >/dev/null 2>&1; then',
+        "  _his=$(hyprctl instances 2>/dev/null | awk '/^instance /{print $2}' | tr -d ':' | head -1)",
+        '  [ -n "$_his" ] && { HYPRLAND_INSTANCE_SIGNATURE=$_his; export HYPRLAND_INSTANCE_SIGNATURE; }',
+        'fi',
+        "",
+        "fail=0",
+        "failed_steps=()",
+        "",
+    ]
+    for phase in plan.phases():
+        out.append("echo")
+        out.append(f"echo '### {phase}'")
+        for st in (x for x in plan.steps if x["phase"] == phase):
+            out.append("echo")
+            out.append(f"echo {sh('== ' + st['title'])}")
+            if st["note"]:
+                out.append(f"# {st['note']}")
+            # A subshell with -e so the status reflects the whole step, not just
+            # its last line.
+            out.append("if ! ( set -e")
+            out.extend("  " + line for line in st["body"])
+            out.append("); then")
+            out.append("  fail=$((fail+1))")
+            out.append(f"  failed_steps+=({sh(st['title'])})")
+            out.append("fi")
+        out.append("")
+    out += [
+        'if [ "$fail" -gt 0 ]; then',
+        '  echo >&2',
+        '  echo "$fail step(s) failed:" >&2',
+        '  printf \'  - %s\\n\' "${failed_steps[@]}" >&2',
+        '  exit 1',
+        'fi',
+        'echo',
+        'echo "plan applied cleanly"',
+    ]
+    return "\n".join(out) + "\n"
+
+
+def cmd_plan(args) -> int:
+    archive = Path(args.archive).expanduser()
+    if not archive.exists():
+        raise SystemExit(f"missing archive: {archive}")
+    out_dir = Path(args.output).expanduser() if args.output else (
+        Path.home() / ".local/state/imprint" / f"plan-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    payload = out_dir / "payload"
+    if archive.is_dir():
+        root = archive
+    else:
+        if payload.exists():
+            shutil.rmtree(payload)
+        extract_archive(archive, payload)
+        root = payload if (payload / "manifest.json").is_file() else open_imprint(archive, payload)
+    manifest = load_manifest(root)
+    available = [cid for cid in (manifest.get("categories") or {}) if (root / "categories" / cid).exists()]
+    ids = parse_only(args.only) if args.only else available
+    ids = [cid for cid in ids if cid in available]
+    if not ids:
+        raise SystemExit("no selected categories are present in this imprint")
+    plan = build_plan(root, manifest, ids)
+    script = out_dir / "restore.sh"
+    script.write_text(render_plan_script(plan, manifest, archive, root), encoding="utf-8")
+    os.chmod(script, 0o755)
+    write_json(out_dir / "plan.json", {
+        "archive": str(archive), "payload": str(root), "hostname": manifest.get("hostname"),
+        "categories": ids, "phases": plan.phases(),
+        "steps": [{"phase": x["phase"], "title": x["title"], "lines": len(x["body"])} for x in plan.steps],
+    })
+    result = {"ok": True, "plan": str(out_dir), "script": str(script),
+              "steps": len(plan.steps), "phases": plan.phases(), "categories": ids}
+    json.dump(result, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    return 0
+
+
 def cmd_verify(args) -> int:
     archive = Path(args.archive).expanduser()
     with tempfile.TemporaryDirectory(prefix="imprint-verify-") as tmp:
@@ -2939,6 +3259,10 @@ def build_parser() -> argparse.ArgumentParser:
     brief = sub.add_parser("brief")
     brief.add_argument("archive")
     brief.add_argument("--json", action="store_true")
+    planp = sub.add_parser("plan")
+    planp.add_argument("archive")
+    planp.add_argument("--only", default="")
+    planp.add_argument("-o", "--output", default="")
     verify = sub.add_parser("verify")
     verify.add_argument("archive")
     diff = sub.add_parser("diff")
@@ -2958,6 +3282,7 @@ def main(argv: list[str] | None = None) -> int:
         "restore": cmd_restore,
         "info": cmd_info,
         "brief": cmd_brief,
+        "plan": cmd_plan,
         "verify": cmd_verify,
         "diff": cmd_diff,
         "undo": cmd_undo,

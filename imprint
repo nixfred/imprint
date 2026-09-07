@@ -98,6 +98,8 @@ Usage:
   imprint restore FILE --upgrade      Run `omarchy update -y` first, then restore
   imprint restore FILE --only system --allow-system
                                       Apply /etc changes and enable system units
+  imprint plan FILE           Write a reviewable restore.sh you can read first
+  imprint plan FILE --only plugins -o ~/myplan
   imprint info FILE           Show the machine brief (AI-readable)
   imprint diff FILE           What drifted since this imprint
   imprint verify FILE         Check the archive
@@ -409,6 +411,10 @@ case $cmd in
     else
       do_restore "$archive" "$only" "$dry" "$confirm_host" "$upgrade" "$allow_system"
     fi
+    ;;
+  plan)
+    [[ $# -ge 1 ]] || die "usage: imprint plan FILE [--only ...] [-o DIR]"
+    engine plan "$@"
     ;;
   info|brief)
     [[ $# -ge 1 ]] || die "usage: imprint info FILE"

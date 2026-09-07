@@ -770,5 +770,89 @@ class GapClosureTests(unittest.TestCase):
             self.assertFalse(engine.trees_match(repo, live))
 
 
+class PlanTests(unittest.TestCase):
+    """`plan` must emit a script that is reviewable, re-runnable and honest."""
+
+    def _plan(self, manifest, files=None):
+        tmp = tempfile.mkdtemp()
+        root = Path(tmp) / "payload"
+        (root / "categories").mkdir(parents=True)
+        for cid in manifest.get("categories", {}):
+            (root / "categories" / cid).mkdir(parents=True, exist_ok=True)
+        for rel, body in (files or {}).items():
+            f = root / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(body, encoding="utf-8")
+        manifest.setdefault("kind", engine.KIND)
+        (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        plan = engine.build_plan(root, manifest, list(manifest.get("categories", {})))
+        return plan, engine.render_plan_script(plan, manifest, Path("a.tar.zst"), root)
+
+    def test_script_bootstraps_the_desktop_session(self):
+        _p, script = self._plan({"categories": {"plugins": {"plugins": []}}})
+        # Without these the omarchy CLI and shell IPC silently do nothing.
+        self.assertIn("OMARCHY_PATH:=/usr/share/omarchy", script)
+        self.assertIn("XDG_RUNTIME_DIR:=/run/user/$(id -u)", script)
+        self.assertIn("WAYLAND_DISPLAY", script)
+        self.assertIn("HYPRLAND_INSTANCE_SIGNATURE", script)
+
+    def test_preflight_refuses_a_dead_shell(self):
+        _p, script = self._plan({"categories": {"plugins": {"plugins": []}}})
+        self.assertIn("is not answering", script)
+
+    def test_upgrade_runs_before_packages(self):
+        _p, script = self._plan({"categories": {"packages": {"repo": ["jq"]}}})
+        self.assertLess(script.index("omarchy update -y"), script.index("omarchy pkg add"))
+
+    def test_a_repo_with_no_remote_is_called_out_not_skipped_silently(self):
+        _p, script = self._plan({"categories": {"projects": {
+            "repos": [{"path": "Projects/orphan", "url": ""}]}}})
+        self.assertIn("no git remote recorded", script)
+
+    def test_existing_plugin_is_not_recloned(self):
+        _p, script = self._plan({"categories": {"plugins": {"plugins": [
+            {"id": "a.plug", "kind": "git", "url": "https://x/a.git"}]}}})
+        self.assertIn("] || omarchy plugin add", script)
+
+    def test_placement_is_carried_into_the_enable_command(self):
+        _p, script = self._plan({"categories": {"plugins": {"plugins": [
+            {"id": "a.plug", "kind": "git", "url": "https://x/a.git", "enabled": True,
+             "placement": {"section": "left", "index": 3}}]}}})
+        self.assertIn("omarchy plugin enable a.plug --section left --index 3", script)
+
+    def test_disable_pass_repeats_for_clone_cascades(self):
+        _p, script = self._plan({"categories": {"plugins": {
+            "plugins": [], "disabledIds": ["pi.workspaces"]}}})
+        self.assertIn("for _ in 1 2 3; do", script)
+        self.assertIn("omarchy plugin disable pi.workspaces", script)
+
+    def test_steps_run_under_set_e_so_status_is_real(self):
+        _p, script = self._plan({"categories": {"packages": {"repo": ["jq"]}}})
+        self.assertIn("if ! ( set -e", script)
+        self.assertIn("failed_steps+=(", script)
+        self.assertIn('exit 1', script)
+
+    def test_generated_script_is_valid_bash(self):
+        import subprocess
+        _p, script = self._plan({"categories": {
+            "packages": {"repo": ["jq"], "aur": ["yay"]},
+            "projects": {"repos": [{"path": "Projects/x", "url": "https://x/x.git",
+                                    "branch": "main"}]},
+            "plugins": {"plugins": [{"id": "a.plug", "kind": "git", "url": "https://x/a.git",
+                                     "enabled": True, "branch": "main", "commit": "d" * 40}],
+                        "disabledIds": ["b.off"]},
+            "themes": {"themes": [{"id": "t", "url": "https://x/t.git"}]},
+        }})
+        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as fh:
+            fh.write(script); path = fh.name
+        proc = subprocess.run(["bash", "-n", path], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_system_is_not_inlined_because_it_needs_root(self):
+        _p, script = self._plan({"categories": {"system": {"enabledUnits": [], "etcFiles": []}}})
+        self.assertIn("--allow-system", script)
+        self.assertNotIn("sudo bash", script)
+
+
 if __name__ == "__main__":
     unittest.main()
