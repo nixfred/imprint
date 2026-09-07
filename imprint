@@ -54,7 +54,19 @@ IMPRINT_WORDMARK=$(cat <<'WORDMARK'
 WORDMARK
 )
 
+clear_screen() {
+  # Only when a person is watching: clearing a redirected or piped stdout just
+  # injects escape codes into whatever is capturing it.
+  [[ -t 1 ]] || return 0
+  if command -v tput >/dev/null 2>&1; then
+    tput clear 2>/dev/null && return 0
+  fi
+  # Home, erase screen, erase scrollback.
+  printf '\033[H\033[2J\033[3J'
+}
+
 banner() {
+  clear_screen
   local logo
   if [[ -r /usr/share/omarchy/logo.txt ]]; then
     logo=$(cat /usr/share/omarchy/logo.txt)

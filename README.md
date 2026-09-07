@@ -50,7 +50,8 @@ That links `imprint` into `~/.local/bin`. Omarchy already has `gum`, `python3`,
 
 ## Use
 
-Run `imprint` for the menu. The OMARCHY wordmark sits at the top.
+Run `imprint` for the menu. It clears the screen and puts the OMARCHY wordmark
+at the top, with IMPRINT under it in the same block font.
 
 **In the picker, `space` toggles the highlighted row.** A row marked `▸` has a
 submenu — `space` opens it and `←` goes back, so you can pick individual
