@@ -33,8 +33,11 @@ need python3
 need tar
 need zstd
 
+# gum's pickers need a real terminal. Without one -- cron, ssh without -t, a
+# pipeline -- fall back to the non-interactive path instead of dying on
+# "could not open TTY".
 HAVE_GUM=0
-if command -v gum >/dev/null 2>&1; then
+if command -v gum >/dev/null 2>&1 && [[ -t 0 && -t 1 ]]; then
   HAVE_GUM=1
 fi
 
@@ -216,8 +219,13 @@ do_save() {
   local all=${3:-0}
   banner
   if [[ -z $only && $all -eq 0 ]]; then
-    only=$(choose_categories "What should this imprint carry?" "$(default_selected)") \
-      || die "cancelled"
+    if (( HAVE_GUM )); then
+      only=$(choose_categories "What should this imprint carry?" "$(default_selected)") \
+        || die "cancelled"
+    else
+      only=$(default_selected)
+      say "No terminal for the picker; using the default categories."
+    fi
   fi
   if [[ -z $output ]]; then
     local host
@@ -272,8 +280,13 @@ do_restore() {
     engine info "$archive"
   fi
   if [[ -z $only ]]; then
-    only=$(choose_categories "What should land on this machine?" "$(ids_from_archive_defaults "$archive")" "$archive") \
-      || die "cancelled"
+    if (( HAVE_GUM )); then
+      only=$(choose_categories "What should land on this machine?" "$(ids_from_archive_defaults "$archive")" "$archive") \
+        || die "cancelled"
+    else
+      only=$(ids_from_archive_defaults "$archive")
+      say "No terminal for the picker; using this archive's default categories."
+    fi
   fi
   if printf '%s' "$only" | grep -q 'identity'; then
     warn "Identity will rename this host. Restore still needs --confirm-hostname."
@@ -322,6 +335,11 @@ do_list() {
 
 main_menu() {
   banner
+  if (( HAVE_GUM == 0 )); then
+    usage
+    echo
+    die "the menu needs a terminal; run one of the commands above"
+  fi
   need gum
   local choice
   choice=$(gum choose --header="What do you want to do?" \
