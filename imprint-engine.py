@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import time
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -200,6 +201,111 @@ CATEGORIES = [
         "risk": "secrets",
     },
 ]
+
+
+
+# ------------------------------------------------------------- presentation --
+# gum spin was doing this job. It queries the terminal for capabilities and
+# never reads the answers back, so the replies land in the shell as stray
+# characters after imprint exits -- and a spinner hides the one thing worth
+# watching, which is what is actually being collected.
+
+RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
+FG = {"green": "\033[38;5;114m", "blue": "\033[38;5;111m", "amber": "\033[38;5;179m",
+      "red": "\033[38;5;174m", "grey": "\033[38;5;245m"}
+TICK, CROSS, DOTS = "\u2713", "\u2717", "\u22ef"
+
+
+def colour_ok(stream) -> bool:
+    return (stream.isatty() and not os.environ.get("NO_COLOR")
+            and os.environ.get("TERM") not in (None, "", "dumb"))
+
+
+class Progress:
+    """A single self-updating line, plus one settled line per finished item."""
+
+    BAR_WIDTH = 28
+
+    def __init__(self, total: int, title: str, stream=None):
+        self.stream = stream or sys.stderr
+        self.total = max(0, total)
+        self.done = 0
+        self.title = title
+        self.colour = colour_ok(self.stream)
+        self.live = self.colour
+        self.started = time.monotonic()
+        self.failed = 0
+        if self.title:
+            self._raw(f"\n{self._c(BOLD, self.title)}\n\n")
+
+    def _c(self, code, text):
+        return f"{code}{text}{RESET}" if self.colour else text
+
+    def _raw(self, text):
+        try:
+            self.stream.write(text)
+            self.stream.flush()
+        except (OSError, ValueError):
+            pass
+
+    def _bar(self) -> str:
+        if not self.total:
+            return ""
+        filled = int(self.BAR_WIDTH * self.done / self.total)
+        return "\u2588" * filled + self._c(FG["grey"], "\u2591" * (self.BAR_WIDTH - filled))
+
+    def update(self, label: str) -> None:
+        """Show what is happening right now, on a line that will be overwritten."""
+        if not self.live:
+            return
+        counter = f"{self.done}/{self.total}" if self.total else str(self.done)
+        line = f"  {self._bar()}  {self._c(DIM, counter)}  {label}"
+        self._raw("\r\033[2K" + line)
+
+    def item(self, label: str, detail: str = "", ok: bool = True) -> None:
+        """Settle one item onto its own line, above the bar."""
+        self.done += 1
+        if not ok:
+            self.failed += 1
+        mark = self._c(FG["green"], TICK) if ok else self._c(FG["red"], CROSS)
+        width = 34
+        if len(label) > width:
+            label = label[: width - 1] + "\u2026"
+        detail = self._c(FG["grey"], detail) if detail else ""
+        line = f"  {mark} {label:<{width}} {detail}"
+        if self.live:
+            self._raw("\r\033[2K" + line + "\n")
+            self.update("")
+        else:
+            self._raw(line + "\n")
+
+    def finish(self, summary: str = "", detail: str = "") -> None:
+        if self.live:
+            self._raw("\r\033[2K")
+        secs = time.monotonic() - self.started
+        if summary:
+            self._raw(f"\n  {self._c(BOLD, summary)}\n")
+        parts = [p for p in (detail, f"{secs:.1f}s") if p]
+        if self.failed:
+            parts.append(f"{self.failed} failed")
+        self._raw(self._c(FG["grey"], "  " + " \u00b7 ".join(parts)) + "\n\n")
+
+
+def emit(result: dict, args) -> None:
+    """JSON is for scripts. A person watching has already seen the progress."""
+    if getattr(args, "json", False) or not sys.stdout.isatty():
+        json.dump(result, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+
+
+def note(text: str, colour: str = "") -> None:
+    stream = sys.stderr
+    body = f"{FG.get(colour, '')}{text}{RESET}" if colour and colour_ok(stream) else text
+    try:
+        stream.write(f"  {body}\n")
+        stream.flush()
+    except (OSError, ValueError):
+        pass
 
 
 def category_by_id(cid: str) -> dict:
@@ -1830,17 +1936,22 @@ def copy_tool(staging: Path) -> None:
         os.chmod(tool / "imprint", os.stat(tool / "imprint").st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def collect_selected(staging: Path, home: Path, ids: list[str]) -> dict:
+def collect_selected(staging: Path, home: Path, ids: list[str],
+                     progress: "Progress | None" = None) -> dict:
     categories = {}
     for cid in ids:
         collector = COLLECTORS[cid]
+        title = category_by_id(cid)["title"]
+        if progress:
+            progress.update(title)
         cat_dir = staging / "categories" / cid
         cat_dir.mkdir(parents=True, exist_ok=True)
         meta = collector(cat_dir, home)
         meta = dict(meta or {})
         meta["bytes"] = dir_size(cat_dir)
         categories[cid] = meta
-        print(f"  collected {cid} ({human_size(meta['bytes'])})", file=sys.stderr)
+        if progress:
+            progress.item(title, human_size(meta["bytes"]))
     return categories
 
 
@@ -1940,20 +2051,21 @@ def cmd_save(args) -> int:
     with tempfile.TemporaryDirectory(prefix="imprint-") as tmp:
         staging = Path(tmp) / "imprint"
         staging.mkdir()
-        print("Collecting categories:", ", ".join(ids), file=sys.stderr)
-        categories = collect_selected(staging, home, ids)
+        progress = Progress(len(ids), f"Collecting {hostname()}")
+        categories = collect_selected(staging, home, ids, progress)
         manifest = machine_facts()
         manifest["categories"] = {cid: strip_heavy(categories[cid]) for cid in ids}
         manifest["archiveName"] = dest.name
         write_json(staging / "manifest.json", manifest)
         (staging / "BRIEF.md").write_text(render_brief(manifest), encoding="utf-8")
         copy_tool(staging)
-        print(f"Writing {dest}", file=sys.stderr)
+        progress.update("writing the archive")
         write_archive(staging, dest)
+        size_now = dest.stat().st_size
+        progress.finish(f"Wrote {dest}",
+                        f"{human_size(size_now)} \u00b7 {len(ids)} categories")
     size = dest.stat().st_size
-    result = {"ok": True, "path": str(dest), "bytes": size, "categories": ids}
-    json.dump(result, sys.stdout, indent=2)
-    sys.stdout.write("\n")
+    emit({"ok": True, "path": str(dest), "bytes": size, "categories": ids}, args)
     return 0
 
 
@@ -2852,7 +2964,7 @@ def cmd_restore(args) -> int:
             if dry:
                 report["upgrade"] = "omarchy update -y"
             else:
-                print("  upgrading the machine first", file=sys.stderr)
+                note("upgrading the machine first (omarchy update -y)", "amber")
                 proc = run(["omarchy", "update", "-y"])
                 if proc.returncode == 0:
                     report["upgrade"] = "omarchy update ok"
@@ -2878,8 +2990,11 @@ def cmd_restore(args) -> int:
             if cid in ids
         ]
         order += [cid for cid in ids if cid not in order]
+        progress = Progress(len(order), ("Restoring onto " if not dry else "Rehearsing on ") + hostname())
         for cid in order:
-            print(f"  restoring {cid}", file=sys.stderr)
+            title = category_by_id(cid)["title"]
+            progress.update(title)
+            before = len(FAILURES)
             actions = restore_category(
                 cid,
                 root / "categories" / cid,
@@ -2891,6 +3006,7 @@ def cmd_restore(args) -> int:
                 args,
             )
             report["categories"][cid] = actions
+            progress.item(title, f"{len(actions)} actions", ok=len(FAILURES) == before)
         if not dry:
             reload_proc = run(["hyprctl", "reload"])
             if reload_proc.returncode != 0:
@@ -2902,10 +3018,14 @@ def cmd_restore(args) -> int:
                 report["categories"].setdefault("_final", []).append(
                     fail("omarchy restart shell failed: " + (shell_proc.stderr or shell_proc.stdout).strip()[:200])
                 )
+        progress.finish("Restore complete" if not FAILURES
+                        else f"Restore finished with {len(FAILURES)} problem(s)",
+                        f"{len(order)} categories")
         report["ok"] = not FAILURES
         report["failures"] = list(FAILURES)
-        json.dump(report, sys.stdout, indent=2)
-        sys.stdout.write("\n")
+        for problem in FAILURES[:6]:
+            note(problem[:160], "red")
+        emit(report, args)
     return 0 if not FAILURES else 1
 
 
@@ -3375,6 +3495,10 @@ def run_step(step: dict, preamble: list[str], plan_dir: Path, payload: Path) -> 
             pass
 
 
+def failed_now(journal: dict) -> list:
+    return [k for k, v in journal.get("steps", {}).items() if v.get("state") == "failed"]
+
+
 def cmd_apply(args) -> int:
     plan_dir = Path(args.plan).expanduser()
     plan_file = plan_dir / "plan.json"
@@ -3427,6 +3551,8 @@ def cmd_apply(args) -> int:
             continue
         todo.append(step)
 
+    progress = Progress(len(todo), f"Applying {len(todo)} step(s)"
+                        + (f", {len(skipped)} already done" if skipped else ""))
     for step in todo:
         journal["steps"][step["id"]] = {
             "phase": step["phase"], "title": step["title"], "hash": step["hash"],
@@ -3437,9 +3563,9 @@ def cmd_apply(args) -> int:
             journal["steps"][step["id"]].update(state="pending", finishedAt=iso_now(),
                                                 note="dry run, not executed")
             save_journal(plan_dir, journal)
-            print(f"  would run [{step['phase']}] {step['title']}", file=sys.stderr)
+            progress.item(step["title"], f"[{step['phase']}] would run")
             continue
-        print(f"  [{step['phase']}] {step['title']}", file=sys.stderr)
+        progress.update(f"[{step['phase']}] {step['title']}")
         code, tail = run_step(step, preamble, plan_dir, payload)
         entry = journal["steps"][step["id"]]
         entry["finishedAt"] = iso_now()
@@ -3447,11 +3573,15 @@ def cmd_apply(args) -> int:
         entry["output"] = tail
         entry["state"] = "succeeded" if code == 0 else "failed"
         save_journal(plan_dir, journal)
+        progress.item(step["title"], step["phase"], ok=code == 0)
         if code != 0:
             fail(f"[{step['phase']}] {step['title']}: exit {code}")
             if args.stop_on_failure:
                 break
 
+    progress.finish("Plan applied" if not failed_now(journal) else "Plan stopped with failures",
+                    f"{len(todo)} step(s) run"
+                    + (f" \u00b7 {len(skipped)} already done" if skipped else ""))
     done = [k for k, v in journal["steps"].items() if v.get("state") == "succeeded"]
     failed = [(k, v) for k, v in journal["steps"].items() if v.get("state") == "failed"]
     pending = [s["id"] for s in steps
@@ -3472,11 +3602,11 @@ def cmd_apply(args) -> int:
                     "output": (v.get("output") or "")[-300:]} for k, v in failed],
         "stillPending": pending,
     }
-    json.dump(report, sys.stdout, indent=2)
-    sys.stdout.write("\n")
+    emit(report, args)
     if failed:
-        print(f"\n{len(failed)} step(s) failed. Fix, then: imprint apply {plan_dir} --resume",
-              file=sys.stderr)
+        for k, v in failed[:6]:
+            note(f"{v.get('title')}: exit {v.get('exit')}", "red")
+        note(f"resume with: imprint apply {plan_dir} --resume", "amber")
     return 0 if not failed else 1
 
 
@@ -3955,12 +4085,14 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("categories")
     sub.add_parser("facts")
     save = sub.add_parser("save")
+    save.add_argument("--json", action="store_true", help="print the machine-readable report")
     save.add_argument("--only", default="")
     save.add_argument("--all", action="store_true")
     save.add_argument("-o", "--output", default="")
     save.add_argument("--select", default="",
                       help="JSON from `imprint pick`, to narrow within a category")
     restore = sub.add_parser("restore")
+    restore.add_argument("--json", action="store_true", help="print the machine-readable report")
     restore.add_argument("archive")
     restore.add_argument("--only", default="")
     restore.add_argument("--dry-run", action="store_true")
@@ -3982,6 +4114,7 @@ def build_parser() -> argparse.ArgumentParser:
     planp.add_argument("--only", default="")
     planp.add_argument("-o", "--output", default="")
     applyp = sub.add_parser("apply")
+    applyp.add_argument("--json", action="store_true", help="print the machine-readable report")
     applyp.add_argument("plan")
     applyp.add_argument("--resume", action="store_true",
                         help="continue an interrupted run, skipping steps already done")

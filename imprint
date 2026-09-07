@@ -236,28 +236,12 @@ do_save() {
     fi
   fi
   [[ -n $output ]] || die "no output path"
-  say "Saving $( [[ $all -eq 1 ]] && echo all categories || echo "$only" )"
-  say "→ $output"
-  if (( HAVE_GUM )); then
-    if [[ $all -eq 1 ]]; then
-      gum spin --spinner dot --title "Collecting this machine…" -- \
-        python3 "$ENGINE" save --all -o "$output"
-    else
-      gum spin --spinner dot --title "Collecting this machine…" -- \
-        python3 "$ENGINE" save --only "$only" ${SELECTION_FILE:+--select "$SELECTION_FILE"} -o "$output"
-    fi
+  if [[ $all -eq 1 ]]; then
+    engine save --all -o "$output" >/dev/null
   else
-    if [[ $all -eq 1 ]]; then
-      engine save --all -o "$output"
-    else
-      engine save --only "$only" ${SELECTION_FILE:+--select "$SELECTION_FILE"} -o "$output"
-    fi
+    engine save --only "$only" ${SELECTION_FILE:+--select "$SELECTION_FILE"} -o "$output" >/dev/null
   fi
   [[ -n $SELECTION_FILE ]] && rm -f "$SELECTION_FILE"
-  say "Wrote $output"
-  if command -v du >/dev/null; then
-    say "Size $(du -h "$output" | awk '{print $1}')"
-  fi
 }
 
 do_restore() {
@@ -305,13 +289,7 @@ do_restore() {
   if [[ $dry -eq 0 ]]; then
     confirm "Restore selected categories onto this machine?" || die "cancelled"
   fi
-  say "Restoring $only"
-  if (( HAVE_GUM )) && [[ $dry -eq 0 ]]; then
-    gum spin --spinner dot --title "Applying imprint…" -- \
-      python3 "$ENGINE" restore "$archive" --only "$only" "${extra[@]}"
-  else
-    engine restore "$archive" --only "$only" "${extra[@]}"
-  fi
+  engine restore "$archive" --only "$only" "${extra[@]}" >/dev/null
 }
 
 do_list() {

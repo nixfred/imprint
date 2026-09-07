@@ -104,6 +104,25 @@ imprint list
 The archive is self-contained. On a fresh Omarchy install you can extract it
 and run `tool/imprint restore .` without installing anything first.
 
+## What a run looks like
+
+```
+Collecting dex
+
+  ✓ Look                               10.1 KB
+  ✓ Plugins                            5.0 MB
+  ✓ CLI configs                        59.1 KB
+
+  Wrote /home/pi/imprints/imprint-dex-20260907-1013.tar.zst
+  2.9 MB · 3 categories · 2.2s
+```
+
+A progress bar tracks the current item on a line that each finished item
+overwrites, so you get a live bar while it works and a tidy checklist when it
+is done. Colour is dropped when stdout is not a terminal or `NO_COLOR` is set,
+and the machine-readable JSON is printed only when piped or asked for with
+`--json` — a person watching has already seen the result.
+
 ## Read it before you run it
 
 `imprint plan FILE` extracts the archive and writes a `restore.sh` next to it —
