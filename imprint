@@ -31,19 +31,21 @@ need() {
 
 need python3
 need tar
-need zstd
 
 # gum's pickers need a real terminal. Without one -- cron, ssh without -t, a
 # pipeline -- fall back to the non-interactive path instead of dying on
 # "could not open TTY".
+# Interactive menus need a terminal, nothing more -- gum is no longer used.
 HAVE_GUM=0
-if command -v gum >/dev/null 2>&1 && [[ -t 0 && -t 1 ]]; then
+if [[ -t 0 && -t 1 ]]; then
   HAVE_GUM=1
 fi
 
-accent="${GUM_CHOOSE_SELECTED_FOREGROUND:-#7aa2f7}"
-muted="${GUM_CONFIRM_PROMPT_FOREGROUND:-#8E969E}"
-text="${GUM_FILTER_HEADER_FOREGROUND:-#EAECEE}"
+# Colours come from the active Omarchy theme, via the engine.
+IMP_ACCENT='' IMP_GREEN='' IMP_AMBER='' IMP_RED='' IMP_GREY='' IMP_BLUE='' IMP_RESET='' IMP_BOLD=''
+if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+  eval "$(engine palette 2>/dev/null || true)"
+fi
 
 # IMPRINT in the same block font as the Omarchy wordmark, at half its height.
 IMPRINT_WORDMARK=$(cat <<'WORDMARK'
@@ -74,33 +76,18 @@ banner() {
   else
     logo='OMARCHY'
   fi
-  if (( HAVE_GUM )); then
-    gum style --foreground "$accent" --bold --align center --width 92 "$logo"
-    gum style --foreground "$text" --bold --align center --width 92 "$IMPRINT_WORDMARK"
-    gum style --foreground "$muted" --italic --align center --width 92 \
-      "Stamp one Omarchy onto another · space selects · ▸ opens a submenu · enter confirms"
-    echo
-  else
-    printf '%s\n' "$logo"
-    printf '%s\n' "$IMPRINT_WORDMARK"
-    echo
-  fi
+  printf '%s%s%s\n' "$IMP_ACCENT" "$logo" "$IMP_RESET"
+  printf '%s%s%s\n' "$IMP_BOLD" "$IMPRINT_WORDMARK" "$IMP_RESET"
+  printf '%s  Stamp one Omarchy onto another · space selects · ▸ opens a submenu%s\n\n' \
+    "$IMP_GREY" "$IMP_RESET"
 }
 
 say() {
-  if (( HAVE_GUM )); then
-    gum style --foreground "$text" -- "$@"
-  else
-    printf '%s\n' "$*"
-  fi
+  printf '  %s\n' "$*"
 }
 
 warn() {
-  if (( HAVE_GUM )); then
-    gum style --foreground "#E0AF68" -- "$@"
-  else
-    printf 'warning: %s\n' "$*"
-  fi
+  printf '  %s%s%s\n' "$IMP_AMBER" "$*" "$IMP_RESET"
 }
 
 die() {
@@ -118,7 +105,8 @@ Usage:
   imprint save --all -o FILE
   imprint save --only scripts,cli      Just the scripts, no plugins
   imprint save --only look,bar,plugins
-  imprint restore [FILE]      Choose categories from an archive
+  imprint restore [FILE]      Pick what to restore, review the changes, confirm
+  imprint preview FILE        Show what a restore would change, and stop
   imprint restore FILE --only bar,plugins --dry-run
   imprint restore FILE --upgrade      Run `omarchy update -y` first, then restore
   imprint restore FILE --only system --allow-system
@@ -196,22 +184,22 @@ choose_categories() {
 pick_archive() {
   local start=${1:-$HOME/imprints}
   mkdir -p "$start"
+  local found
+  found=$(ls -1t "$start"/*.tar.zst "$HOME"/backups/*.tar.zst 2>/dev/null | awk '!seen[$0]++')
+  [[ -n $found ]] || { echo "no archives in $start or ~/backups" >&2; return 1; }
   if (( HAVE_GUM )); then
-    gum file --directory=false --height=16 --header="Choose an imprint archive" "$start"
+    printf '%s\n' "$found" | engine menu --header "Choose an imprint archive"
   else
-    ls -1 "$start"/imprint-*.tar.zst 2>/dev/null | tail -n 1
+    printf '%s\n' "$found" | head -n 1
   fi
 }
 
 confirm() {
-  local prompt=$1
-  if (( HAVE_GUM )); then
-    gum confirm "$prompt"
-  else
-    printf '%s [y/N] ' "$prompt"
-    read -r ans
-    [[ $ans == y || $ans == Y ]]
-  fi
+  local prompt=$1 ans
+  [[ -t 0 ]] || return 1
+  printf '  %s%s%s [y/N] ' "$IMP_BOLD" "$prompt" "$IMP_RESET"
+  read -r ans </dev/tty || return 1
+  [[ $ans == y || $ans == Y || $ans == yes ]]
 }
 
 do_save() {
@@ -232,8 +220,10 @@ do_save() {
     host=$(hostname)
     mkdir -p "$HOME/imprints"
     output="$HOME/imprints/imprint-${host}-$(date +%Y%m%d-%H%M).tar.zst"
-    if (( HAVE_GUM )); then
-      output=$(gum input --header="Write archive to" --value="$output")
+    if [[ -t 0 ]]; then
+      local typed
+      printf '  %sWrite archive to%s\n' "$IMP_BOLD" "$IMP_RESET"
+      read -r -e -i "$output" typed </dev/tty && [[ -n $typed ]] && output=$typed
     fi
   fi
   [[ -n $output ]] || die "no output path"
@@ -257,21 +247,17 @@ do_restore() {
     archive=$(pick_archive) || die "cancelled"
   fi
   [[ -n $archive && -e $archive ]] || die "archive not found: $archive"
-  say "Archive $archive"
   engine verify "$archive" >/dev/null || die "archive failed verify"
-  if (( HAVE_GUM )); then
-    engine info "$archive" | gum pager --timeout=0s || true
-  else
-    engine info "$archive"
-  fi
+  say "Archive $archive"
   if [[ -z $only ]]; then
     if (( HAVE_GUM )); then
-      PICK_ACTION="Start restore" only=$(choose_categories "What should land on this machine?" "$archive") || die "cancelled"
+      PICK_ACTION="Review changes" only=$(choose_categories "What should land on this machine?" "$archive") || die "cancelled"
     else
       only=$(ids_from_archive_defaults "$archive")
       say "No terminal for the picker; using this archive's default categories."
     fi
   fi
+  [[ -n $only ]] || die "nothing selected"
   if printf '%s' "$only" | grep -q 'identity'; then
     warn "Identity will rename this host. Restore still needs --confirm-hostname."
   fi
@@ -287,10 +273,15 @@ do_restore() {
   (( allow_system == 1 )) && extra+=(--allow-system)
   # These were parsed and then thrown away on the interactive path.
   [[ -n $confirm_host ]] && extra+=(--confirm-hostname "$confirm_host")
+  [[ -n $SELECTION_FILE ]] && extra+=(--select "$SELECTION_FILE")
+
+  # Say exactly what will change before asking for the go-ahead.
+  engine preview "$archive" --only "$only" ${SELECTION_FILE:+--select "$SELECTION_FILE"}
   if [[ $dry -eq 0 ]]; then
-    confirm "Restore selected categories onto this machine?" || die "cancelled"
+    confirm "Apply these changes to this machine?" || { [[ -n $SELECTION_FILE ]] && rm -f "$SELECTION_FILE"; die "cancelled"; }
   fi
   engine restore "$archive" --only "$only" "${extra[@]}" >/dev/null
+  [[ -n $SELECTION_FILE ]] && rm -f "$SELECTION_FILE"
 }
 
 do_list() {
@@ -302,13 +293,9 @@ do_list() {
     say "No archives in ~/imprints yet. Run imprint save."
     return 0
   fi
-  if (( HAVE_GUM )); then
-    printf '%s\n' "$files" | while read -r f; do
-      printf '%s  %s\n' "$(du -h "$f" | awk '{print $1}')" "$f"
-    done | gum style --foreground "$text" --border rounded --padding "1 2" --border-foreground "$accent"
-  else
-    ls -lh "$HOME/imprints"/imprint-*.tar.zst
-  fi
+  printf '%s\n' "$files" | while read -r f; do
+    printf '  %s%8s%s  %s\n' "$IMP_GREY" "$(du -h "$f" | awk '{print $1}')" "$IMP_RESET" "$f"
+  done
 }
 
 main_menu() {
@@ -318,10 +305,8 @@ main_menu() {
     echo
     die "the menu needs a terminal; run one of the commands above"
   fi
-  need gum
   local choice
-  choice=$(gum choose --header="What do you want to do?" \
-    --cursor="▸ " --height=10 \
+  choice=$(printf '%s\n' \
     "Save this machine" \
     "Restore onto this machine" \
     "Inspect an imprint" \
@@ -329,19 +314,19 @@ main_menu() {
     "Undo last restore" \
     "List archives" \
     "About" \
-    "Quit") || exit 0
+    "Quit" | engine menu --header "What do you want to do?") || exit 0
   case $choice in
     "Save this machine") do_save ;;
     "Restore onto this machine") do_restore ;;
     "Inspect an imprint")
       local f
       f=$(pick_archive) || exit 0
-      engine info "$f" | gum pager --timeout=0s
+      engine info "$f" | ${PAGER:-less -R}
       ;;
     "Diff against this machine")
       local f
       f=$(pick_archive) || exit 0
-      engine diff "$f" | gum pager --timeout=0s
+      engine diff "$f" | ${PAGER:-less -R}
       ;;
     "Undo last restore")
       confirm "Put back files from the last restore?" || exit 0
@@ -420,6 +405,10 @@ case $cmd in
   apply)
     [[ $# -ge 1 ]] || die "usage: imprint apply PLAN_DIR [--resume]"
     engine apply "$@"
+    ;;
+  preview)
+    [[ $# -ge 1 ]] || die "usage: imprint preview FILE"
+    engine preview "$@"
     ;;
   info|brief)
     [[ $# -ge 1 ]] || die "usage: imprint info FILE"

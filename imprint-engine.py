@@ -515,8 +515,18 @@ def write_json(path: Path, data) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n", encoding="utf-8")
 
 
+# Churn, not configuration: regenerated on next run and pure noise in a diff.
+NOISE_SUFFIXES = (".log", ".sock", ".pid", ".lock", ".tmp", ".swp", ".part")
+NOISE_DIR_NAMES = {"Cache", "cache", "logs", "Crash Reports", "GPUCache", "ShaderCache",
+                   "Code Cache", "blob_storage", "Service Worker"}
+# Runtime singletons an app recreates on launch; copying them confuses it.
+NOISE_EXACT = {"SingletonCookie", "SingletonLock", "SingletonSocket", ".lock", "lockfile"}
+
+
 def is_skipped_name(name: str) -> bool:
-    if name in EXCLUDE_DIR_NAMES:
+    if name in EXCLUDE_DIR_NAMES or name in NOISE_DIR_NAMES or name in NOISE_EXACT:
+        return True
+    if name.endswith(NOISE_SUFFIXES):
         return True
     if name.endswith("~"):
         return True
@@ -2400,13 +2410,16 @@ def backup_existing(src: Path, undo: Path, home: Path) -> None:
         shutil.copy2(src, dest, follow_symlinks=True)
 
 
-def restore_file_tree(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool) -> list[str]:
+def restore_file_tree(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool,
+                      category: str = "") -> list[str]:
     files_root = cat_dir / "files"
     done = []
     if not files_root.is_dir():
         return done
     for path in iter_files(files_root):
         rel = path.relative_to(files_root)
+        if category and not wanted(category, str(rel)):
+            continue
         dest = home / rel
         try:
             contained(home, dest.parent)
@@ -2567,6 +2580,8 @@ def restore_plugins(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: b
         if not safe_segment(pid):
             actions.append(f"refused unsafe plugin id {pid!r}")
             continue
+        if not wanted("plugins", pid):
+            continue
         target = plugins_root / pid
         if dry:
             # Say exactly what apply would run, not just the category name.
@@ -2661,8 +2676,10 @@ def restore_plugins(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: b
     if not dry:
         run(["omarchy-shell", "shell", "rescanPlugins"])
         live = {item.get("id"): item for item in plugin_list() if item.get("id")}
-    wanted = [p for p in (meta.get("plugins") or []) if p.get("enabled") and safe_segment(p.get("id") or "")]
-    for plug in wanted:
+    to_enable = [p for p in (meta.get("plugins") or [])
+                 if p.get("enabled") and safe_segment(p.get("id") or "")
+                 and wanted("plugins", p.get("id") or "")]
+    for plug in to_enable:
         pid = plug["id"]
         if dry:
             place = plug.get("placement") or {}
@@ -2766,8 +2783,8 @@ def restore_packages(cat_dir: Path, dry: bool) -> list[str]:
         return []
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     actions = []
-    repo = meta.get("repo") or []
-    aur = meta.get("aur") or []
+    repo = [p for p in (meta.get("repo") or []) if wanted("packages", f"repo:{p}")]
+    aur = [p for p in (meta.get("aur") or []) if wanted("packages", f"aur:{p}")]
     if dry:
         if repo:
             actions.append("pkg add " + " ".join(repo))
@@ -2795,6 +2812,8 @@ def restore_themes(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bo
     if meta_path.is_file():
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         for theme in meta.get("themes") or []:
+            if not wanted("themes", theme.get("id") or ""):
+                continue
             if theme.get("url"):
                 if dry:
                     actions.append(f"theme install {theme['url']}")
@@ -2960,7 +2979,7 @@ def restore_identity(cat_dir: Path, dry: bool, confirm_host: str | None) -> list
 
 
 def restore_scripts(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool) -> list[str]:
-    actions = restore_file_tree(cat_dir, home, old_home, undo, dry)
+    actions = restore_file_tree(cat_dir, home, old_home, undo, dry, category="scripts")
     meta_path = cat_dir / "meta.json"
     if not meta_path.is_file():
         return actions
@@ -2968,6 +2987,8 @@ def restore_scripts(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: b
     for entry in meta.get("links") or []:
         link_rel, target_rel = entry.get("link") or "", entry.get("target") or ""
         if not link_rel or not target_rel:
+            continue
+        if not wanted("scripts", link_rel):
             continue
         try:
             link = contained(home, (home / link_rel).parent) / Path(link_rel).name
@@ -3230,8 +3251,175 @@ def restore_category(
     return actions
 
 
+def load_selection(args) -> None:
+    spec_path = getattr(args, "select", "")
+    if not spec_path:
+        return
+    path = Path(spec_path).expanduser()
+    try:
+        spec = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"cannot read the selection file {path}: {exc}")
+    SUBSELECT.clear()
+    for cid, keys in (spec.get("subselections") or {}).items():
+        SUBSELECT[cid] = set(keys)
+
+
+def preview_changes(root: Path, home: Path, manifest: dict, ids: list[str]) -> dict:
+    """What a restore would actually alter, before anything is touched.
+
+    A dry run lists the operations; this classifies them, so the difference
+    between "rewrites 40 files" and "rewrites 2 and leaves 38 alone" is visible
+    before you agree to it.
+    """
+    old_home = manifest.get("home") or ""
+    files_new, files_changed, files_same = [], [], []
+    for cid in ids:
+        files_root = root / "categories" / cid / "files"
+        if not files_root.is_dir():
+            continue
+        for path in iter_files(files_root):
+            rel = path.relative_to(files_root)
+            if cid == "scripts" and not wanted("scripts", str(rel)):
+                continue
+            live = home / rel
+            entry = f"~/{rel}"
+            if not live.exists() and not live.is_symlink():
+                files_new.append(entry)
+                continue
+            packed = read_text_safe(path)
+            current = read_text_safe(live)
+            if packed is not None and current is not None:
+                same = rewrite_text(packed, old_home, str(home)) == current
+            else:
+                try:
+                    same = path.stat().st_size == live.stat().st_size
+                except OSError:
+                    same = False
+            (files_same if same else files_changed).append(entry)
+
+    out = {
+        "filesNew": sorted(files_new),
+        "filesChanged": sorted(files_changed),
+        "filesUnchanged": len(files_same),
+    }
+
+    cats = manifest.get("categories") or {}
+    if "plugins" in ids:
+        meta_path = root / "categories/plugins/meta.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
+        live = {i.get("id"): i for i in plugin_list() if i.get("id")}
+        install, update, enable, disable = [], [], [], []
+        root_dir = home / ".config/omarchy/plugins"
+        for plug in meta.get("plugins") or []:
+            pid = plug.get("id")
+            if not pid or not wanted("plugins", pid):
+                continue
+            target = root_dir / pid
+            if not target.exists():
+                install.append(pid)
+            elif plug.get("commit") and git_head(target) != plug["commit"]:
+                update.append(f"{pid} {git_head(target)[:8]}\u2192{plug['commit'][:8]}")
+            if plug.get("enabled") and not live.get(pid, {}).get("enabled"):
+                enable.append(pid)
+        for pid in meta.get("disabledIds") or []:
+            if live.get(pid, {}).get("enabled"):
+                disable.append(pid)
+        out["pluginsInstall"] = sorted(install)
+        out["pluginsUpdate"] = sorted(update)
+        out["pluginsEnable"] = sorted(enable)
+        out["pluginsDisable"] = sorted(disable)
+    if "packages" in ids:
+        pkg = cats.get("packages") or {}
+        have = set(run_ok(["pacman", "-Qq"]).split())
+        missing = [p for p in (pkg.get("repo") or []) + (pkg.get("aur") or [])
+                   if p not in have and wanted("packages", f"repo:{p}") | wanted("packages", f"aur:{p}")]
+        out["packagesInstall"] = sorted(missing)
+    if "projects" in ids:
+        meta_path = root / "categories/projects/meta.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
+        clone = [r["path"] for r in (meta.get("repos") or [])
+                 if r.get("path") and wanted("projects", r["path"])
+                 and not (home / r["path"]).exists()]
+        out["projectsClone"] = sorted(clone)
+    if "identity" in ids:
+        meta_path = root / "categories/identity/meta.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
+        if meta.get("hostname") and meta["hostname"] != hostname():
+            out["hostname"] = f"{hostname()} \u2192 {meta['hostname']}"
+    return out
+
+
+def render_preview(changes: dict, ids: list[str]) -> str:
+    grey, amber, green, red = (FG.get("grey", ""), FG.get("amber", ""),
+                               FG.get("green", ""), FG.get("red", ""))
+    tint = colour_ok(sys.stderr)
+    c = lambda code, text: f"{code}{text}{RESET}" if tint and code else text
+    lines = ["", c(BOLD, "This restore will change:"), ""]
+
+    def block(title, items, colour, limit=12):
+        if not items:
+            return
+        lines.append(f"  {c(colour, title)}  {c(grey, f'({len(items)})')}")
+        for entry in items[:limit]:
+            lines.append(f"      {entry}")
+        if len(items) > limit:
+            lines.append(c(grey, f"      \u2026 and {len(items) - limit} more"))
+        lines.append("")
+
+    block("overwrite existing files", changes.get("filesChanged") or [], amber)
+    block("create new files", changes.get("filesNew") or [], green)
+    block("install plugins", changes.get("pluginsInstall") or [], green)
+    block("move plugins to another commit", changes.get("pluginsUpdate") or [], amber)
+    block("enable plugins", changes.get("pluginsEnable") or [], green)
+    block("DISABLE plugins currently on", changes.get("pluginsDisable") or [], red)
+    block("install packages", changes.get("packagesInstall") or [], green)
+    block("clone projects", changes.get("projectsClone") or [], green)
+    if changes.get("hostname"):
+        lines.append(f"  {c(red, 'rename this machine')}  {changes['hostname']}")
+        lines.append("")
+
+    unchanged = changes.get("filesUnchanged") or 0
+    touched = (len(changes.get("filesChanged") or []) + len(changes.get("filesNew") or [])
+               + len(changes.get("pluginsInstall") or []) + len(changes.get("pluginsUpdate") or [])
+               + len(changes.get("pluginsEnable") or []) + len(changes.get("pluginsDisable") or [])
+               + len(changes.get("packagesInstall") or []) + len(changes.get("projectsClone") or []))
+    if not touched:
+        lines.append(f"  {c(green, 'Nothing to change - this machine already matches the imprint.')}")
+        lines.append("")
+    lines.append(c(grey, f"  {len(ids)} categories \u00b7 {unchanged} files already identical"))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def cmd_preview(args) -> int:
+    ensure_session_env()
+    load_selection(args)
+    archive = Path(args.archive).expanduser()
+    if not archive.exists():
+        raise SystemExit(f"missing archive: {archive}")
+    home = Path.home()
+    with tempfile.TemporaryDirectory(prefix="imprint-preview-") as tmp:
+        root = open_imprint(archive, Path(tmp) / "open")
+        manifest = load_manifest(root)
+        available = [cid for cid in (manifest.get("categories") or {})
+                     if (root / "categories" / cid).exists()]
+        ids = parse_only(args.only) if args.only else available
+        ids = [cid for cid in ids if cid in available]
+        if not ids:
+            raise SystemExit("no selected categories are present in this imprint")
+        changes = preview_changes(root, home, manifest, ids)
+        if getattr(args, "json", False):
+            json.dump({"ok": True, "categories": ids, "changes": changes}, sys.stdout, indent=2)
+            sys.stdout.write("\n")
+        else:
+            sys.stderr.write(render_preview(changes, ids))
+    return 0
+
+
 def cmd_restore(args) -> int:
     ensure_session_env()
+    load_selection(args)
     archive = Path(args.archive).expanduser()
     if not archive.exists():
         raise SystemExit(f"missing archive: {archive}")
@@ -3380,8 +3568,8 @@ class Plan:
 
 
 def plan_packages(plan: Plan, meta: dict) -> None:
-    repo = meta.get("repo") or []
-    aur = meta.get("aur") or []
+    repo = [p for p in (meta.get("repo") or []) if wanted("packages", f"repo:{p}")]
+    aur = [p for p in (meta.get("aur") or []) if wanted("packages", f"aur:{p}")]
     if repo:
         plan.add("packages", f"{len(repo)} repo packages",
                  ["omarchy pkg add " + " ".join(sh(x) for x in repo)],
@@ -3412,7 +3600,7 @@ def plan_toolchains(plan: Plan, meta: dict, root: Path) -> None:
 def plan_projects(plan: Plan, meta: dict, root: Path) -> None:
     for repo in meta.get("repos") or []:
         rel, url = repo.get("path"), repo.get("url")
-        if not rel:
+        if not rel or not wanted("projects", rel):
             continue
         if not url:
             plan.add("projects", f"{rel} (NO REMOTE)", [
@@ -4098,6 +4286,55 @@ def script_children(home: Path) -> list[Node]:
     return out
 
 
+def archive_children(root: Path, cid: str) -> list[Node]:
+    """Submenu contents for a restore, read from the archive rather than this
+    machine. The per-category meta.json is complete; the manifest is truncated."""
+    meta_path = root / "categories" / cid / "meta.json"
+    if not meta_path.is_file():
+        return []
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    out: list[Node] = []
+    if cid == "plugins":
+        for plug in meta.get("plugins") or []:
+            pid = plug.get("id")
+            if not pid:
+                continue
+            bits = [plug.get("kind") or ""]
+            if plug.get("enabled"):
+                bits.append("enabled")
+            if plug.get("overlayFiles"):
+                bits.append(f"{len(plug['overlayFiles'])} local edits")
+            out.append(Node(pid, pid, ", ".join(b for b in bits if b), selected=True))
+    elif cid == "projects":
+        for repo in meta.get("repos") or []:
+            path = repo.get("path")
+            if not path:
+                continue
+            hint = "no remote" if not repo.get("url") else ("+patch" if repo.get("patch") else "")
+            out.append(Node(path, path, hint, selected=True))
+    elif cid == "packages":
+        out += [Node(f"repo:{n}", n, "repo", selected=True) for n in meta.get("repo") or []]
+        out += [Node(f"aur:{n}", n, "aur", selected=True) for n in meta.get("aur") or []]
+    elif cid == "themes":
+        for theme in meta.get("themes") or []:
+            tid = theme.get("id")
+            if tid:
+                out.append(Node(tid, tid, theme.get("kind") or "", selected=True))
+    elif cid == "scripts":
+        files_root = root / "categories/scripts/files"
+        for f in sorted(iter_files(files_root)) if files_root.is_dir() else []:
+            rel = str(f.relative_to(files_root))
+            out.append(Node(rel, rel, "", selected=True))
+        for link in meta.get("links") or []:
+            rel = link.get("link")
+            if rel:
+                out.append(Node(rel, rel, "link", selected=True))
+    return out
+
+
 SUBMENU_BUILDERS = {
     "plugins": lambda home: plugin_children(home),
     "projects": lambda home: project_children(home),
@@ -4107,17 +4344,27 @@ SUBMENU_BUILDERS = {
 }
 
 
-def build_tree(home: Path, present: set | None, defaults_on: bool = True) -> list[Node]:
+def build_tree(home: Path, present: set | None, defaults_on: bool = True,
+               archive_root: Path | None = None) -> list[Node]:
     nodes = []
     for item in CATEGORIES:
         cid = item["id"]
         if present is not None and cid not in present:
             continue
-        on = bool(item.get("default")) if defaults_on else False
+        # Restoring: default to what the archive carries, since a category is
+        # only listed at all when it is in there.
+        on = True if archive_root is not None else bool(item.get("default"))
+        if not defaults_on:
+            on = False
         risk = item.get("risk") or "portable"
         tag = {"host": "this machine", "identity": "hostname", "secrets": "keys"}.get(risk, "")
         children = []
-        if cid in SUBMENU_BUILDERS:
+        if archive_root is not None:
+            try:
+                children = archive_children(archive_root, cid)
+            except Exception:
+                children = []
+        elif cid in SUBMENU_BUILDERS:
             try:
                 children = SUBMENU_BUILDERS[cid](home)
             except Exception:
@@ -4268,6 +4515,94 @@ def _pick_loop(stdscr, roots, header):
             return None
 
 
+def _menu_loop(stdscr, rows, header):
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    try:
+        curses.use_default_colors()
+        curses.init_pair(1, theme_accent(), -1)
+    except curses.error:
+        pass
+    cursor = 0
+    while True:
+        height, width = stdscr.getmaxyx()
+        stdscr.erase()
+        stdscr.addnstr(0, 0, header[:width - 1], width - 1, curses.A_BOLD)
+        for i, label in enumerate(rows):
+            if 2 + i >= height - 1:
+                break
+            mark = "\u25b8 " if i == cursor else "  "
+            attr = curses.A_REVERSE if i == cursor else curses.A_NORMAL
+            stdscr.addnstr(2 + i, 0, f" {mark}{label}"[:width - 1].ljust(width - 1), width - 1, attr)
+        stdscr.addnstr(height - 1, 0,
+                       "\u2192/\u2190 or \u2191/\u2193 move \u00b7 enter choose \u00b7 q cancel"[:width - 1],
+                       width - 1, curses.A_DIM)
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key == 27:
+            stdscr.nodelay(True)
+            seq = ""
+            for _ in range(2):
+                nxt = stdscr.getch()
+                if nxt == -1:
+                    break
+                seq += chr(nxt)
+            stdscr.nodelay(False)
+            key = {"[A": curses.KEY_UP, "OA": curses.KEY_UP, "[B": curses.KEY_DOWN,
+                   "OB": curses.KEY_DOWN, "[C": curses.KEY_DOWN, "OC": curses.KEY_DOWN,
+                   "[D": curses.KEY_UP, "OD": curses.KEY_UP}.get(seq, 27)
+            if key == 27:
+                return None
+        if key in (curses.KEY_DOWN, ord("j"), curses.KEY_RIGHT, ord("l")):
+            cursor = (cursor + 1) % len(rows)
+        elif key in (curses.KEY_UP, ord("k"), curses.KEY_LEFT, ord("h")):
+            cursor = (cursor - 1) % len(rows)
+        elif key in (curses.KEY_ENTER, 10, 13, ord(" ")):
+            return cursor
+        elif key == ord("q"):
+            return None
+
+
+def with_tty_screen(func, *rest):
+    """curses draws on /dev/tty so stdout stays free for the answer."""
+    saved = os.dup(1)
+    tty_fd = os.open("/dev/tty", os.O_RDWR)
+    try:
+        os.dup2(tty_fd, 1)
+        return curses.wrapper(func, *rest)
+    finally:
+        os.dup2(saved, 1)
+        os.close(saved)
+        os.close(tty_fd)
+
+
+def cmd_menu(args) -> int:
+    rows = [line for line in sys.stdin.read().splitlines() if line.strip()]
+    if not rows:
+        raise SystemExit("no menu items given")
+    try:
+        open("/dev/tty").close()
+    except OSError:
+        raise SystemExit("the menu needs a terminal")
+    chosen = with_tty_screen(_menu_loop, rows, args.header or "Choose")
+    if chosen is None:
+        return 1
+    sys.stdout.write(rows[chosen] + "\n")
+    return 0
+
+
+def cmd_palette(_args) -> int:
+    """Shell-evaluable colours from the active theme, so the wrapper matches."""
+    out = []
+    for key in ("accent", "green", "amber", "red", "grey", "blue"):
+        code = FG.get(key, "")
+        out.append(f"IMP_{key.upper()}=$'{code}'" if code else f"IMP_{key.upper()}=''")
+    out.append("IMP_RESET=$'\\033[0m'")
+    out.append("IMP_BOLD=$'\\033[1m'")
+    sys.stdout.write("\n".join(out) + "\n")
+    return 0
+
+
 def cmd_pick(args) -> int:
     # The result goes to stdout so callers can capture it with $(...). curses
     # therefore has to draw somewhere else: /dev/tty, like fzf does.
@@ -4282,18 +4617,12 @@ def cmd_pick(args) -> int:
         with tempfile.TemporaryDirectory(prefix="imprint-pick-") as tmp:
             root = open_imprint(Path(args.archive).expanduser(), Path(tmp) / "open")
             present = set((load_manifest(root).get("categories") or {}).keys())
-    categories = build_tree(home, present)
+            categories = build_tree(home, present, archive_root=root)
+    else:
+        categories = build_tree(home, present)
     roots = [SelectAll(categories)] + categories + [ActionRow(args.action or "Start backup", categories)]
     header = args.header or "What should this imprint carry?"
-    saved_stdout = os.dup(1)
-    tty_fd = os.open("/dev/tty", os.O_RDWR)
-    try:
-        os.dup2(tty_fd, 1)
-        result = curses.wrapper(_pick_loop, roots, header)
-    finally:
-        os.dup2(saved_stdout, 1)
-        os.close(saved_stdout)
-        os.close(tty_fd)
+    result = with_tty_screen(_pick_loop, roots, header)
     if result is None:
         return 1
     chosen, subs = [], {}
@@ -4426,6 +4755,8 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("--json", action="store_true", help="print the machine-readable report")
     restore.add_argument("archive")
     restore.add_argument("--only", default="")
+    restore.add_argument("--select", default="",
+                         help="JSON from `imprint pick`, to narrow within a category")
     restore.add_argument("--dry-run", action="store_true")
     restore.add_argument("--confirm-hostname", default="")
     restore.add_argument("--system-root", default="/",
@@ -4455,10 +4786,18 @@ def build_parser() -> argparse.ArgumentParser:
     applyp.add_argument("--phase", default="", help="only run this phase")
     applyp.add_argument("--stop-on-failure", action="store_true",
                         help="halt at the first failing step instead of carrying on")
+    menup = sub.add_parser("menu")
+    menup.add_argument("--header", default="")
+    sub.add_parser("palette")
     pick = sub.add_parser("pick")
     pick.add_argument("--archive", default="")
     pick.add_argument("--header", default="")
     pick.add_argument("--action", default="", help="label for the row that starts the job")
+    prev = sub.add_parser("preview")
+    prev.add_argument("archive")
+    prev.add_argument("--only", default="")
+    prev.add_argument("--select", default="")
+    prev.add_argument("--json", action="store_true")
     verify = sub.add_parser("verify")
     verify.add_argument("archive")
     diff = sub.add_parser("diff")
@@ -4482,6 +4821,9 @@ def main(argv: list[str] | None = None) -> int:
         "plan": cmd_plan,
         "apply": cmd_apply,
         "pick": cmd_pick,
+        "menu": cmd_menu,
+        "palette": cmd_palette,
+        "preview": cmd_preview,
         "verify": cmd_verify,
         "diff": cmd_diff,
         "undo": cmd_undo,

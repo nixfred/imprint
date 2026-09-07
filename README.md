@@ -127,6 +127,37 @@ is done. Colour is dropped when stdout is not a terminal or `NO_COLOR` is set,
 and the machine-readable JSON is printed only when piped or asked for with
 `--json` — a person watching has already seen the result.
 
+## Restoring
+
+`imprint restore` walks you through it:
+
+1. pick the archive
+2. choose what to bring over, in the same picker as save — categories with a
+   `▸` open into their contents, so you can take two plugins and leave the rest
+3. **it tells you exactly what will change**, then asks
+
+```
+This restore will change:
+
+  overwrite existing files  (4)
+      ~/.config/omarchy/server-status.json
+      ~/.config/omarchy/workspace-names.json
+      …
+
+  move plugins to another commit  (1)
+      nixfred.workspace-names d6dbb683→176dfc84
+
+  17 categories · 1671 files already identical
+
+  Apply these changes to this machine? [y/N]
+```
+
+Files already identical are counted, not listed — the difference between
+"rewrites 4 files" and "rewrites 1671" is the whole point. Destructive items
+(disabling a plugin you have on, renaming the machine) are called out in red.
+
+`imprint preview FILE` shows the same thing and stops, changing nothing.
+
 ## Read it before you run it
 
 `imprint plan FILE` extracts the archive and writes a `restore.sh` next to it —

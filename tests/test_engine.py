@@ -1313,5 +1313,84 @@ class WiderCaptureTests(unittest.TestCase):
         self.assertIsInstance(engine.theme_accent(), int)
 
 
+class RestorePreviewTests(unittest.TestCase):
+    """A restore says what it will change, before it is allowed to change it."""
+
+    def _archive(self, tmp, packed, live):
+        root = Path(tmp) / "arc"
+        files = root / "categories/cli/files"
+        for rel, body in packed.items():
+            f = files / rel; f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(body, encoding="utf-8")
+        (root / "categories/cli").mkdir(parents=True, exist_ok=True)
+        (root / "manifest.json").write_text(json.dumps(
+            {"kind": engine.KIND, "home": "/home/src", "categories": {"cli": {}}}), encoding="utf-8")
+        home = Path(tmp) / "home"
+        for rel, body in live.items():
+            f = home / rel; f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(body, encoding="utf-8")
+        home.mkdir(parents=True, exist_ok=True)
+        return root, home
+
+    def test_classifies_new_changed_and_identical(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, home = self._archive(tmp,
+                packed={"a.conf": "same\n", "b.conf": "new value\n", "c.conf": "brand new\n"},
+                live={"a.conf": "same\n", "b.conf": "old value\n"})
+            manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+            ch = engine.preview_changes(root, home, manifest, ["cli"])
+            self.assertEqual(ch["filesChanged"], ["~/b.conf"])
+            self.assertEqual(ch["filesNew"], ["~/c.conf"])
+            self.assertEqual(ch["filesUnchanged"], 1)
+
+    def test_home_rewrite_is_accounted_for_before_calling_a_file_changed(self):
+        # The packed file mentions the source machine's home; after rewriting it
+        # matches this machine, so it must not be reported as a change.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, home = self._archive(tmp, packed={"p.conf": "PATH=/home/src/bin\n"}, live={})
+            (home / "p.conf").write_text(f"PATH={home}/bin\n", encoding="utf-8")
+            manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+            ch = engine.preview_changes(root, home, manifest, ["cli"])
+            self.assertEqual(ch["filesChanged"], [])
+            self.assertEqual(ch["filesUnchanged"], 1)
+
+    def test_render_says_so_when_nothing_would_change(self):
+        text = engine.render_preview({"filesNew": [], "filesChanged": [], "filesUnchanged": 9}, ["cli"])
+        self.assertIn("Nothing to change", text)
+
+    def test_render_lists_destructive_actions_explicitly(self):
+        text = engine.render_preview({
+            "filesChanged": ["~/.bashrc"], "filesNew": [], "filesUnchanged": 0,
+            "pluginsDisable": ["pi.workspaces"], "hostname": "vic \u2192 dex"}, ["plugins"])
+        self.assertIn("overwrite existing files", text)
+        self.assertIn("DISABLE plugins currently on", text)
+        self.assertIn("rename this machine", text)
+
+    def test_selection_narrows_a_restore(self):
+        engine.SUBSELECT.clear()
+        try:
+            engine.SUBSELECT["scripts"] = {"bin/keep"}
+            self.assertTrue(engine.wanted("scripts", "bin/keep"))
+            self.assertFalse(engine.wanted("scripts", "bin/drop"))
+            with tempfile.TemporaryDirectory() as tmp:
+                cat = Path(tmp) / "cat"
+                files = cat / "files/bin"; files.mkdir(parents=True)
+                (files / "keep").write_text("a", encoding="utf-8")
+                (files / "drop").write_text("b", encoding="utf-8")
+                home = Path(tmp) / "home"; home.mkdir()
+                undo = Path(tmp) / "undo"; undo.mkdir()
+                done = engine.restore_file_tree(cat, home, "", undo, False, category="scripts")
+                self.assertEqual(done, ["bin/keep"])
+                self.assertFalse((home / "bin/drop").exists())
+        finally:
+            engine.SUBSELECT.clear()
+
+    def test_noise_files_are_not_captured(self):
+        for name in ("app.log", "x.sock", "SingletonLock", "Cache", "daemon.pid"):
+            self.assertTrue(engine.is_skipped_name(name), name)
+        for name in ("config.toml", "settings.json", "keybinds.conf"):
+            self.assertFalse(engine.is_skipped_name(name), name)
+
+
 if __name__ == "__main__":
     unittest.main()
