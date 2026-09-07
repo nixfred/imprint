@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import curses
 import json
 import os
 import re
@@ -449,9 +450,11 @@ def extra_packages() -> dict:
     explicit = [line for line in run_ok(["pacman", "-Qqe"]).splitlines() if line]
     aur = set(line for line in run_ok(["pacman", "-Qmq"]).splitlines() if line)
     base = load_package_baselines()
-    extra_aur = sorted(pkg for pkg in explicit if pkg in aur and not is_stock_package(pkg, base))
+    extra_aur = sorted(pkg for pkg in explicit if pkg in aur and not is_stock_package(pkg, base)
+                       and wanted("packages", f"aur:{pkg}"))
     extra_repo = sorted(
         pkg for pkg in explicit if pkg not in aur and not is_stock_package(pkg, base)
+        and wanted("packages", f"repo:{pkg}")
     )
     return {
         "explicit": explicit,
@@ -471,6 +474,16 @@ def rewrite_text(text: str, old_home: str, new_home: str) -> str:
         return text
     pattern = re.escape(old_home) + r"(?=$|[^A-Za-z0-9_.-])"
     return re.sub(pattern, new_home.replace("\\", "\\\\"), text)
+
+
+# When the picker returns a partial choice inside a category, the collectors
+# narrow to it. Empty means "everything in the category", as before.
+SUBSELECT: dict[str, set] = {}
+
+
+def wanted(category: str, key: str) -> bool:
+    allowed = SUBSELECT.get(category)
+    return allowed is None or key in allowed
 
 
 FAILURES: list[str] = []
@@ -981,6 +994,8 @@ def collect_plugins(cat_dir: Path, home: Path) -> dict:
                 continue
             if is_skipped_name(plugin_dir.name):
                 continue
+            if not wanted("plugins", plugin_dir.name):
+                continue
             info = classify_plugin(plugin_dir, listing.get(plugin_dir.name))
             pid_name = plugin_dir.name
             if not live and have_shell:
@@ -1088,6 +1103,8 @@ def collect_themes(cat_dir: Path, home: Path) -> dict:
     if themes_root.is_dir():
         for theme_dir in sorted(themes_root.iterdir()):
             if not theme_dir.is_dir():
+                continue
+            if not wanted("themes", theme_dir.name):
                 continue
             url = git_remote(theme_dir)
             rec = {
@@ -1200,6 +1217,8 @@ def collect_scripts(cat_dir: Path, home: Path) -> dict:
             if not path.is_file() and not path.is_symlink():
                 continue
             if is_skipped_name(path.name):
+                continue
+            if not wanted("scripts", rel_under_home(path, home)):
                 continue
             # A symlink into a checkout is a link to that repo, not a file.
             # Flattening it produced a standalone copy cut off from the rest of
@@ -1548,8 +1567,10 @@ def collect_projects(cat_dir: Path, home: Path) -> dict:
         for entry in sorted(root.iterdir()):
             if not (entry / ".git").exists() or is_skipped_name(entry.name):
                 continue
-            url = git_remote(entry)
             rel = rel_under_home(entry, home)
+            if not wanted("projects", rel):
+                continue
+            url = git_remote(entry)
             rec = {
                 "path": rel,
                 "name": entry.name,
@@ -1901,6 +1922,15 @@ def default_archive_path(home: Path, host: str) -> Path:
 
 def cmd_save(args) -> int:
     home = Path.home()
+    if getattr(args, "select", ""):
+        path = Path(args.select).expanduser()
+        try:
+            spec = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"cannot read the selection file {path}: {exc}")
+        SUBSELECT.clear()
+        for cid, keys in (spec.get("subselections") or {}).items():
+            SUBSELECT[cid] = set(keys)
     ids = parse_only(args.only) if args.only else default_category_ids()
     if args.all:
         ids = [item["id"] for item in CATEGORIES]
@@ -3450,6 +3480,347 @@ def cmd_apply(args) -> int:
     return 0 if not failed else 1
 
 
+
+# ---------------------------------------------------------------- picker ----
+# gum choose cannot do either half of what this needs: gum 2.x leaves space
+# unbound, and it has no notion of a submenu. So the picker is ours.
+
+MARK_ON, MARK_OFF, MARK_PART = "\u25c9", "\u25cb", "\u25d0"   # ◉ ○ ◐
+MARK_SUB = "\u25b8"                                           # ▸
+
+
+class SelectAll:
+    """The first row of the top menu. Reflects, and drives, everything below it."""
+
+    key = "__all__"
+    label = "Select ALL for backup"
+    hint = "everything, including the host-bound and secret categories"
+    children: list = []
+    parent = None
+    is_branch = False
+
+    def __init__(self, siblings):
+        self._siblings = siblings
+
+    def state(self) -> str:
+        states = {n.state() for n in self._siblings}
+        if states == {"on"}:
+            return "on"
+        if states == {"off"}:
+            return "off"
+        return "partial"
+
+    def set_all(self, value: bool) -> None:
+        for node in self._siblings:
+            node.set_all(value)
+
+    @property
+    def selected(self) -> bool:
+        return self.state() == "on"
+
+    @selected.setter
+    def selected(self, value) -> None:
+        self.set_all(bool(value))
+
+    def chosen_leaves(self) -> list[str]:
+        return []
+
+
+class Node:
+    __slots__ = ("key", "label", "hint", "children", "selected", "parent")
+
+    def __init__(self, key, label, hint="", children=None, selected=False):
+        self.key = key
+        self.label = label
+        self.hint = hint
+        self.children = children or []
+        self.selected = selected
+        self.parent = None
+        for child in self.children:
+            child.parent = self
+
+    @property
+    def is_branch(self) -> bool:
+        return bool(self.children)
+
+    def state(self) -> str:
+        """on / off / partial -- partial only ever applies to a branch."""
+        if not self.is_branch:
+            return "on" if self.selected else "off"
+        states = [c.state() for c in self.children]
+        if all(x == "on" for x in states):
+            return "on"
+        if all(x == "off" for x in states):
+            return "off"
+        return "partial"
+
+    def set_all(self, value: bool) -> None:
+        if self.is_branch:
+            for child in self.children:
+                child.set_all(value)
+        else:
+            self.selected = value
+
+    def chosen_leaves(self) -> list[str]:
+        if not self.is_branch:
+            return [self.key] if self.selected else []
+        out = []
+        for child in self.children:
+            out.extend(child.chosen_leaves())
+        return out
+
+
+def plugin_children(home: Path) -> list[Node]:
+    root = home / ".config/omarchy/plugins"
+    if not root.is_dir():
+        return []
+    listing = {i.get("id"): i for i in plugin_list() if i.get("id")}
+    out = []
+    for d in sorted(root.iterdir()):
+        if not (d.is_dir() or d.is_symlink()) or is_skipped_name(d.name):
+            continue
+        info = listing.get(d.name) or {}
+        hint = "git" if (d / ".git").exists() else "local"
+        if info.get("enabled"):
+            hint += ", enabled"
+        out.append(Node(d.name, d.name, hint, selected=True))
+    return out
+
+
+def project_children(home: Path) -> list[Node]:
+    out = []
+    for root_name in PROJECT_ROOTS:
+        root = home / root_name
+        if not root.is_dir():
+            continue
+        for d in sorted(root.iterdir()):
+            if not (d / ".git").exists() or is_skipped_name(d.name):
+                continue
+            rel = rel_under_home(d, home)
+            hint = "no remote" if not git_remote(d) else ("dirty" if git_dirty(d) else "")
+            out.append(Node(rel, rel, hint, selected=True))
+    return out
+
+
+def package_children() -> list[Node]:
+    data = extra_packages()
+    out = [Node(f"repo:{n}", n, "repo", selected=True) for n in data.get("repo") or []]
+    out += [Node(f"aur:{n}", n, "aur", selected=True) for n in data.get("aur") or []]
+    return out
+
+
+def theme_children(home: Path) -> list[Node]:
+    root = home / ".config/omarchy/themes"
+    if not root.is_dir():
+        return []
+    return [Node(d.name, d.name, "git" if git_remote(d) else "local", selected=True)
+            for d in sorted(root.iterdir()) if d.is_dir()]
+
+
+def script_children(home: Path) -> list[Node]:
+    out = []
+    for folder in (home / "bin", home / ".local/bin"):
+        if not folder.is_dir():
+            continue
+        for f in sorted(folder.iterdir()):
+            if is_skipped_name(f.name) or not (f.is_file() or f.is_symlink()):
+                continue
+            rel = rel_under_home(f, home)
+            out.append(Node(rel, rel, "link" if f.is_symlink() else "", selected=True))
+    return out
+
+
+SUBMENU_BUILDERS = {
+    "plugins": lambda home: plugin_children(home),
+    "projects": lambda home: project_children(home),
+    "packages": lambda home: package_children(),
+    "themes": lambda home: theme_children(home),
+    "scripts": lambda home: script_children(home),
+}
+
+
+def build_tree(home: Path, present: set | None, defaults_on: bool = True) -> list[Node]:
+    nodes = []
+    for item in CATEGORIES:
+        cid = item["id"]
+        if present is not None and cid not in present:
+            continue
+        on = bool(item.get("default")) if defaults_on else False
+        risk = item.get("risk") or "portable"
+        tag = {"host": "this machine", "identity": "hostname", "secrets": "keys"}.get(risk, "")
+        children = []
+        if cid in SUBMENU_BUILDERS:
+            try:
+                children = SUBMENU_BUILDERS[cid](home)
+            except Exception:
+                children = []
+        node = Node(cid, item["title"], item["summary"] + (f"  [{tag}]" if tag else ""),
+                    children=children, selected=on)
+        if children:
+            node.set_all(on)
+        nodes.append(node)
+    return nodes
+
+
+def _draw(stdscr, rows, cursor, top, trail, header, height, width):
+    stdscr.erase()
+    crumbs = " / ".join(["All"] + [n.label for n in trail])
+    stdscr.addnstr(0, 0, header[:width - 1], width - 1, curses.A_BOLD)
+    stdscr.addnstr(1, 0, crumbs[:width - 1], width - 1, curses.A_DIM)
+    body = height - 4
+    for i in range(body):
+        idx = top + i
+        if idx >= len(rows):
+            break
+        node = rows[idx]
+        st = node.state()
+        mark = {"on": MARK_ON, "off": MARK_OFF, "partial": MARK_PART}[st]
+        arrow = MARK_SUB if node.is_branch else " "
+        count = f" ({len(node.children)})" if node.is_branch else ""
+        if isinstance(node, SelectAll):
+            count = ""
+        text = f" {mark} {node.label}{count} {arrow}"
+        if node.hint:
+            text += f"   {node.hint}"
+        attr = curses.A_REVERSE if idx == cursor else curses.A_NORMAL
+        stdscr.addnstr(3 + i, 0, text[:width - 1].ljust(width - 1), width - 1, attr)
+    hints = ("space toggles \u00b7 space on \u25b8 opens the submenu \u00b7 \u2190 back \u00b7 "
+             "t whole group \u00b7 a all \u00b7 n none \u00b7 enter confirm \u00b7 q cancel")
+    stdscr.addnstr(height - 1, 0, hints[:width - 1], width - 1, curses.A_DIM)
+    stdscr.refresh()
+
+
+def _pick_loop(stdscr, roots, header):
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    trail: list[Node] = []
+    rows = roots
+    cursor = top = 0
+    while True:
+        height, width = stdscr.getmaxyx()
+        body = max(1, height - 4)
+        cursor = max(0, min(cursor, len(rows) - 1))
+        if cursor < top:
+            top = cursor
+        if cursor >= top + body:
+            top = cursor - body + 1
+        _draw(stdscr, rows, cursor, top, trail, header, height, width)
+        try:
+            key = stdscr.getch()
+        except KeyboardInterrupt:
+            return None
+        if key == 27:
+            # keypad(True) asks for application-cursor mode (\x1bOB), but plenty
+            # of terminals and multiplexers still send \x1b[B. Decode both by
+            # hand rather than letting an arrow fall through to the ESC binding.
+            stdscr.nodelay(True)
+            seq = ""
+            for _ in range(2):
+                nxt = stdscr.getch()
+                if nxt == -1:
+                    break
+                seq += chr(nxt)
+            stdscr.nodelay(False)
+            key = {"[A": curses.KEY_UP, "OA": curses.KEY_UP,
+                   "[B": curses.KEY_DOWN, "OB": curses.KEY_DOWN,
+                   "[C": curses.KEY_RIGHT, "OC": curses.KEY_RIGHT,
+                   "[D": curses.KEY_LEFT, "OD": curses.KEY_LEFT,
+                   "[5": curses.KEY_PPAGE, "[6": curses.KEY_NPAGE,
+                   "[H": curses.KEY_HOME, "[F": curses.KEY_END}.get(seq, 27)
+        node = rows[cursor] if rows else None
+        if key in (curses.KEY_DOWN, ord("j")):
+            cursor += 1
+        elif key in (curses.KEY_UP, ord("k")):
+            cursor -= 1
+        elif key == curses.KEY_NPAGE:
+            cursor += body
+        elif key == curses.KEY_PPAGE:
+            cursor -= body
+        elif key == curses.KEY_HOME:
+            cursor = 0
+        elif key == curses.KEY_END:
+            cursor = len(rows) - 1
+        elif key == ord(" "):
+            # The whole point: space toggles a leaf, and walks into a submenu.
+            if node is None:
+                continue
+            if node.is_branch:
+                trail.append(node)
+                rows, cursor, top = node.children, 0, 0
+            else:
+                # No auto-advance: space must be able to undo itself in place.
+                node.selected = not node.selected
+        elif key in (curses.KEY_RIGHT, ord("l"), curses.KEY_ENTER, 10, 13):
+            if node is not None and node.is_branch and key in (curses.KEY_RIGHT, ord("l")):
+                trail.append(node)
+                rows, cursor, top = node.children, 0, 0
+            elif key in (curses.KEY_ENTER, 10, 13):
+                if trail:
+                    parent = trail.pop()
+                    rows = trail[-1].children if trail else roots
+                    cursor = max(0, rows.index(parent)) if parent in rows else 0
+                    top = 0
+                else:
+                    return roots
+        elif key in (curses.KEY_LEFT, ord("h"), 27, curses.KEY_BACKSPACE, 127, 8):
+            if trail:
+                parent = trail.pop()
+                rows = trail[-1].children if trail else roots
+                cursor = rows.index(parent) if parent in rows else 0
+                top = 0
+        elif key == ord("t"):
+            if node is not None:
+                node.set_all(node.state() != "on")
+        elif key == ord("a"):
+            for r in rows:
+                r.set_all(True)
+        elif key == ord("n"):
+            for r in rows:
+                r.set_all(False)
+        elif key in (ord("q"),):
+            return None
+
+
+def cmd_pick(args) -> int:
+    # The result goes to stdout so callers can capture it with $(...). curses
+    # therefore has to draw somewhere else: /dev/tty, like fzf does.
+    try:
+        tty = open("/dev/tty", "r+b", buffering=0)
+    except OSError:
+        raise SystemExit("the picker needs a terminal")
+    tty.close()
+    home = Path.home()
+    present = None
+    if args.archive:
+        with tempfile.TemporaryDirectory(prefix="imprint-pick-") as tmp:
+            root = open_imprint(Path(args.archive).expanduser(), Path(tmp) / "open")
+            present = set((load_manifest(root).get("categories") or {}).keys())
+    categories = build_tree(home, present)
+    roots = [SelectAll(categories)] + categories
+    header = args.header or "What should this imprint carry?"
+    saved_stdout = os.dup(1)
+    tty_fd = os.open("/dev/tty", os.O_RDWR)
+    try:
+        os.dup2(tty_fd, 1)
+        result = curses.wrapper(_pick_loop, roots, header)
+    finally:
+        os.dup2(saved_stdout, 1)
+        os.close(saved_stdout)
+        os.close(tty_fd)
+    if result is None:
+        return 1
+    chosen, subs = [], {}
+    for node in categories:
+        if node.state() == "off":
+            continue
+        chosen.append(node.key)
+        if node.is_branch and node.state() == "partial":
+            subs[node.key] = node.chosen_leaves()
+    json.dump({"categories": chosen, "subselections": subs}, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    return 0
+
+
 def cmd_verify(args) -> int:
     archive = Path(args.archive).expanduser()
     with tempfile.TemporaryDirectory(prefix="imprint-verify-") as tmp:
@@ -3560,6 +3931,8 @@ def build_parser() -> argparse.ArgumentParser:
     save.add_argument("--only", default="")
     save.add_argument("--all", action="store_true")
     save.add_argument("-o", "--output", default="")
+    save.add_argument("--select", default="",
+                      help="JSON from `imprint pick`, to narrow within a category")
     restore = sub.add_parser("restore")
     restore.add_argument("archive")
     restore.add_argument("--only", default="")
@@ -3591,6 +3964,9 @@ def build_parser() -> argparse.ArgumentParser:
     applyp.add_argument("--phase", default="", help="only run this phase")
     applyp.add_argument("--stop-on-failure", action="store_true",
                         help="halt at the first failing step instead of carrying on")
+    pick = sub.add_parser("pick")
+    pick.add_argument("--archive", default="")
+    pick.add_argument("--header", default="")
     verify = sub.add_parser("verify")
     verify.add_argument("archive")
     diff = sub.add_parser("diff")
@@ -3612,6 +3988,7 @@ def main(argv: list[str] | None = None) -> int:
         "brief": cmd_brief,
         "plan": cmd_plan,
         "apply": cmd_apply,
+        "pick": cmd_pick,
         "verify": cmd_verify,
         "diff": cmd_diff,
         "undo": cmd_undo,

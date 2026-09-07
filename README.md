@@ -52,9 +52,21 @@ That links `imprint` into `~/.local/bin`. Omarchy already has `gum`, `python3`,
 
 Run `imprint` for the menu. The OMARCHY wordmark sits at the top.
 
-**In the picker, `tab` or `x` toggles a category, `a` selects all, `enter`
-confirms. Space does nothing** — gum 2.x does not bind it, so if you are
-hitting space and seeing no change, that is why.
+**In the picker, `space` toggles the highlighted row.** A row marked `▸` has a
+submenu — `space` opens it and `←` goes back, so you can pick individual
+plugins, projects, packages, themes or scripts rather than whole categories.
+The first row, **Select ALL for backup**, turns everything on or off at once.
+
+```
+ ◐ Select ALL for backup     everything, including the host-bound and secret categories
+ ◉ Look                      Theme, font, gaps, rounding, branding
+ ◉ Plugins (70) ▸            Reinstalled from git source; only local-only trees are packed
+ ◉ Projects (87) ▸           Your git checkouts as clone recipes plus uncommitted patches
+ ○ Monitors                  This machine's display layout  [this machine]
+```
+
+`◉` all, `○` none, `◐` some of the submenu. Other keys: `t` toggles a whole
+group, `a` all, `n` none, `enter` confirms, `q` cancels.
 
 ```
 imprint save                         # picker, writes ~/imprints/imprint-$host-$time.tar.zst

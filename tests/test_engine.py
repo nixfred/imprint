@@ -1071,5 +1071,92 @@ class ApplyJournalTests(unittest.TestCase):
             self.assertIn("not readable as a plan", str(ctx.exception))
 
 
+class PickerTests(unittest.TestCase):
+    """space toggles, space on a branch descends, and the top row drives all."""
+
+    def _tree(self):
+        leaf = engine.Node("look", "Look", selected=True)
+        kids = [engine.Node("a", "a", selected=True), engine.Node("b", "b", selected=True)]
+        branch = engine.Node("plugins", "Plugins", children=kids, selected=True)
+        cats = [leaf, branch]
+        return cats, [engine.SelectAll(cats)] + cats
+
+    def test_branch_state_is_derived_from_children(self):
+        cats, _roots = self._tree()
+        branch = cats[1]
+        self.assertEqual(branch.state(), "on")
+        branch.children[0].selected = False
+        self.assertEqual(branch.state(), "partial")
+        branch.children[1].selected = False
+        self.assertEqual(branch.state(), "off")
+
+    def test_select_all_row_reflects_and_drives_everything(self):
+        cats, roots = self._tree()
+        all_row = roots[0]
+        self.assertEqual(all_row.state(), "on")
+        all_row.set_all(False)
+        self.assertTrue(all(n.state() == "off" for n in cats))
+        self.assertEqual(all_row.state(), "off")
+        all_row.set_all(True)
+        self.assertEqual(all_row.state(), "on")
+        cats[0].selected = False
+        self.assertEqual(all_row.state(), "partial")
+
+    def test_select_all_toggles_in_place_rather_than_latching(self):
+        cats, roots = self._tree()
+        all_row = roots[0]
+        all_row.selected = not all_row.selected      # what space does
+        self.assertEqual(all_row.state(), "off")
+        all_row.selected = not all_row.selected
+        self.assertEqual(all_row.state(), "on")
+
+    def test_only_partial_branches_produce_a_subselection(self):
+        cats, _roots = self._tree()
+        branch = cats[1]
+        self.assertEqual(branch.chosen_leaves(), ["a", "b"])
+        branch.children[0].selected = False
+        self.assertEqual(branch.chosen_leaves(), ["b"])
+        self.assertEqual(branch.state(), "partial")
+
+    def test_a_row_with_children_is_drawn_with_the_submenu_arrow(self):
+        cats, roots = self._tree()
+        rows = {}
+        class Win:
+            def erase(self): rows.clear()
+            def addnstr(self, y, x, text, n, attr=0): rows[y] = text[:n]
+            def refresh(self): pass
+        engine._draw(Win(), roots, 0, 0, [], "hdr", 24, 100)
+        drawn = "\n".join(rows.values())
+        self.assertIn(engine.MARK_SUB, drawn)                 # ▸ present
+        self.assertIn("Plugins (2)", drawn)                   # child count shown
+        self.assertNotIn(f"Select ALL for backup ({engine.MARK_SUB}", drawn)
+        look_line = [v for v in rows.values() if "Look" in v][0]
+        self.assertNotIn(engine.MARK_SUB, look_line)          # leaves have no arrow
+
+    def test_marks_distinguish_on_off_and_partial(self):
+        cats, roots = self._tree()
+        cats[1].children[0].selected = False
+        rows = {}
+        class Win:
+            def erase(self): rows.clear()
+            def addnstr(self, y, x, text, n, attr=0): rows[y] = text[:n]
+            def refresh(self): pass
+        engine._draw(Win(), roots, 0, 0, [], "hdr", 24, 100)
+        joined = "\n".join(rows.values())
+        self.assertIn(engine.MARK_ON, joined)
+        self.assertIn(engine.MARK_PART, joined)
+
+    def test_subselection_narrows_what_a_category_collects(self):
+        engine.SUBSELECT.clear()
+        try:
+            engine.SUBSELECT["plugins"] = {"keep.me"}
+            self.assertTrue(engine.wanted("plugins", "keep.me"))
+            self.assertFalse(engine.wanted("plugins", "drop.me"))
+            # a category with no subselection is unrestricted
+            self.assertTrue(engine.wanted("themes", "anything"))
+        finally:
+            engine.SUBSELECT.clear()
+
+
 if __name__ == "__main__":
     unittest.main()

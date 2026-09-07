@@ -45,6 +45,15 @@ accent="${GUM_CHOOSE_SELECTED_FOREGROUND:-#7aa2f7}"
 muted="${GUM_CONFIRM_PROMPT_FOREGROUND:-#8E969E}"
 text="${GUM_FILTER_HEADER_FOREGROUND:-#EAECEE}"
 
+# IMPRINT in the same block font as the Omarchy wordmark, at half its height.
+IMPRINT_WORDMARK=$(cat <<'WORDMARK'
+▀▀▀███▀▀▀  ███▄     ▄███  ███▀▀▀▀██▄  ███▀▀▀▀██▄  ▀▀▀███▀▀▀  ███▄    ███  ▀▀▀███▀▀▀
+   ███     ███ ▀███▀ ███  ███    ███  ███    ███     ███     ███▀█▄  ███     ███
+   ███     ███   ▀   ███  ███▀▀▀▀▀▀   ███▀▀███▀      ███     ███  ▀█▄███     ███
+▄▄▄███▄▄▄  ███       ███  ███         ███   ▀██▄  ▄▄▄███▄▄▄  ███    ▀███     ███
+WORDMARK
+)
+
 banner() {
   local logo
   if [[ -r /usr/share/omarchy/logo.txt ]]; then
@@ -54,13 +63,13 @@ banner() {
   fi
   if (( HAVE_GUM )); then
     gum style --foreground "$accent" --bold --align center --width 92 "$logo"
-    gum style --foreground "$text" --bold --align center --width 92 "IMPRINT"
+    gum style --foreground "$text" --bold --align center --width 92 "$IMPRINT_WORDMARK"
     gum style --foreground "$muted" --italic --align center --width 92 \
-      "Stamp one Omarchy onto another · tab or x toggles · a all · enter confirms"
+      "Stamp one Omarchy onto another · space selects · ▸ opens a submenu · enter confirms"
     echo
   else
     printf '%s\n' "$logo"
-    echo "IMPRINT"
+    printf '%s\n' "$IMPRINT_WORDMARK"
     echo
   fi
 }
@@ -112,9 +121,9 @@ Usage:
   imprint list                Archives in ~/imprints
   imprint facts               This machine as JSON
 
-In the picker: tab or x toggles a category, a selects all, enter confirms.
-Space does nothing -- gum 2.x does not bind it. Identity, monitors, input
-and secrets stay off unless you turn them on.
+In the picker: space toggles a category. A row marked ▸ has a submenu --
+space opens it, ← goes back. The top row selects everything for backup.
+Identity, monitors, input and secrets stay off unless you turn them on.
 EOF
 }
 
@@ -153,43 +162,19 @@ ids_from_archive_defaults() {
   default_ids "$1"
 }
 
+SELECTION_FILE=""
+
+# Our own picker: space toggles, space on a row with a submenu walks into it,
+# and the top row selects everything. gum choose can do none of that.
 choose_categories() {
   local header=$1
-  local preselect=$2
-  local archive=${3:-}
-  need gum
-  local rows
-  rows=$(catalog_rows "$archive") || return 1
-  [[ -n $rows ]] || die "no categories to choose"
-
-  # Options are the display labels only. Passing "label<TAB>id" via
-  # --label-delimiter makes gum re-sort the list alphabetically, which throws
-  # away the catalog order that puts host-bound and secret categories last.
-  local labels selected
-  labels=$(printf '%s\n' "$rows" | awk -F'\t' '{print $2}')
-  selected=$(printf '%s\n' "$rows" \
-    | awk -F'\t' -v want=",$preselect," 'index(want, "," $1 ",") {print $2}' \
-    | paste -sd, -)
-
-  local args=(
-    choose --no-limit
-    --height=18
-    --show-help
-    --cursor="▸ "
-    --cursor-prefix="○ "
-    --selected-prefix="◉ "
-    --unselected-prefix="○ "
-    --header="$header  (tab or x toggles · a selects all · enter confirms)"
-  )
-  if [[ -n $selected ]]; then
-    args+=(--selected="$selected")
-  fi
-  local picked
-  picked=$(printf '%s\n' "$labels" | gum "${args[@]}") || return 1
-  [[ -n $picked ]] || return 1
-  # Map chosen labels back to ids, emitted in catalog order.
-  awk -F'\t' 'NR==FNR{sel[$0]=1; next} sel[$2]{print $1}' \
-    <(printf '%s\n' "$picked") <(printf '%s\n' "$rows") | paste -sd, -
+  local archive=${2:-}
+  SELECTION_FILE=$(mktemp -t imprint-selection-XXXXXX.json)
+  local args=(pick --header "$header")
+  [[ -n $archive ]] && args+=(--archive "$archive")
+  engine "${args[@]}" > "$SELECTION_FILE" || { rm -f "$SELECTION_FILE"; SELECTION_FILE=""; return 1; }
+  python3 -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["categories"]))' \
+    "$SELECTION_FILE"
 }
 
 pick_archive() {
@@ -220,8 +205,7 @@ do_save() {
   banner
   if [[ -z $only && $all -eq 0 ]]; then
     if (( HAVE_GUM )); then
-      only=$(choose_categories "What should this imprint carry?" "$(default_selected)") \
-        || die "cancelled"
+      only=$(choose_categories "What should this imprint carry?") || die "cancelled"
     else
       only=$(default_selected)
       say "No terminal for the picker; using the default categories."
@@ -245,15 +229,16 @@ do_save() {
         python3 "$ENGINE" save --all -o "$output"
     else
       gum spin --spinner dot --title "Collecting this machine…" -- \
-        python3 "$ENGINE" save --only "$only" -o "$output"
+        python3 "$ENGINE" save --only "$only" ${SELECTION_FILE:+--select "$SELECTION_FILE"} -o "$output"
     fi
   else
     if [[ $all -eq 1 ]]; then
       engine save --all -o "$output"
     else
-      engine save --only "$only" -o "$output"
+      engine save --only "$only" ${SELECTION_FILE:+--select "$SELECTION_FILE"} -o "$output"
     fi
   fi
+  [[ -n $SELECTION_FILE ]] && rm -f "$SELECTION_FILE"
   say "Wrote $output"
   if command -v du >/dev/null; then
     say "Size $(du -h "$output" | awk '{print $1}')"
@@ -281,8 +266,7 @@ do_restore() {
   fi
   if [[ -z $only ]]; then
     if (( HAVE_GUM )); then
-      only=$(choose_categories "What should land on this machine?" "$(ids_from_archive_defaults "$archive")" "$archive") \
-        || die "cancelled"
+      only=$(choose_categories "What should land on this machine?" "$archive") || die "cancelled"
     else
       only=$(ids_from_archive_defaults "$archive")
       say "No terminal for the picker; using this archive's default categories."
