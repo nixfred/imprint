@@ -74,6 +74,7 @@ imprint plan FILE --only plugins -o ~/myplan
 imprint info FILE                    # machine brief; feed this to an agent
 imprint diff FILE                    # what drifted since the imprint
 imprint verify FILE
+imprint facts                        # this machine as JSON, for scripts and agents
 imprint undo                         # last restore’s safety copy
 imprint list
 ```
@@ -99,6 +100,23 @@ you can read, edit, or hand to someone else.
 ### files       copy the config trees into place
 ### activate    enable/disable plugins where the source had them, reload
 ```
+
+`imprint apply DIR` runs that same plan step by step, writing a `journal.json`
+beside it after every one, so an interrupted run is resumable:
+
+```bash
+imprint plan  ~/backups/imprint-dex.tar.zst -o ~/myplan
+imprint apply ~/myplan                 # run it
+imprint apply ~/myplan --resume        # continue after a failure or a kill
+imprint apply ~/myplan --recheck       # re-run steps already recorded as done
+imprint apply ~/myplan --dry-run       # list the steps, execute nothing
+```
+
+`--resume` skips steps recorded as succeeded, retries anything that failed or was
+left mid-flight by a kill, and re-runs any step whose body changed since it last
+succeeded — so editing the plan and resuming does the right thing. The plan
+directory can be moved or copied to another machine: payload paths go through
+`$PLAN_PAYLOAD` instead of being baked in.
 
 Every step runs in a `set -e` subshell, so a failure is real and gets listed by
 name at the end rather than swallowed. Steps that may legitimately fail end in

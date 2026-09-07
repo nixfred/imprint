@@ -1846,15 +1846,25 @@ def write_archive(staging: Path, dest: Path) -> None:
 
 def extract_archive(archive: Path, dest: Path) -> None:
     dest.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(archive, "r:*") as tar:
-        tar.extractall(dest, filter="data")
+    try:
+        with tarfile.open(archive, "r:*") as tar:
+            tar.extractall(dest, filter="data")
+    except tarfile.TarError as exc:
+        raise SystemExit(f"{archive} is not a readable imprint archive: {exc}")
+    except OSError as exc:
+        raise SystemExit(f"cannot read {archive}: {exc}")
 
 
 def load_manifest(root: Path) -> dict:
     path = root / "manifest.json"
     if not path.is_file():
         raise SystemExit("not an imprint: missing manifest.json")
-    data = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"manifest.json is not readable: {exc}")
+    if not isinstance(data, dict):
+        raise SystemExit("manifest.json is not an object")
     if data.get("kind") != KIND:
         raise SystemExit(f"not an imprint: kind={data.get('kind')}")
     return data
@@ -2041,11 +2051,33 @@ def sync_git_checkout(target: Path, plug: dict, cat_dir: Path | None = None) -> 
     # With an overlay the local modifications are the source machine's own work,
     # reapplied right after this, so discarding them here is safe and required
     # to move the checkout at all. The pre-restore copy is in the undo dir.
+    # --force also clobbers untracked files that the target commit contains,
+    # which is how a checkout aborts after an earlier overlay left copies behind.
     force = ["--force"] if has_overlay else []
-    if want_branch:
-        proc = run(["git", "-C", str(target), "checkout", *force, "-B", want_branch, target_ref])
-    else:
-        proc = run(["git", "-C", str(target), "checkout", *force, "--detach", target_ref])
+    def do_checkout():
+        if want_branch:
+            return run(["git", "-C", str(target), "checkout", *force, "-B", want_branch, target_ref])
+        return run(["git", "-C", str(target), "checkout", *force, "--detach", target_ref])
+
+    proc = do_checkout()
+    if proc.returncode != 0:
+        # Untracked files that the target commit also tracks are stale copies from
+        # an earlier restore. Drop exactly those and retry; leave anything else.
+        listing = run_ok(["git", "-C", str(target), "ls-files", "--others",
+                          "--exclude-standard", "-z"])
+        removed = 0
+        for name in listing.split("\0"):
+            if not name:
+                continue
+            if run(["git", "-C", str(target), "cat-file", "-e",
+                    f"{target_ref}:{name}"]).returncode == 0:
+                try:
+                    (target / name).unlink()
+                    removed += 1
+                except OSError:
+                    pass
+        if removed:
+            proc = do_checkout()
     if proc.returncode != 0:
         return fail(f"{pid}: checkout of {target_ref} failed: "
                     + (proc.stderr or proc.stdout).strip()[:160])
@@ -2718,215 +2750,6 @@ def verify_units(units: list[str], system_root: str, alt_root: bool) -> list[str
     return out
 
 
-def restore_identity(cat_dir: Path, dry: bool, confirm_host: str | None) -> list[str]:
-    meta_path = cat_dir / "meta.json"
-    if not meta_path.is_file():
-        return []
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    wanted = meta.get("hostname")
-    if not wanted:
-        return []
-    if dry:
-        return [f"hostnamectl set-hostname {wanted}"]
-    if confirm_host != wanted:
-        return [f"skipped hostname {wanted} (pass --confirm-hostname {wanted})"]
-    proc = run(["hostnamectl", "set-hostname", wanted])
-    if proc.returncode == 0:
-        return ["hostname ok"]
-    return [fail("hostname failed: " + (proc.stderr or proc.stdout).strip()[:200])]
-
-
-
-def restore_scripts(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool) -> list[str]:
-    actions = restore_file_tree(cat_dir, home, old_home, undo, dry)
-    meta_path = cat_dir / "meta.json"
-    if not meta_path.is_file():
-        return actions
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    for entry in meta.get("links") or []:
-        link_rel, target_rel = entry.get("link") or "", entry.get("target") or ""
-        if not link_rel or not target_rel:
-            continue
-        try:
-            link = contained(home, (home / link_rel).parent) / Path(link_rel).name
-            target = contained(home, home / target_rel)
-        except UnsafePath:
-            actions.append(fail(f"refused link outside home: {link_rel!r} -> {target_rel!r}"))
-            continue
-        if dry:
-            actions.append(f"ln -s ~/{target_rel} ~/{link_rel}")
-            continue
-        if not target.exists():
-            actions.append(fail(
-                f"~/{link_rel} not linked: ~/{target_rel} is missing"
-                + (f" (restore Projects, or clone {entry['url']})" if entry.get("url") else "")
-            ))
-            continue
-        if link.exists() or link.is_symlink():
-            backup_existing(link, undo, home)
-            if link.is_dir() and not link.is_symlink():
-                shutil.rmtree(link)
-            else:
-                link.unlink()
-        link.parent.mkdir(parents=True, exist_ok=True)
-        link.symlink_to(target)
-        actions.append(f"linked ~/{link_rel} -> ~/{target_rel}")
-    return actions
-
-
-def restore_projects(cat_dir: Path, home: Path, dry: bool) -> list[str]:
-    meta_path = cat_dir / "meta.json"
-    if not meta_path.is_file():
-        return []
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    actions = []
-    for repo in meta.get("repos") or []:
-        rel = repo.get("path") or ""
-        url = repo.get("url") or ""
-        if not rel:
-            continue
-        try:
-            target = contained(home, home / rel)
-        except UnsafePath:
-            actions.append(fail(f"refused project path outside home: {rel!r}"))
-            continue
-        branch = repo.get("branch") or ""
-        if not url:
-            actions.append(f"skip {rel}: no git remote, nothing to clone from")
-            continue
-        if dry:
-            actions.append(f"git clone {url} ~/{rel}" + (f" -b {branch}" if branch else ""))
-            if repo.get("patch"):
-                actions.append(f"  then git apply {len(repo.get('changed') or [])} uncommitted files")
-            continue
-        if target.exists():
-            actions.append(f"{rel} already present, left alone")
-        else:
-            cmd = ["git", "clone"]
-            if branch:
-                cmd += ["-b", branch]
-            cmd += [url, str(target)]
-            proc = run(cmd)
-            if proc.returncode != 0:
-                actions.append(fail(f"clone failed {rel}: " + (proc.stderr or proc.stdout).strip()[:200]))
-                continue
-            actions.append(f"cloned {rel} from source")
-        rel_patch = repo.get("patch") or ""
-        if rel_patch:
-            try:
-                patch = contained(cat_dir, cat_dir / rel_patch)
-            except UnsafePath:
-                actions.append(fail(f"refused patch path {rel_patch!r}"))
-                continue
-            if patch.is_file():
-                proc = run(["git", "-C", str(target), "apply", "--3way", str(patch)])
-                if proc.returncode == 0:
-                    actions.append(f"reapplied uncommitted work to {rel}")
-                else:
-                    actions.append(fail(f"patch failed for {rel}: " + (proc.stderr or proc.stdout).strip()[:200]))
-    for rel in meta.get("withoutRemote") or []:
-        actions.append(f"WARNING {rel} has no remote and was not captured as content")
-    return actions
-
-
-def restore_toolchains(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool) -> list[str]:
-    actions = restore_file_tree(cat_dir, home, old_home, undo, dry)
-    meta_path = cat_dir / "meta.json"
-    if not meta_path.is_file():
-        return actions
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    steps: list[list[str]] = []
-    if meta.get("mise"):
-        steps.append(["mise", "install", "--yes"])
-    for crate in meta.get("cargo") or []:
-        steps.append(["cargo", "install", crate])
-    for tool in meta.get("go") or []:
-        module = tool.get("module")
-        if module:
-            steps.append(["go", "install", f"{module}@latest"])
-    for pkg in meta.get("npmGlobal") or []:
-        steps.append(["npm", "install", "-g", pkg])
-    if dry:
-        return actions + [" ".join(step) for step in steps]
-    for step in steps:
-        if not shutil.which(step[0]):
-            actions.append(fail(f"{step[0]} not installed, skipped: " + " ".join(step)))
-            continue
-        proc = run(step)
-        if proc.returncode == 0:
-            actions.append("ok: " + " ".join(step))
-        else:
-            actions.append(fail("failed: " + " ".join(step) + " -- " + (proc.stderr or proc.stdout).strip()[:200]))
-    for name in meta.get("unresolvedGo") or []:
-        actions.append(f"WARNING go tool {name} has no resolvable module path")
-    return actions
-
-
-def restore_system(cat_dir: Path, home: Path, dry: bool, allow: bool,
-                   system_root: str = "/") -> list[str]:
-    meta_path = cat_dir / "meta.json"
-    if not meta_path.is_file():
-        return []
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    etc_root = cat_dir / "etc"
-    # The archive is unpacked into a temp dir that disappears when restore
-    # returns, so stage the payload somewhere the user can actually review and
-    # re-run later.
-    stage = home / ".local/state/imprint" / f"system-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-    stage_etc = stage / "etc"
-    lines = ["#!/usr/bin/env bash", "set -euo pipefail", "# Written by imprint. Review before running."]
-    installs = []
-    if etc_root.is_dir():
-        for path in sorted(etc_root.rglob("*")):
-            if not path.is_file():
-                continue
-            rel = path.relative_to(etc_root)
-            if not dry:
-                copy_file(path, stage_etc / rel)
-            etc_target = Path(system_root) / "etc" / rel
-            installs.append((path, etc_target))
-            lines.append(f'install -Dm644 {shlex.quote(str(stage_etc / rel))} {shlex.quote(str(etc_target))}')
-    units = [u for u in (meta.get("enabledUnits") or []) if safe_segment(u)]
-    alt_root = system_root not in ("", "/")
-    root_flag = f" --root={shlex.quote(system_root)}" if alt_root else ""
-    if installs and not alt_root:
-        lines.append("systemctl daemon-reload")
-    for unit in units:
-        lines.append(f"systemctl{root_flag} enable {shlex.quote(unit)} "
-                     f"|| echo \"could not enable {unit}\" >&2")
-    summary = [f"{len(installs)} /etc files, {len(units)} system units to enable"]
-    if dry:
-        return summary + [f"install /etc/{p.relative_to(etc_root)}" for p, _ in installs[:8]] + \
-               ([f"... {len(installs) - 8} more"] if len(installs) > 8 else []) + \
-               [f"systemctl enable {u}" for u in units[:8]] + \
-               ([f"... {len(units) - 8} more units"] if len(units) > 8 else [])
-    stage.mkdir(parents=True, exist_ok=True)
-    script = stage / "restore-system.sh"
-    script.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    os.chmod(script, 0o755)
-    if not allow:
-        return summary + [
-            "system layer NOT applied: needs root, pass --allow-system to run it",
-            f"review the generated script at {script}",
-        ]
-    if alt_root:
-        # Applying into an alternate root needs no privileges and cannot touch
-        # the running system, which is how this path gets verified.
-        Path(system_root).mkdir(parents=True, exist_ok=True)
-        proc = run(["bash", str(script)])
-        if proc.returncode != 0:
-            return summary + [fail(f"system layer failed against {system_root}: "
-                                   + (proc.stderr or proc.stdout).strip()[:400])]
-        return summary + [f"system layer applied into {system_root}"] + \
-            verify_units(units, system_root, alt_root)
-    if run(["sudo", "-n", "true"]).returncode != 0:
-        return summary + [fail(f"no non-interactive sudo; run it yourself: sudo {script}")]
-    proc = run(["sudo", "-n", "bash", str(script)])
-    if proc.returncode != 0:
-        return summary + [fail("system layer failed: " + (proc.stderr or proc.stdout).strip()[:400])]
-    return summary + ["system layer applied"] + verify_units(units, system_root, alt_root)
-
-
 def restore_category(
     cid: str,
     cat_dir: Path,
@@ -3082,6 +2905,18 @@ def sh(value: str) -> str:
     return shlex.quote(str(value))
 
 
+PAYLOAD_VAR = "$PLAN_PAYLOAD"
+
+
+def payload_ref(root: Path, path: Path) -> str:
+    """Reference a file inside the plan payload without baking in its location,
+    so the plan directory can be moved or copied to another machine."""
+    try:
+        return f'"{PAYLOAD_VAR}"/{shlex.quote(str(path.relative_to(root)))}'
+    except ValueError:
+        return sh(path)
+
+
 class Plan:
     """An ordered list of shell steps, each one safe to re-run."""
 
@@ -3116,7 +2951,7 @@ def plan_toolchains(plan: Plan, meta: dict, root: Path) -> None:
     if src.is_file():
         plan.add("toolchains", "mise tool versions", [
             'mkdir -p "$HOME/.config/mise"',
-            f'cp {sh(src)} "$HOME/.config/mise/config.toml"',
+            f'cp {payload_ref(root, src)} "$HOME/.config/mise/config.toml"',
             "mise install --yes",
         ])
     for tool in meta.get("go") or []:
@@ -3148,14 +2983,15 @@ def plan_projects(plan: Plan, meta: dict, root: Path) -> None:
         patch = repo.get("patch")
         if patch:
             pfile = root / "categories/projects" / patch
-            body += [f'if [ -f {sh(pfile)} ]; then',
-                     f'  git -C "$HOME"/{sh(rel)} apply --3way {sh(pfile)} || '
+            ref = payload_ref(root, pfile)
+            body += [f'if [ -f {ref} ]; then',
+                     f'  git -C "$HOME"/{sh(rel)} apply --3way {ref} || '
                      f'echo "patch for {rel} did not apply cleanly" >&2',
                      'fi']
         plan.add("projects", rel, body)
 
 
-def plan_themes(plan: Plan, meta: dict) -> None:
+def plan_themes(plan: Plan, meta: dict, root: Path) -> None:
     for theme in meta.get("themes") or []:
         if theme.get("url"):
             plan.add("themes", f"theme {theme.get('id')}",
@@ -3174,34 +3010,44 @@ def plan_plugins(plan: Plan, meta: dict, root: Path) -> None:
             # plugin add clones into a temp dir before noticing the id is taken,
             # so skip it outright when the plugin is already there.
             body.append(f'[ -d {dest} ] || omarchy plugin add {sh(plug["url"])} --yes || true')
+            if not (plug.get("branch") or plug.get("commit")):
+                # Nothing downstream would notice a failed clone for this one.
+                body.append(f'[ -d {dest} ] || '
+                            f'{{ echo "{pid} was not installed" >&2; exit 1; }}')
             branch, commit = plug.get("branch") or "", plug.get("commit") or ""
             if branch or commit:
                 body.append(f'git -C {dest} remote get-url imprint-src >/dev/null 2>&1 '
                             f'|| git -C {dest} remote add imprint-src {sh(plug["url"])}')
                 bundle = plug.get("bundle")
                 if bundle:
-                    bfile = cat / bundle
-                    body.append(f'[ -f {sh(bfile)} ] && git -C {dest} fetch {sh(bfile)} '
+                    bfile = payload_ref(root, cat / bundle)
+                    body.append(f'[ -f {bfile} ] && git -C {dest} fetch {bfile} '
                                 f'{sh(branch)}:refs/remotes/imprint-bundle/{sh(branch)} --force || true')
                 body.append(f'git -C {dest} fetch imprint-src --quiet || true')
                 ref = commit or f"imprint-src/{branch}"
-                body.append(f'git -C {dest} checkout -B {sh(branch)} {sh(ref)} || '
-                            f'echo "could not put {pid} on {branch}" >&2')
-            overlay = plug.get("overlay")
+                overlay = plug.get("overlay")
+                # -f when an overlay follows: the local modifications and the
+                # untracked files a previous overlay left behind are exactly what
+                # we are about to rewrite, and without it the checkout aborts.
+                force = " -f" if overlay else ""
+                body.append(f'imprint_checkout {dest} {sh(branch)} {sh(ref)}{force} || '
+                            f'{{ echo "could not put {pid} on {branch}" >&2; exit 1; }}')
+            else:
+                overlay = plug.get("overlay")
             if overlay:
-                body.append(f'cp -a {sh(cat / overlay)}/. {dest}/')
+                body.append(f'cp -a {payload_ref(root, cat / overlay)}/. {dest}/')
         else:
             tree = plug.get("tree")
             if tree:
-                body += [f'mkdir -p {dest}', f'cp -a {sh(cat / tree)}/. {dest}/']
+                body += [f'mkdir -p {dest}', f'cp -a {payload_ref(root, cat / tree)}/. {dest}/']
             elif plug.get("clonedFrom"):
                 body.append(f'omarchy plugin clone {sh(plug["clonedFrom"])} || true')
         for unit in plug.get("units") or []:
             if not safe_segment(unit):
                 continue
-            ufile = cat / "units" / unit
-            body += [f'if [ -f {sh(ufile)} ]; then',
-                     f'  install -Dm644 {sh(ufile)} "$HOME/.config/systemd/user/{unit}"',
+            ufile = payload_ref(root, cat / "units" / unit)
+            body += [f'if [ -f {ufile} ]; then',
+                     f'  install -Dm644 {ufile} "$HOME/.config/systemd/user/{unit}"',
                      f'  systemctl --user daemon-reload',
                      f'  systemctl --user enable --now {sh(unit)}',
                      f'  systemctl --user restart {sh(unit)}',
@@ -3243,7 +3089,7 @@ def plan_files(plan: Plan, cid: str, root: Path) -> None:
     if not count:
         return
     plan.add("files", f"{cid}: {count} files", [
-        f'cp -a {sh(files_root)}/. "$HOME"/',
+        f'cp -a {payload_ref(root, files_root)}/. "$HOME"/',
     ], note="home paths inside these are rewritten by `imprint restore`, not by this script")
 
 
@@ -3278,7 +3124,7 @@ def build_plan(root: Path, manifest: dict, ids: list[str]) -> Plan:
         elif cid == "projects":
             plan_projects(plan, meta, root)
         elif cid == "themes":
-            plan_themes(plan, meta)
+            plan_themes(plan, meta, root)
             plan_files(plan, cid, root)
         elif cid == "plugins":
             plan_plugins(plan, meta, root)
@@ -3309,6 +3155,9 @@ def render_plan_script(plan: Plan, manifest: dict, archive: Path, root: Path) ->
         "# Every step is written to be safe to re-run. Steps that may legitimately",
         "# fail end in `|| true`; anything else failing is counted and reported.",
         "set -uo pipefail",
+        "",
+        'PLAN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
+        ': "${PLAN_PAYLOAD:=$PLAN_DIR/payload}"; export PLAN_PAYLOAD',
         "",
         "# The omarchy CLI and the shell IPC need a desktop session. Without this",
         "# every enable/disable silently does nothing, which is easy to miss.",
@@ -3360,6 +3209,59 @@ def render_plan_script(plan: Plan, manifest: dict, archive: Path, root: Path) ->
     return "\n".join(out) + "\n"
 
 
+def step_id(index: int, step: dict) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", step["title"].lower()).strip("-")[:40] or "step"
+    return f"{index:03d}-{step['phase']}-{slug}"
+
+
+def body_hash(body: list[str]) -> str:
+    import hashlib
+    return hashlib.sha256("\n".join(body).encode("utf-8")).hexdigest()[:16]
+
+
+def step_record(index: int, step: dict) -> dict:
+    return {
+        "id": step_id(index, step),
+        "phase": step["phase"],
+        "title": step["title"],
+        "note": step.get("note", ""),
+        "body": step["body"],
+        "hash": body_hash(step["body"]),
+    }
+
+
+def session_preamble() -> list[str]:
+    """Same desktop-session bootstrap the generated script uses."""
+    return [
+        ': "${OMARCHY_PATH:=/usr/share/omarchy}"; export OMARCHY_PATH',
+        ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; export XDG_RUNTIME_DIR',
+        'if [ -z "${WAYLAND_DISPLAY:-}" ]; then',
+        '  for _s in "$XDG_RUNTIME_DIR"/wayland-*; do',
+        '    case "$_s" in *.lock) continue ;; esac',
+        '    [ -e "$_s" ] || continue',
+        '    WAYLAND_DISPLAY=$(basename "$_s"); export WAYLAND_DISPLAY; break',
+        '  done',
+        'fi',
+        'if [ -z "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] && command -v hyprctl >/dev/null 2>&1; then',
+        "  _his=$(hyprctl instances 2>/dev/null | awk '/^instance /{print $2}' | tr -d ':' | head -1)",
+        '  [ -n "$_his" ] && { HYPRLAND_INSTANCE_SIGNATURE=$_his; export HYPRLAND_INSTANCE_SIGNATURE; }',
+        'fi',
+        '',
+        '# Check out a recorded ref, clearing only the untracked files that the',
+        '# target commit itself tracks -- those are stale copies an earlier restore',
+        '# left behind. Genuine local additions are never touched.',
+        'imprint_checkout() {',
+        '  local dest=$1 branch=$2 ref=$3 force=${4:-}',
+        '  if git -C "$dest" checkout $force -B "$branch" "$ref" 2>/dev/null; then return 0; fi',
+        '  local f',
+        '  while IFS= read -r -d "" f; do',
+        '    if git -C "$dest" cat-file -e "$ref:$f" 2>/dev/null; then rm -f -- "$dest/$f"; fi',
+        '  done < <(git -C "$dest" ls-files --others --exclude-standard -z)',
+        '  git -C "$dest" checkout $force -B "$branch" "$ref"',
+        '}',
+    ]
+
+
 def cmd_plan(args) -> int:
     archive = Path(args.archive).expanduser()
     if not archive.exists():
@@ -3388,13 +3290,164 @@ def cmd_plan(args) -> int:
     write_json(out_dir / "plan.json", {
         "archive": str(archive), "payload": str(root), "hostname": manifest.get("hostname"),
         "categories": ids, "phases": plan.phases(),
-        "steps": [{"phase": x["phase"], "title": x["title"], "lines": len(x["body"])} for x in plan.steps],
+        "preamble": session_preamble(),
+        "steps": [step_record(i, x) for i, x in enumerate(plan.steps)],
     })
     result = {"ok": True, "plan": str(out_dir), "script": str(script),
               "steps": len(plan.steps), "phases": plan.phases(), "categories": ids}
     json.dump(result, sys.stdout, indent=2)
     sys.stdout.write("\n")
     return 0
+
+
+
+JOURNAL_NAME = "journal.json"
+
+
+def load_journal(plan_dir: Path) -> dict:
+    path = plan_dir / JOURNAL_NAME
+    if not path.is_file():
+        return {"runs": 0, "steps": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"runs": 0, "steps": {}}
+    if not isinstance(data.get("steps"), dict):
+        data["steps"] = {}
+    return data
+
+
+def save_journal(plan_dir: Path, journal: dict) -> None:
+    # Written after every step so an interrupted run can be resumed.
+    write_json(plan_dir / JOURNAL_NAME, journal)
+
+
+def run_step(step: dict, preamble: list[str], plan_dir: Path, payload: Path) -> tuple[int, str]:
+    script = "\n".join([
+        "#!/usr/bin/env bash",
+        "set -uo pipefail",
+        f"export PLAN_PAYLOAD={shlex.quote(str(payload))}",
+        *preamble,
+        "set -e",
+        *step["body"],
+    ]) + "\n"
+    # A fixed name, so a killed run leaves one stale file rather than a pile.
+    path = plan_dir / ".imprint-step.sh"
+    try:
+        path.write_text(script, encoding="utf-8")
+        proc = run(["bash", str(path)])
+        tail = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        return proc.returncode, tail[-1200:]
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def cmd_apply(args) -> int:
+    plan_dir = Path(args.plan).expanduser()
+    plan_file = plan_dir / "plan.json"
+    if not plan_file.is_file():
+        raise SystemExit(f"not a plan directory (no plan.json): {plan_dir}")
+    try:
+        plan = json.loads(plan_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"{plan_file} is not readable as a plan: {exc}")
+    steps = plan.get("steps") or []
+    preamble = plan.get("preamble") or []
+    if not steps:
+        raise SystemExit("this plan has no steps")
+
+    payload = plan_dir / "payload"
+    if not payload.is_dir():
+        recorded = Path(plan.get("payload") or "")
+        if not recorded.is_dir():
+            raise SystemExit(
+                f"the plan's payload is missing (looked in {payload} and {recorded}); "
+                "re-run `imprint plan` to rebuild it")
+        payload = recorded
+
+    known_phases = {st["phase"] for st in steps}
+    if args.phase and args.phase not in known_phases:
+        raise SystemExit(f"no phase {args.phase!r} in this plan; it has: "
+                         + ", ".join(sorted(known_phases)))
+    try:
+        (plan_dir / ".imprint-write-test").write_text("", encoding="utf-8")
+        (plan_dir / ".imprint-write-test").unlink()
+    except OSError as exc:
+        raise SystemExit(f"cannot write the journal into {plan_dir}: {exc}")
+
+    journal = load_journal(plan_dir) if args.resume else {"runs": 0, "steps": {}}
+    if args.restart:
+        journal = {"runs": 0, "steps": {}}
+    journal["runs"] = int(journal.get("runs") or 0) + 1
+    journal["plan"] = str(plan_file)
+    journal["startedAt"] = iso_now()
+
+    todo, skipped = [], []
+    for step in steps:
+        if args.phase and step["phase"] != args.phase:
+            continue
+        prior = (journal["steps"].get(step["id"]) or {})
+        # A step whose body changed since it succeeded is not done any more.
+        if (prior.get("state") == "succeeded" and prior.get("hash") == step["hash"]
+                and not args.recheck):
+            skipped.append(step)
+            continue
+        todo.append(step)
+
+    for step in todo:
+        journal["steps"][step["id"]] = {
+            "phase": step["phase"], "title": step["title"], "hash": step["hash"],
+            "state": "running", "startedAt": iso_now(),
+        }
+        save_journal(plan_dir, journal)
+        if args.dry_run:
+            journal["steps"][step["id"]].update(state="pending", finishedAt=iso_now(),
+                                                note="dry run, not executed")
+            save_journal(plan_dir, journal)
+            print(f"  would run [{step['phase']}] {step['title']}", file=sys.stderr)
+            continue
+        print(f"  [{step['phase']}] {step['title']}", file=sys.stderr)
+        code, tail = run_step(step, preamble, plan_dir, payload)
+        entry = journal["steps"][step["id"]]
+        entry["finishedAt"] = iso_now()
+        entry["exit"] = code
+        entry["output"] = tail
+        entry["state"] = "succeeded" if code == 0 else "failed"
+        save_journal(plan_dir, journal)
+        if code != 0:
+            fail(f"[{step['phase']}] {step['title']}: exit {code}")
+            if args.stop_on_failure:
+                break
+
+    done = [k for k, v in journal["steps"].items() if v.get("state") == "succeeded"]
+    failed = [(k, v) for k, v in journal["steps"].items() if v.get("state") == "failed"]
+    pending = [s["id"] for s in steps
+               if journal["steps"].get(s["id"], {}).get("state") not in {"succeeded", "failed"}]
+    journal["finishedAt"] = iso_now()
+    save_journal(plan_dir, journal)
+
+    report = {
+        "ok": not failed,
+        "plan": str(plan_dir),
+        "journal": str(plan_dir / JOURNAL_NAME),
+        "run": journal["runs"],
+        "dryRun": bool(args.dry_run),
+        "ranNow": len(todo),
+        "skippedAlreadyDone": len(skipped),
+        "succeeded": len(done),
+        "failed": [{"id": k, "title": v.get("title"), "exit": v.get("exit"),
+                    "output": (v.get("output") or "")[-300:]} for k, v in failed],
+        "stillPending": pending,
+    }
+    json.dump(report, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    if failed:
+        print(f"\n{len(failed)} step(s) failed. Fix, then: imprint apply {plan_dir} --resume",
+              file=sys.stderr)
+    return 0 if not failed else 1
 
 
 def cmd_verify(args) -> int:
@@ -3528,6 +3581,16 @@ def build_parser() -> argparse.ArgumentParser:
     planp.add_argument("archive")
     planp.add_argument("--only", default="")
     planp.add_argument("-o", "--output", default="")
+    applyp = sub.add_parser("apply")
+    applyp.add_argument("plan")
+    applyp.add_argument("--resume", action="store_true",
+                        help="continue an interrupted run, skipping steps already done")
+    applyp.add_argument("--restart", action="store_true", help="discard the journal and start over")
+    applyp.add_argument("--recheck", action="store_true", help="re-run steps already recorded as done")
+    applyp.add_argument("--dry-run", action="store_true")
+    applyp.add_argument("--phase", default="", help="only run this phase")
+    applyp.add_argument("--stop-on-failure", action="store_true",
+                        help="halt at the first failing step instead of carrying on")
     verify = sub.add_parser("verify")
     verify.add_argument("archive")
     diff = sub.add_parser("diff")
@@ -3548,6 +3611,7 @@ def main(argv: list[str] | None = None) -> int:
         "info": cmd_info,
         "brief": cmd_brief,
         "plan": cmd_plan,
+        "apply": cmd_apply,
         "verify": cmd_verify,
         "diff": cmd_diff,
         "undo": cmd_undo,

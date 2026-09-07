@@ -100,11 +100,14 @@ Usage:
                                       Apply /etc changes and enable system units
   imprint plan FILE           Write a reviewable restore.sh you can read first
   imprint plan FILE --only plugins -o ~/myplan
+  imprint apply DIR           Run a plan, recording each step; resumable
+  imprint apply DIR --resume  Continue after a failure or interruption
   imprint info FILE           Show the machine brief (AI-readable)
   imprint diff FILE           What drifted since this imprint
   imprint verify FILE         Check the archive
   imprint undo                Put back files from the last restore
   imprint list                Archives in ~/imprints
+  imprint facts               This machine as JSON
 
 In the picker: tab or x toggles a category, a selects all, enter confirms.
 Space does nothing -- gum 2.x does not bind it. Identity, monitors, input
@@ -416,6 +419,10 @@ case $cmd in
     [[ $# -ge 1 ]] || die "usage: imprint plan FILE [--only ...] [-o DIR]"
     engine plan "$@"
     ;;
+  apply)
+    [[ $# -ge 1 ]] || die "usage: imprint apply PLAN_DIR [--resume]"
+    engine apply "$@"
+    ;;
   info|brief)
     [[ $# -ge 1 ]] || die "usage: imprint info FILE"
     engine info "$@"
@@ -436,6 +443,9 @@ case $cmd in
     ;;
   categories)
     engine categories
+    ;;
+  facts)
+    engine facts
     ;;
   *)
     usage

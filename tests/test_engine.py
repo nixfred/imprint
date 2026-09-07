@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import sys
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -947,6 +948,127 @@ class SystemLayerTests(unittest.TestCase):
         self.assertIn("omarchy update failed", report["upgrade"])
         # Arch has no partial upgrades: nothing may be installed onto a failed one.
         self.assertEqual(report["categories"], {})
+
+
+class ApplyJournalTests(unittest.TestCase):
+    """apply must survive interruption and never re-do finished work blindly."""
+
+    def _plan_dir(self, tmp, bodies):
+        d = Path(tmp) / "plan"
+        (d / "payload").mkdir(parents=True)
+        steps = [{"id": f"{i:03d}-t-{i}", "phase": "t", "title": f"step{i}",
+                  "note": "", "body": b, "hash": engine.body_hash(b)}
+                 for i, b in enumerate(bodies)]
+        (d / "plan.json").write_text(json.dumps(
+            {"steps": steps, "preamble": [], "payload": str(d / "payload")}), encoding="utf-8")
+        return d
+
+    def _args(self, d, **kw):
+        from types import SimpleNamespace
+        base = dict(plan=str(d), resume=False, restart=False, recheck=False,
+                    dry_run=False, phase="", stop_on_failure=False)
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    def _run(self, d, **kw):
+        import io, contextlib
+        buf = io.StringIO()
+        engine.FAILURES.clear()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            rc = engine.cmd_apply(self._args(d, **kw))
+        engine.FAILURES.clear()
+        return rc, json.loads(buf.getvalue())
+
+    def test_a_failing_step_is_recorded_and_exits_nonzero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._plan_dir(tmp, [["true"], ["exit 3"], ["true"]])
+            rc, r = self._run(d)
+            self.assertEqual(rc, 1)
+            self.assertFalse(r["ok"])
+            self.assertEqual(len(r["failed"]), 1)
+            self.assertEqual(r["failed"][0]["exit"], 3)
+
+    def test_resume_skips_what_succeeded_and_retries_what_failed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "flag"
+            d = self._plan_dir(tmp, [["true"], [f'test -f {marker}']])
+            rc, r = self._run(d)
+            self.assertEqual(rc, 1)
+            marker.write_text("", encoding="utf-8")     # fix the cause
+            rc, r = self._run(d, resume=True)
+            self.assertEqual(rc, 0)
+            self.assertEqual(r["ranNow"], 1)             # only the failed one
+            self.assertEqual(r["skippedAlreadyDone"], 1)
+
+    def test_a_step_left_running_by_a_kill_is_retried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._plan_dir(tmp, [["true"], ["true"]])
+            self._run(d)
+            j = json.loads((d / "journal.json").read_text(encoding="utf-8"))
+            key = sorted(j["steps"])[1]
+            j["steps"][key]["state"] = "running"          # as SIGKILL would leave it
+            (d / "journal.json").write_text(json.dumps(j), encoding="utf-8")
+            _rc, r = self._run(d, resume=True)
+            self.assertEqual(r["ranNow"], 1)
+
+    def test_an_edited_step_is_no_longer_considered_done(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._plan_dir(tmp, [["true"], ["true"]])
+            self._run(d)
+            plan = json.loads((d / "plan.json").read_text(encoding="utf-8"))
+            plan["steps"][0]["body"] = ["true", "true"]
+            plan["steps"][0]["hash"] = engine.body_hash(plan["steps"][0]["body"])
+            (d / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+            _rc, r = self._run(d, resume=True)
+            self.assertEqual(r["ranNow"], 1)
+            self.assertEqual(r["skippedAlreadyDone"], 1)
+
+    def test_dry_run_executes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            made = Path(tmp) / "made"
+            d = self._plan_dir(tmp, [[f"touch {made}"]])
+            _rc, r = self._run(d, dry_run=True)
+            self.assertFalse(made.exists())
+            self.assertTrue(r["dryRun"])
+
+    def test_stop_on_failure_halts_instead_of_carrying_on(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            later = Path(tmp) / "later"
+            d = self._plan_dir(tmp, [["exit 1"], [f"touch {later}"]])
+            self._run(d, stop_on_failure=True)
+            self.assertFalse(later.exists())
+
+    def test_unknown_phase_is_rejected_rather_than_doing_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._plan_dir(tmp, [["true"]])
+            with self.assertRaises(SystemExit) as ctx:
+                self._run(d, phase="nope")
+            self.assertIn("no phase", str(ctx.exception))
+
+    def test_missing_payload_is_reported_clearly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._plan_dir(tmp, [["true"]])
+            shutil.rmtree(d / "payload")
+            plan = json.loads((d / "plan.json").read_text(encoding="utf-8"))
+            plan["payload"] = "/definitely/not/here"
+            (d / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+            with self.assertRaises(SystemExit) as ctx:
+                self._run(d)
+            self.assertIn("payload is missing", str(ctx.exception))
+
+    def test_steps_can_reach_the_payload_by_variable_not_absolute_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._plan_dir(tmp, [['test -d "$PLAN_PAYLOAD"']])
+            rc, _r = self._run(d)
+            self.assertEqual(rc, 0)
+
+    def test_a_corrupt_plan_is_a_message_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp) / "plan"; d.mkdir()
+            (d / "plan.json").write_text("not json", encoding="utf-8")
+            with self.assertRaises(SystemExit) as ctx:
+                self._run(d)
+            self.assertIn("not readable as a plan", str(ctx.exception))
 
 
 if __name__ == "__main__":
