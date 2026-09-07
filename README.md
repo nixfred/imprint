@@ -67,6 +67,9 @@ imprint restore FILE --only identity --confirm-hostname dex
 imprint restore FILE --upgrade       # omarchy update -y first, abort if it fails
 imprint restore FILE --only system --allow-system   # /etc + systemctl enable, via sudo
 
+imprint plan FILE                    # write a restore.sh you can read before running
+imprint plan FILE --only plugins -o ~/myplan
+
 imprint info FILE                    # machine brief; feed this to an agent
 imprint diff FILE                    # what drifted since the imprint
 imprint verify FILE
@@ -76,6 +79,34 @@ imprint list
 
 The archive is self-contained. On a fresh Omarchy install you can extract it
 and run `tool/imprint restore .` without installing anything first.
+
+## Read it before you run it
+
+`imprint plan FILE` extracts the archive and writes a `restore.sh` next to it —
+an ordered, commented shell script of exactly what a restore would do, with
+nothing hidden inside the tool. Same recipe `imprint restore` follows, in a form
+you can read, edit, or hand to someone else.
+
+```
+### preflight   is this an Omarchy box, is the shell answering
+### upgrade     omarchy update -y, before anything is installed onto it
+### packages    omarchy pkg add / pkg aur add
+### toolchains  mise install, go install, cargo install
+### projects    git clone each checkout, then apply its uncommitted patch
+### plugins     plugin add, checkout the recorded branch/commit, reapply local
+                edits, install the systemd units a widget needs
+### files       copy the config trees into place
+### activate    enable/disable plugins where the source had them, reload
+```
+
+Every step runs in a `set -e` subshell, so a failure is real and gets listed by
+name at the end rather than swallowed. Steps that may legitimately fail end in
+`|| true`. The script exports the desktop session variables first: without them
+the omarchy CLI cannot find its own share directory and every `plugin enable` is
+a silent no-op.
+
+The system layer is deliberately not inlined — it needs root, so the plan points
+you at `imprint restore FILE --only system --allow-system`.
 
 ## What it carries
 
