@@ -4517,25 +4517,38 @@ def _keys(*names) -> tuple:
 
 # ncurses hands back a distinct code for a modified arrow (ctrl/shift), which
 # would otherwise fall through unhandled and look like a dead key.
+DOWN_KEYS = _keys("KEY_DOWN", "KEY_SF", "KEY_SNEXT")
+UP_KEYS = _keys("KEY_UP", "KEY_SR", "KEY_SPREVIOUS")
+RIGHT_KEYS = _keys("KEY_RIGHT", "KEY_SRIGHT")
+LEFT_KEYS = _keys("KEY_LEFT", "KEY_SLEFT")
+
+
 def arrow_of(key: int) -> str:
-    """Direction for any arrow variant, including the extended ctrl/alt codes
-    ncurses invents from terminfo (kRIT5, kUP3, ...) that have no constant."""
+    """Direction for any arrow variant.
+
+    The named constants are resolved from the tables directly, so this works
+    with no screen up. keyname() is only the fallback, for the extended
+    ctrl/alt codes ncurses invents from terminfo, which have no constant --
+    and it needs an initialised screen, hence the guard.
+    """
+    if key in DOWN_KEYS:
+        return "down"
+    if key in UP_KEYS:
+        return "up"
+    if key in RIGHT_KEYS:
+        return "right"
+    if key in LEFT_KEYS:
+        return "left"
     try:
         name = curses.keyname(key).decode("ascii", "ignore").upper()
     except (ValueError, curses.error):
         return ""
     for token, direction in (("RIT", "right"), ("RIGHT", "right"),
                              ("LFT", "left"), ("LEFT", "left"),
-                             ("UP", "up"), ("DN", "down"), ("DOWN", "down")):
+                             ("DN", "down"), ("DOWN", "down"), ("UP", "up")):
         if token in name:
             return direction
     return ""
-
-
-DOWN_KEYS = _keys("KEY_DOWN", "KEY_SF", "KEY_SNEXT")
-UP_KEYS = _keys("KEY_UP", "KEY_SR", "KEY_SPREVIOUS")
-RIGHT_KEYS = _keys("KEY_RIGHT", "KEY_SRIGHT")
-LEFT_KEYS = _keys("KEY_LEFT", "KEY_SLEFT")
 
 
 def decode_escape(stdscr) -> int:
