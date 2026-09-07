@@ -4450,27 +4450,12 @@ def _pick_loop(stdscr, roots, header):
         except KeyboardInterrupt:
             return None
         if key == 27:
-            # keypad(True) asks for application-cursor mode (\x1bOB), but plenty
-            # of terminals and multiplexers still send \x1b[B. Decode both by
-            # hand rather than letting an arrow fall through to the ESC binding.
-            stdscr.nodelay(True)
-            seq = ""
-            for _ in range(2):
-                nxt = stdscr.getch()
-                if nxt == -1:
-                    break
-                seq += chr(nxt)
-            stdscr.nodelay(False)
-            key = {"[A": curses.KEY_UP, "OA": curses.KEY_UP,
-                   "[B": curses.KEY_DOWN, "OB": curses.KEY_DOWN,
-                   "[C": curses.KEY_RIGHT, "OC": curses.KEY_RIGHT,
-                   "[D": curses.KEY_LEFT, "OD": curses.KEY_LEFT,
-                   "[5": curses.KEY_PPAGE, "[6": curses.KEY_NPAGE,
-                   "[H": curses.KEY_HOME, "[F": curses.KEY_END}.get(seq, 27)
+            key = decode_escape(stdscr)
         node = rows[cursor] if rows else None
-        if key in (curses.KEY_DOWN, ord("j")):
+        arrow = arrow_of(key) if key > 255 else ""
+        if key in DOWN_KEYS or key == ord("j") or arrow == "down":
             cursor += 1
-        elif key in (curses.KEY_UP, ord("k")):
+        elif key in UP_KEYS or key == ord("k") or arrow == "up":
             cursor -= 1
         elif key == curses.KEY_NPAGE:
             cursor += body
@@ -4480,9 +4465,9 @@ def _pick_loop(stdscr, roots, header):
             cursor = 0
         elif key == curses.KEY_END:
             cursor = len(rows) - 1
-        elif key in (curses.KEY_RIGHT, ord("l")):
+        elif key in RIGHT_KEYS or key == ord("l") or arrow == "right":
             cursor += 1
-        elif key in (curses.KEY_LEFT, ord("h")):
+        elif key in LEFT_KEYS or key == ord("h") or arrow == "left":
             cursor -= 1
         elif key in (ord(" "), curses.KEY_ENTER, 10, 13):
             # Space and enter both mean "act on this row" and nothing else
@@ -4515,6 +4500,81 @@ def _pick_loop(stdscr, roots, header):
             return None
 
 
+
+# Terminals send an arrow as several bytes. nodelay() returns -1 before the rest
+# of them have arrived, so the whole sequence read as a bare Escape and arrows
+# did nothing at all. Wait briefly for the remainder instead.
+CSI_FINAL = {"A": "KEY_UP", "B": "KEY_DOWN", "C": "KEY_RIGHT", "D": "KEY_LEFT",
+             "H": "KEY_HOME", "F": "KEY_END"}
+CSI_TILDE = {"1": "KEY_HOME", "7": "KEY_HOME", "4": "KEY_END", "8": "KEY_END",
+             "5": "KEY_PPAGE", "6": "KEY_NPAGE"}
+
+
+def _keys(*names) -> tuple:
+    """Curses keycodes that exist on this build, by name."""
+    return tuple(getattr(curses, n) for n in names if hasattr(curses, n))
+
+
+# ncurses hands back a distinct code for a modified arrow (ctrl/shift), which
+# would otherwise fall through unhandled and look like a dead key.
+def arrow_of(key: int) -> str:
+    """Direction for any arrow variant, including the extended ctrl/alt codes
+    ncurses invents from terminfo (kRIT5, kUP3, ...) that have no constant."""
+    try:
+        name = curses.keyname(key).decode("ascii", "ignore").upper()
+    except (ValueError, curses.error):
+        return ""
+    for token, direction in (("RIT", "right"), ("RIGHT", "right"),
+                             ("LFT", "left"), ("LEFT", "left"),
+                             ("UP", "up"), ("DN", "down"), ("DOWN", "down")):
+        if token in name:
+            return direction
+    return ""
+
+
+DOWN_KEYS = _keys("KEY_DOWN", "KEY_SF", "KEY_SNEXT")
+UP_KEYS = _keys("KEY_UP", "KEY_SR", "KEY_SPREVIOUS")
+RIGHT_KEYS = _keys("KEY_RIGHT", "KEY_SRIGHT")
+LEFT_KEYS = _keys("KEY_LEFT", "KEY_SLEFT")
+
+
+def decode_escape(stdscr) -> int:
+    """Map an escape sequence to a curses key, or 27 for a real lone Escape."""
+    stdscr.timeout(90)
+    try:
+        first = stdscr.getch()
+        if first == -1:
+            return 27
+        intro = chr(first)
+        if intro not in ("[", "O"):
+            return 27
+        seq = ""
+        for _ in range(16):
+            nxt = stdscr.getch()
+            if nxt == -1:
+                break
+            ch = chr(nxt)
+            seq += ch
+            if "@" <= ch <= "~":
+                break
+    finally:
+        stdscr.timeout(-1)
+    if not seq:
+        return 27
+    final, params = seq[-1], seq[:-1]
+    if final in CSI_FINAL:                       # \x1b[B, \x1bOB, \x1b[1;5B
+        return getattr(curses, CSI_FINAL[final])
+    if final == "~":                             # \x1b[5~
+        name = CSI_TILDE.get(params.split(";")[0])
+        if name:
+            return getattr(curses, name)
+    if final == "u":                             # kitty: \x1b[13;1u
+        head = params.split(";")[0]
+        if head.isdigit():
+            return int(head)
+    return 27
+
+
 def _menu_loop(stdscr, rows, header):
     curses.curs_set(0)
     stdscr.keypad(True)
@@ -4540,22 +4600,15 @@ def _menu_loop(stdscr, rows, header):
         stdscr.refresh()
         key = stdscr.getch()
         if key == 27:
-            stdscr.nodelay(True)
-            seq = ""
-            for _ in range(2):
-                nxt = stdscr.getch()
-                if nxt == -1:
-                    break
-                seq += chr(nxt)
-            stdscr.nodelay(False)
-            key = {"[A": curses.KEY_UP, "OA": curses.KEY_UP, "[B": curses.KEY_DOWN,
-                   "OB": curses.KEY_DOWN, "[C": curses.KEY_DOWN, "OC": curses.KEY_DOWN,
-                   "[D": curses.KEY_UP, "OD": curses.KEY_UP}.get(seq, 27)
+            key = decode_escape(stdscr)
             if key == 27:
                 return None
-        if key in (curses.KEY_DOWN, ord("j"), curses.KEY_RIGHT, ord("l")):
+        arrow = arrow_of(key) if key > 255 else ""
+        if key in DOWN_KEYS or key in RIGHT_KEYS or key in (ord("j"), ord("l")) \
+                or arrow in ("down", "right"):
             cursor = (cursor + 1) % len(rows)
-        elif key in (curses.KEY_UP, ord("k"), curses.KEY_LEFT, ord("h")):
+        elif key in UP_KEYS or key in LEFT_KEYS or key in (ord("k"), ord("h")) \
+                or arrow in ("up", "left"):
             cursor = (cursor - 1) % len(rows)
         elif key in (curses.KEY_ENTER, 10, 13, ord(" ")):
             return cursor
@@ -4564,15 +4617,23 @@ def _menu_loop(stdscr, rows, header):
 
 
 def with_tty_screen(func, *rest):
-    """curses draws on /dev/tty so stdout stays free for the answer."""
-    saved = os.dup(1)
+    """Run a curses UI on /dev/tty, leaving stdin and stdout for data.
+
+    Both ends matter: stdout carries the answer back to the caller, and stdin
+    may be a pipe feeding the menu its items -- curses must not read keys from
+    either of them.
+    """
+    saved_out, saved_in = os.dup(1), os.dup(0)
     tty_fd = os.open("/dev/tty", os.O_RDWR)
     try:
         os.dup2(tty_fd, 1)
+        os.dup2(tty_fd, 0)
         return curses.wrapper(func, *rest)
     finally:
-        os.dup2(saved, 1)
-        os.close(saved)
+        os.dup2(saved_out, 1)
+        os.dup2(saved_in, 0)
+        os.close(saved_out)
+        os.close(saved_in)
         os.close(tty_fd)
 
 

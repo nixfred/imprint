@@ -1392,5 +1392,42 @@ class RestorePreviewTests(unittest.TestCase):
             self.assertFalse(engine.is_skipped_name(name), name)
 
 
+class ArrowKeyTests(unittest.TestCase):
+    """Arrows arrive as multi-byte sequences, split across reads, in several
+    encodings. Every one of those has to move the cursor."""
+
+    def test_every_arrow_variant_maps_to_a_direction(self):
+        for name, want in (("KEY_RIGHT", "right"), ("KEY_LEFT", "left"),
+                           ("KEY_UP", "up"), ("KEY_DOWN", "down")):
+            code = getattr(engine.curses, name)
+            self.assertEqual(engine.arrow_of(code), want, name)
+
+    def test_unknown_keys_report_no_direction(self):
+        self.assertEqual(engine.arrow_of(ord("x")), "")
+        self.assertEqual(engine.arrow_of(ord(" ")), "")
+
+    def test_modified_arrow_codes_are_recognised(self):
+        # ncurses invents codes for ctrl/shift arrows from terminfo; they have no
+        # Python constant, so they are matched by name instead.
+        for name in ("KEY_SRIGHT", "KEY_SLEFT", "KEY_SR", "KEY_SF"):
+            if hasattr(engine.curses, name):
+                self.assertNotEqual(engine.arrow_of(getattr(engine.curses, name)), "", name)
+
+    def test_direction_sets_are_non_empty_and_disjoint(self):
+        self.assertTrue(engine.DOWN_KEYS and engine.UP_KEYS)
+        self.assertTrue(engine.RIGHT_KEYS and engine.LEFT_KEYS)
+        self.assertFalse(set(engine.DOWN_KEYS) & set(engine.UP_KEYS))
+        self.assertFalse(set(engine.RIGHT_KEYS) & set(engine.LEFT_KEYS))
+
+    def test_csi_tables_cover_the_sequences_terminals_send(self):
+        # \x1b[B and \x1bOB both end in B; the final byte is what decides.
+        for final, name in engine.CSI_FINAL.items():
+            self.assertTrue(hasattr(engine.curses, name), final)
+        for param, name in engine.CSI_TILDE.items():
+            self.assertTrue(hasattr(engine.curses, name), param)
+        self.assertEqual(engine.CSI_FINAL["B"], "KEY_DOWN")
+        self.assertEqual(engine.CSI_FINAL["C"], "KEY_RIGHT")
+
+
 if __name__ == "__main__":
     unittest.main()
