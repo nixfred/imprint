@@ -66,8 +66,17 @@ The first row, **Select ALL for backup**, turns everything on or off at once.
  ○ Monitors                  This machine's display layout  [this machine]
 ```
 
-`◉` all, `○` none, `◐` some of the submenu. Other keys: `t` toggles a whole
-group, `a` all, `n` none, `enter` confirms, `q` cancels.
+`◉` all, `○` none, `◐` some of the submenu.
+
+**Nothing starts until you say so.** Space and enter both just act on the row
+under the cursor, so selecting everything selects everything and leaves you
+there to keep editing. The run begins only when you pick the last row:
+
+```
+   ▶ Start backup   14 categories selected
+```
+
+Other keys: `t` toggles a whole group, `a` all, `n` none, `q` cancels.
 
 ```
 imprint save                         # picker, writes ~/imprints/imprint-$host-$time.tar.zst

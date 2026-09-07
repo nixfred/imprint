@@ -47,10 +47,11 @@ text="${GUM_FILTER_HEADER_FOREGROUND:-#EAECEE}"
 
 # IMPRINT in the same block font as the Omarchy wordmark, at half its height.
 IMPRINT_WORDMARK=$(cat <<'WORDMARK'
-▀▀▀███▀▀▀  ███▄     ▄███  ███▀▀▀▀██▄  ███▀▀▀▀██▄  ▀▀▀███▀▀▀  ███▄    ███  ▀▀▀███▀▀▀
-   ███     ███ ▀███▀ ███  ███    ███  ███    ███     ███     ███▀█▄  ███     ███
-   ███     ███   ▀   ███  ███▀▀▀▀▀▀   ███▀▀███▀      ███     ███  ▀█▄███     ███
-▄▄▄███▄▄▄  ███       ███  ███         ███   ▀██▄  ▄▄▄███▄▄▄  ███    ▀███     ███
+██████  ██      ██  ███████   ███████   ██████  ██     ██  ██████████
+  ██    ████  ████  ██    ██  ██    ██    ██    ███    ██      ██
+  ██    ██ ████ ██  ███████   ███████     ██    ██ ██  ██      ██
+  ██    ██  ██  ██  ██        ██   ██     ██    ██   ████      ██
+██████  ██      ██  ██        ██    ██  ██████  ██     ██      ██
 WORDMARK
 )
 
@@ -133,9 +134,11 @@ Usage:
   imprint list                Archives in ~/imprints
   imprint facts               This machine as JSON
 
-In the picker: space toggles a category. A row marked ▸ has a submenu --
-space opens it, ← goes back. The top row selects everything for backup.
-Identity, monitors, input and secrets stay off unless you turn them on.
+In the picker: space toggles the highlighted row. A row marked ▸ has a
+submenu -- space opens it, ← goes back. The top row selects everything and
+stays put so you can keep editing. Nothing runs until you pick the
+"▶ Start backup" row at the bottom. Identity, monitors, input and secrets
+stay off unless you turn them on.
 EOF
 }
 
@@ -182,7 +185,7 @@ choose_categories() {
   local header=$1
   local archive=${2:-}
   SELECTION_FILE=$(mktemp -t imprint-selection-XXXXXX.json)
-  local args=(pick --header "$header")
+  local args=(pick --header "$header" --action "${PICK_ACTION:-Start backup}")
   [[ -n $archive ]] && args+=(--archive "$archive")
   engine "${args[@]}" > "$SELECTION_FILE" || { rm -f "$SELECTION_FILE"; SELECTION_FILE=""; return 1; }
   python3 -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["categories"]))' \
@@ -217,7 +220,7 @@ do_save() {
   banner
   if [[ -z $only && $all -eq 0 ]]; then
     if (( HAVE_GUM )); then
-      only=$(choose_categories "What should this imprint carry?") || die "cancelled"
+      PICK_ACTION="Start backup" only=$(choose_categories "What should this imprint carry?") || die "cancelled"
     else
       only=$(default_selected)
       say "No terminal for the picker; using the default categories."
@@ -278,7 +281,7 @@ do_restore() {
   fi
   if [[ -z $only ]]; then
     if (( HAVE_GUM )); then
-      only=$(choose_categories "What should land on this machine?" "$archive") || die "cancelled"
+      PICK_ACTION="Start restore" only=$(choose_categories "What should land on this machine?" "$archive") || die "cancelled"
     else
       only=$(ids_from_archive_defaults "$archive")
       say "No terminal for the picker; using this archive's default categories."

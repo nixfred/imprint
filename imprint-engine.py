@@ -3526,6 +3526,36 @@ class SelectAll:
         return []
 
 
+class ActionRow:
+    """The row that actually starts the job. Nothing else confirms, so no
+    keystroke on a selection row can kick the run off by accident."""
+
+    key = "__go__"
+    children: list = []
+    parent = None
+    is_branch = False
+
+    def __init__(self, label, siblings):
+        self.label = label
+        self._siblings = siblings
+
+    @property
+    def hint(self) -> str:
+        n = sum(1 for x in self._siblings if x.state() != "off")
+        return f"{n} categor{'y' if n == 1 else 'ies'} selected" if n else "nothing selected yet"
+
+    def state(self) -> str:
+        return "off"
+
+    def set_all(self, value: bool) -> None:
+        pass
+
+    selected = False
+
+    def chosen_leaves(self) -> list[str]:
+        return []
+
+
 class Node:
     __slots__ = ("key", "label", "hint", "children", "selected", "parent")
 
@@ -3673,6 +3703,11 @@ def _draw(stdscr, rows, cursor, top, trail, header, height, width):
         if idx >= len(rows):
             break
         node = rows[idx]
+        if isinstance(node, ActionRow):
+            text = f"   \u25b6 {node.label}   {node.hint}"
+            attr = (curses.A_REVERSE if idx == cursor else curses.A_BOLD)
+            stdscr.addnstr(3 + i, 0, text[:width - 1].ljust(width - 1), width - 1, attr)
+            continue
         st = node.state()
         mark = {"on": MARK_ON, "off": MARK_OFF, "partial": MARK_PART}[st]
         arrow = MARK_SUB if node.is_branch else " "
@@ -3685,7 +3720,7 @@ def _draw(stdscr, rows, cursor, top, trail, header, height, width):
         attr = curses.A_REVERSE if idx == cursor else curses.A_NORMAL
         stdscr.addnstr(3 + i, 0, text[:width - 1].ljust(width - 1), width - 1, attr)
     hints = ("space toggles \u00b7 space on \u25b8 opens the submenu \u00b7 \u2190 back \u00b7 "
-             "t whole group \u00b7 a all \u00b7 n none \u00b7 enter confirm \u00b7 q cancel")
+             "t whole group \u00b7 a all \u00b7 n none \u00b7 q cancel")
     stdscr.addnstr(height - 1, 0, hints[:width - 1], width - 1, curses.A_DIM)
     stdscr.refresh()
 
@@ -3740,28 +3775,20 @@ def _pick_loop(stdscr, roots, header):
             cursor = 0
         elif key == curses.KEY_END:
             cursor = len(rows) - 1
-        elif key == ord(" "):
-            # The whole point: space toggles a leaf, and walks into a submenu.
+        elif key in (ord(" "), curses.KEY_ENTER, 10, 13, curses.KEY_RIGHT, ord("l")):
+            # Space and enter both mean "act on this row" and nothing else
+            # confirms, so selecting everything cannot start the run.
             if node is None:
                 continue
+            if isinstance(node, ActionRow):
+                return roots
             if node.is_branch:
                 trail.append(node)
                 rows, cursor, top = node.children, 0, 0
+            elif key in (curses.KEY_RIGHT, ord("l")):
+                continue
             else:
-                # No auto-advance: space must be able to undo itself in place.
                 node.selected = not node.selected
-        elif key in (curses.KEY_RIGHT, ord("l"), curses.KEY_ENTER, 10, 13):
-            if node is not None and node.is_branch and key in (curses.KEY_RIGHT, ord("l")):
-                trail.append(node)
-                rows, cursor, top = node.children, 0, 0
-            elif key in (curses.KEY_ENTER, 10, 13):
-                if trail:
-                    parent = trail.pop()
-                    rows = trail[-1].children if trail else roots
-                    cursor = max(0, rows.index(parent)) if parent in rows else 0
-                    top = 0
-                else:
-                    return roots
         elif key in (curses.KEY_LEFT, ord("h"), 27, curses.KEY_BACKSPACE, 127, 8):
             if trail:
                 parent = trail.pop()
@@ -3796,7 +3823,7 @@ def cmd_pick(args) -> int:
             root = open_imprint(Path(args.archive).expanduser(), Path(tmp) / "open")
             present = set((load_manifest(root).get("categories") or {}).keys())
     categories = build_tree(home, present)
-    roots = [SelectAll(categories)] + categories
+    roots = [SelectAll(categories)] + categories + [ActionRow(args.action or "Start backup", categories)]
     header = args.header or "What should this imprint carry?"
     saved_stdout = os.dup(1)
     tty_fd = os.open("/dev/tty", os.O_RDWR)
@@ -3967,6 +3994,7 @@ def build_parser() -> argparse.ArgumentParser:
     pick = sub.add_parser("pick")
     pick.add_argument("--archive", default="")
     pick.add_argument("--header", default="")
+    pick.add_argument("--action", default="", help="label for the row that starts the job")
     verify = sub.add_parser("verify")
     verify.add_argument("archive")
     diff = sub.add_parser("diff")

@@ -1158,5 +1158,57 @@ class PickerTests(unittest.TestCase):
             engine.SUBSELECT.clear()
 
 
+class ActionRowTests(unittest.TestCase):
+    """Selecting everything must not start the job; only the action row does."""
+
+    def _rows(self):
+        cats = [engine.Node("look", "Look", selected=True),
+                engine.Node("bar", "Bar", selected=False)]
+        return cats, [engine.SelectAll(cats)] + cats + [engine.ActionRow("Start backup", cats)]
+
+    def test_select_all_row_is_not_the_action_row(self):
+        _cats, rows = self._rows()
+        self.assertIsInstance(rows[0], engine.SelectAll)
+        self.assertIsInstance(rows[-1], engine.ActionRow)
+        self.assertNotIsInstance(rows[0], engine.ActionRow)
+
+    def test_select_all_changes_selection_without_confirming(self):
+        cats, rows = self._rows()
+        rows[0].selected = not rows[0].selected      # what space/enter does there
+        self.assertTrue(all(n.state() == "on" for n in cats))
+        # the action row is a separate object; nothing about toggling all touches it
+        self.assertEqual(rows[-1].state(), "off")
+
+    def test_action_row_reports_how_much_is_selected(self):
+        cats, rows = self._rows()
+        self.assertIn("1 category selected", rows[-1].hint)
+        cats[1].selected = True
+        self.assertIn("2 categories selected", rows[-1].hint)
+        for n in cats:
+            n.set_all(False)
+        self.assertIn("nothing selected", rows[-1].hint)
+
+    def test_action_row_never_becomes_a_selectable_category(self):
+        cats, rows = self._rows()
+        action = rows[-1]
+        action.set_all(True)
+        self.assertEqual(action.state(), "off")
+        self.assertEqual(action.chosen_leaves(), [])
+        self.assertFalse(action.is_branch)
+
+    def test_action_row_is_drawn_as_a_call_to_action_not_a_checkbox(self):
+        _cats, rows = self._rows()
+        drawn = {}
+        class Win:
+            def erase(self): drawn.clear()
+            def addnstr(self, y, x, t, n, a=0): drawn[y] = t[:n]
+            def refresh(self): pass
+        engine._draw(Win(), rows, 0, 0, [], "hdr", 24, 100)
+        line = [v for v in drawn.values() if "Start backup" in v][0]
+        self.assertIn("\u25b6", line)                       # ▶
+        for mark in (engine.MARK_ON, engine.MARK_OFF, engine.MARK_PART):
+            self.assertNotIn(mark, line)
+
+
 if __name__ == "__main__":
     unittest.main()
