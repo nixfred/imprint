@@ -66,6 +66,7 @@ imprint restore FILE --only bar,plugins --dry-run
 imprint restore FILE --only identity --confirm-hostname dex
 imprint restore FILE --upgrade       # omarchy update -y first, abort if it fails
 imprint restore FILE --only system --allow-system   # /etc + systemctl enable, via sudo
+imprint restore FILE --only system --allow-system --system-root /tmp/try   # rehearse it
 
 imprint plan FILE                    # write a restore.sh you can read before running
 imprint plan FILE --only plugins -o ~/myplan
@@ -151,6 +152,15 @@ On restore, `/home/olduser` inside text files becomes the new `$HOME`. Git
 remotes of the form `git@github.com:...` are saved as `https://` so the new
 box does not need your SSH key. Plugins land before `shell.json`, so the bar
 has somewhere to put them.
+
+`--system-root DIR` applies the system layer into another root instead of `/`.
+It needs no privileges, cannot touch the running system, and uses
+`systemctl --root` to enable units offline — so you can rehearse exactly what
+would land before letting it near the real thing.
+
+Afterwards every unit is checked with `systemctl is-enabled`. A unit whose file
+is absent (its package never installed) or that failed to enable is reported as
+a failure, because the generated script logs those to stderr and carries on.
 
 The system layer never touches `/etc` on its own. It stages the files under
 `~/.local/state/imprint/system-<stamp>/` and writes a `restore-system.sh` you

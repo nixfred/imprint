@@ -854,5 +854,100 @@ class PlanTests(unittest.TestCase):
         self.assertNotIn("sudo bash", script)
 
 
+class SystemLayerTests(unittest.TestCase):
+    """The system layer writes /etc and enables units, so it must be verifiable."""
+
+    def _cat(self, tmp):
+        cat = Path(tmp) / "cat"
+        (cat / "etc/systemd/system").mkdir(parents=True)
+        (cat / "etc/thing.conf").write_text("x=1\n", encoding="utf-8")
+        (cat / "etc/systemd/system/demo.service").write_text(
+            "[Unit]\nDescription=demo\n[Service]\nExecStart=/bin/true\n"
+            "[Install]\nWantedBy=multi-user.target\n", encoding="utf-8")
+        (cat / "meta.json").write_text(json.dumps({
+            "enabledUnits": ["demo.service"],
+            "etcFiles": ["thing.conf", "systemd/system/demo.service"]}), encoding="utf-8")
+        return cat
+
+    def test_alt_root_applies_without_root_and_touches_nothing_else(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cat = self._cat(tmp)
+            home = Path(tmp) / "home"; home.mkdir()
+            alt = Path(tmp) / "root"
+            engine.FAILURES.clear()
+            actions = engine.restore_system(cat, home, False, True, str(alt))
+            self.assertTrue((alt / "etc/thing.conf").is_file(), actions)
+            self.assertEqual((alt / "etc/thing.conf").read_text(encoding="utf-8"), "x=1\n")
+            self.assertTrue((alt / "etc/systemd/system/demo.service").is_file())
+            # enabled via systemctl --root, so the wants symlink exists
+            wants = alt / "etc/systemd/system/multi-user.target.wants/demo.service"
+            self.assertTrue(wants.is_symlink(), sorted(p.name for p in alt.rglob("*")))
+            self.assertEqual(engine.FAILURES, [])
+        engine.FAILURES.clear()
+
+    def test_units_that_did_not_enable_are_reported_not_swallowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            alt = Path(tmp) / "root"
+            (alt / "etc/systemd/system").mkdir(parents=True)
+            engine.FAILURES.clear()
+            out = engine.verify_units(["nope.service"], str(alt), True)
+            self.assertTrue(any("no unit file here" in x for x in out), out)
+            self.assertEqual(len(engine.FAILURES), 1)
+        engine.FAILURES.clear()
+
+    def test_static_units_are_not_treated_as_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            alt = Path(tmp) / "root"
+            d = alt / "usr/lib/systemd/system"; d.mkdir(parents=True)
+            # no [Install] section => static, cannot be enabled, not a failure
+            (d / "st.service").write_text("[Unit]\nDescription=s\n[Service]\nExecStart=/bin/true\n",
+                                          encoding="utf-8")
+            engine.FAILURES.clear()
+            out = engine.verify_units(["st.service"], str(alt), True)
+            self.assertEqual(engine.FAILURES, [], out)
+        engine.FAILURES.clear()
+
+    def test_without_allow_system_nothing_is_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cat = self._cat(tmp)
+            home = Path(tmp) / "home"; home.mkdir()
+            alt = Path(tmp) / "root"
+            actions = engine.restore_system(cat, home, False, False, str(alt))
+            self.assertFalse(alt.exists(), actions)
+            self.assertTrue(any("NOT applied" in a for a in actions), actions)
+
+    def test_upgrade_failure_aborts_before_any_category(self):
+        import types
+        from types import SimpleNamespace
+        import io, contextlib
+        real_run, real_open, real_manifest = engine.run, engine.open_imprint, engine.load_manifest
+        fake_root = Path(tempfile.mkdtemp())
+        (fake_root / "categories/packages").mkdir(parents=True)
+        engine.open_imprint = lambda a, b: fake_root
+        engine.load_manifest = lambda r: {"kind": engine.KIND, "home": "/home/x",
+                                          "categories": {"packages": {}}}
+        touched = []
+        engine.run = lambda cmd, **kw: (touched.append(cmd),
+                                        types.SimpleNamespace(returncode=1, stdout="", stderr="boom"))[1]
+        real_restore = engine.restore_category
+        engine.restore_category = lambda *a, **k: ["SHOULD NOT RUN"]
+        buf = io.StringIO()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                args = SimpleNamespace(archive=tmp, only="packages", dry_run=False, upgrade=True)
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                    rc = engine.cmd_restore(args)
+        finally:
+            engine.run, engine.open_imprint, engine.load_manifest = real_run, real_open, real_manifest
+            engine.restore_category = real_restore
+            engine.FAILURES.clear()
+        report = json.loads(buf.getvalue())
+        self.assertEqual(rc, 1)
+        self.assertFalse(report["ok"])
+        self.assertIn("omarchy update failed", report["upgrade"])
+        # Arch has no partial upgrades: nothing may be installed onto a failed one.
+        self.assertEqual(report["categories"], {})
+
+
 if __name__ == "__main__":
     unittest.main()

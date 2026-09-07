@@ -2615,7 +2615,8 @@ def restore_toolchains(cat_dir: Path, home: Path, old_home: str, undo: Path, dry
     return actions
 
 
-def restore_system(cat_dir: Path, home: Path, dry: bool, allow: bool) -> list[str]:
+def restore_system(cat_dir: Path, home: Path, dry: bool, allow: bool,
+                   system_root: str = "/") -> list[str]:
     meta_path = cat_dir / "meta.json"
     if not meta_path.is_file():
         return []
@@ -2635,13 +2636,17 @@ def restore_system(cat_dir: Path, home: Path, dry: bool, allow: bool) -> list[st
             rel = path.relative_to(etc_root)
             if not dry:
                 copy_file(path, stage_etc / rel)
-            installs.append((path, Path("/etc") / rel))
-            lines.append(f'install -Dm644 {shlex.quote(str(stage_etc / rel))} /etc/{rel}')
+            etc_target = Path(system_root) / "etc" / rel
+            installs.append((path, etc_target))
+            lines.append(f'install -Dm644 {shlex.quote(str(stage_etc / rel))} {shlex.quote(str(etc_target))}')
     units = [u for u in (meta.get("enabledUnits") or []) if safe_segment(u)]
-    if installs:
+    alt_root = system_root not in ("", "/")
+    root_flag = f" --root={shlex.quote(system_root)}" if alt_root else ""
+    if installs and not alt_root:
         lines.append("systemctl daemon-reload")
     for unit in units:
-        lines.append(f"systemctl enable {shlex.quote(unit)} || echo \"could not enable {unit}\" >&2")
+        lines.append(f"systemctl{root_flag} enable {shlex.quote(unit)} "
+                     f"|| echo \"could not enable {unit}\" >&2")
     summary = [f"{len(installs)} /etc files, {len(units)} system units to enable"]
     if dry:
         return summary + [f"install /etc/{p.relative_to(etc_root)}" for p, _ in installs[:8]] + \
@@ -2657,12 +2662,269 @@ def restore_system(cat_dir: Path, home: Path, dry: bool, allow: bool) -> list[st
             "system layer NOT applied: needs root, pass --allow-system to run it",
             f"review the generated script at {script}",
         ]
+    if alt_root:
+        # Applying into an alternate root needs no privileges and cannot touch
+        # the running system, which is how this path gets verified.
+        Path(system_root).mkdir(parents=True, exist_ok=True)
+        proc = run(["bash", str(script)])
+        if proc.returncode != 0:
+            return summary + [fail(f"system layer failed against {system_root}: "
+                                   + (proc.stderr or proc.stdout).strip()[:400])]
+        return summary + [f"system layer applied into {system_root}"] + \
+            verify_units(units, system_root, alt_root)
     if run(["sudo", "-n", "true"]).returncode != 0:
         return summary + [fail(f"no non-interactive sudo; run it yourself: sudo {script}")]
     proc = run(["sudo", "-n", "bash", str(script)])
+    if proc.returncode != 0:
+        return summary + [fail("system layer failed: " + (proc.stderr or proc.stdout).strip()[:400])]
+    return summary + ["system layer applied"] + verify_units(units, system_root, alt_root)
+
+
+def verify_units(units: list[str], system_root: str, alt_root: bool) -> list[str]:
+    """Check what actually ended up enabled.
+
+    The generated script logs an enable failure to stderr and carries on, so
+    without this a restore onto a box missing the packages reports success while
+    leaving every service off. `systemctl is-enabled` is the only query that
+    honours --root (cat does not), and its output distinguishes a missing unit
+    from a present-but-disabled one.
+    """
+    root_flag = [f"--root={system_root}"] if alt_root else []
+    # States that mean "nothing more to do": static and indirect units cannot be
+    # enabled by name and are not a failure.
+    fine = {"enabled", "enabled-runtime", "static", "indirect", "alias", "generated", "transient"}
+    missing, not_enabled = [], []
+    for unit in units:
+        proc = run(["systemctl", *root_flag, "is-enabled", unit])
+        state = (proc.stdout or proc.stderr).strip().splitlines()
+        state = state[-1].strip() if state else ""
+        if state == "not-found":
+            missing.append(unit)
+        elif state not in fine:
+            not_enabled.append(f"{unit} ({state or 'unknown'})")
+    out = []
+    if missing:
+        out.append(fail(
+            f"{len(missing)} units have no unit file here, so they were not enabled "
+            f"(is the package installed?): " + ", ".join(missing[:6])
+            + (f" ... +{len(missing) - 6} more" if len(missing) > 6 else "")))
+    if not_enabled:
+        out.append(fail(
+            f"{len(not_enabled)} units are present but did not enable: "
+            + ", ".join(not_enabled[:6])
+            + (f" ... +{len(not_enabled) - 6} more" if len(not_enabled) > 6 else "")))
+    if not missing and not not_enabled and units:
+        out.append(f"all {len(units)} system units verified enabled")
+    return out
+
+
+def restore_identity(cat_dir: Path, dry: bool, confirm_host: str | None) -> list[str]:
+    meta_path = cat_dir / "meta.json"
+    if not meta_path.is_file():
+        return []
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    wanted = meta.get("hostname")
+    if not wanted:
+        return []
+    if dry:
+        return [f"hostnamectl set-hostname {wanted}"]
+    if confirm_host != wanted:
+        return [f"skipped hostname {wanted} (pass --confirm-hostname {wanted})"]
+    proc = run(["hostnamectl", "set-hostname", wanted])
     if proc.returncode == 0:
-        return summary + ["system layer applied"]
-    return summary + [fail("system layer failed: " + (proc.stderr or proc.stdout).strip()[:400])]
+        return ["hostname ok"]
+    return [fail("hostname failed: " + (proc.stderr or proc.stdout).strip()[:200])]
+
+
+
+def restore_scripts(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool) -> list[str]:
+    actions = restore_file_tree(cat_dir, home, old_home, undo, dry)
+    meta_path = cat_dir / "meta.json"
+    if not meta_path.is_file():
+        return actions
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    for entry in meta.get("links") or []:
+        link_rel, target_rel = entry.get("link") or "", entry.get("target") or ""
+        if not link_rel or not target_rel:
+            continue
+        try:
+            link = contained(home, (home / link_rel).parent) / Path(link_rel).name
+            target = contained(home, home / target_rel)
+        except UnsafePath:
+            actions.append(fail(f"refused link outside home: {link_rel!r} -> {target_rel!r}"))
+            continue
+        if dry:
+            actions.append(f"ln -s ~/{target_rel} ~/{link_rel}")
+            continue
+        if not target.exists():
+            actions.append(fail(
+                f"~/{link_rel} not linked: ~/{target_rel} is missing"
+                + (f" (restore Projects, or clone {entry['url']})" if entry.get("url") else "")
+            ))
+            continue
+        if link.exists() or link.is_symlink():
+            backup_existing(link, undo, home)
+            if link.is_dir() and not link.is_symlink():
+                shutil.rmtree(link)
+            else:
+                link.unlink()
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(target)
+        actions.append(f"linked ~/{link_rel} -> ~/{target_rel}")
+    return actions
+
+
+def restore_projects(cat_dir: Path, home: Path, dry: bool) -> list[str]:
+    meta_path = cat_dir / "meta.json"
+    if not meta_path.is_file():
+        return []
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    actions = []
+    for repo in meta.get("repos") or []:
+        rel = repo.get("path") or ""
+        url = repo.get("url") or ""
+        if not rel:
+            continue
+        try:
+            target = contained(home, home / rel)
+        except UnsafePath:
+            actions.append(fail(f"refused project path outside home: {rel!r}"))
+            continue
+        branch = repo.get("branch") or ""
+        if not url:
+            actions.append(f"skip {rel}: no git remote, nothing to clone from")
+            continue
+        if dry:
+            actions.append(f"git clone {url} ~/{rel}" + (f" -b {branch}" if branch else ""))
+            if repo.get("patch"):
+                actions.append(f"  then git apply {len(repo.get('changed') or [])} uncommitted files")
+            continue
+        if target.exists():
+            actions.append(f"{rel} already present, left alone")
+        else:
+            cmd = ["git", "clone"]
+            if branch:
+                cmd += ["-b", branch]
+            cmd += [url, str(target)]
+            proc = run(cmd)
+            if proc.returncode != 0:
+                actions.append(fail(f"clone failed {rel}: " + (proc.stderr or proc.stdout).strip()[:200]))
+                continue
+            actions.append(f"cloned {rel} from source")
+        rel_patch = repo.get("patch") or ""
+        if rel_patch:
+            try:
+                patch = contained(cat_dir, cat_dir / rel_patch)
+            except UnsafePath:
+                actions.append(fail(f"refused patch path {rel_patch!r}"))
+                continue
+            if patch.is_file():
+                proc = run(["git", "-C", str(target), "apply", "--3way", str(patch)])
+                if proc.returncode == 0:
+                    actions.append(f"reapplied uncommitted work to {rel}")
+                else:
+                    actions.append(fail(f"patch failed for {rel}: " + (proc.stderr or proc.stdout).strip()[:200]))
+    for rel in meta.get("withoutRemote") or []:
+        actions.append(f"WARNING {rel} has no remote and was not captured as content")
+    return actions
+
+
+def restore_toolchains(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool) -> list[str]:
+    actions = restore_file_tree(cat_dir, home, old_home, undo, dry)
+    meta_path = cat_dir / "meta.json"
+    if not meta_path.is_file():
+        return actions
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    steps: list[list[str]] = []
+    if meta.get("mise"):
+        steps.append(["mise", "install", "--yes"])
+    for crate in meta.get("cargo") or []:
+        steps.append(["cargo", "install", crate])
+    for tool in meta.get("go") or []:
+        module = tool.get("module")
+        if module:
+            steps.append(["go", "install", f"{module}@latest"])
+    for pkg in meta.get("npmGlobal") or []:
+        steps.append(["npm", "install", "-g", pkg])
+    if dry:
+        return actions + [" ".join(step) for step in steps]
+    for step in steps:
+        if not shutil.which(step[0]):
+            actions.append(fail(f"{step[0]} not installed, skipped: " + " ".join(step)))
+            continue
+        proc = run(step)
+        if proc.returncode == 0:
+            actions.append("ok: " + " ".join(step))
+        else:
+            actions.append(fail("failed: " + " ".join(step) + " -- " + (proc.stderr or proc.stdout).strip()[:200]))
+    for name in meta.get("unresolvedGo") or []:
+        actions.append(f"WARNING go tool {name} has no resolvable module path")
+    return actions
+
+
+def restore_system(cat_dir: Path, home: Path, dry: bool, allow: bool,
+                   system_root: str = "/") -> list[str]:
+    meta_path = cat_dir / "meta.json"
+    if not meta_path.is_file():
+        return []
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    etc_root = cat_dir / "etc"
+    # The archive is unpacked into a temp dir that disappears when restore
+    # returns, so stage the payload somewhere the user can actually review and
+    # re-run later.
+    stage = home / ".local/state/imprint" / f"system-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    stage_etc = stage / "etc"
+    lines = ["#!/usr/bin/env bash", "set -euo pipefail", "# Written by imprint. Review before running."]
+    installs = []
+    if etc_root.is_dir():
+        for path in sorted(etc_root.rglob("*")):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(etc_root)
+            if not dry:
+                copy_file(path, stage_etc / rel)
+            etc_target = Path(system_root) / "etc" / rel
+            installs.append((path, etc_target))
+            lines.append(f'install -Dm644 {shlex.quote(str(stage_etc / rel))} {shlex.quote(str(etc_target))}')
+    units = [u for u in (meta.get("enabledUnits") or []) if safe_segment(u)]
+    alt_root = system_root not in ("", "/")
+    root_flag = f" --root={shlex.quote(system_root)}" if alt_root else ""
+    if installs and not alt_root:
+        lines.append("systemctl daemon-reload")
+    for unit in units:
+        lines.append(f"systemctl{root_flag} enable {shlex.quote(unit)} "
+                     f"|| echo \"could not enable {unit}\" >&2")
+    summary = [f"{len(installs)} /etc files, {len(units)} system units to enable"]
+    if dry:
+        return summary + [f"install /etc/{p.relative_to(etc_root)}" for p, _ in installs[:8]] + \
+               ([f"... {len(installs) - 8} more"] if len(installs) > 8 else []) + \
+               [f"systemctl enable {u}" for u in units[:8]] + \
+               ([f"... {len(units) - 8} more units"] if len(units) > 8 else [])
+    stage.mkdir(parents=True, exist_ok=True)
+    script = stage / "restore-system.sh"
+    script.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.chmod(script, 0o755)
+    if not allow:
+        return summary + [
+            "system layer NOT applied: needs root, pass --allow-system to run it",
+            f"review the generated script at {script}",
+        ]
+    if alt_root:
+        # Applying into an alternate root needs no privileges and cannot touch
+        # the running system, which is how this path gets verified.
+        Path(system_root).mkdir(parents=True, exist_ok=True)
+        proc = run(["bash", str(script)])
+        if proc.returncode != 0:
+            return summary + [fail(f"system layer failed against {system_root}: "
+                                   + (proc.stderr or proc.stdout).strip()[:400])]
+        return summary + [f"system layer applied into {system_root}"] + \
+            verify_units(units, system_root, alt_root)
+    if run(["sudo", "-n", "true"]).returncode != 0:
+        return summary + [fail(f"no non-interactive sudo; run it yourself: sudo {script}")]
+    proc = run(["sudo", "-n", "bash", str(script)])
+    if proc.returncode != 0:
+        return summary + [fail("system layer failed: " + (proc.stderr or proc.stdout).strip()[:400])]
+    return summary + ["system layer applied"] + verify_units(units, system_root, alt_root)
 
 
 def restore_category(
@@ -2696,7 +2958,8 @@ def restore_category(
     if cid == "toolchains":
         return restore_toolchains(cat_dir, home, old_home, undo, dry)
     if cid == "system":
-        return restore_system(cat_dir, home, dry, bool(getattr(args, "allow_system", False)))
+        return restore_system(cat_dir, home, dry, bool(getattr(args, "allow_system", False)),
+                              getattr(args, "system_root", "/") or "/")
     actions = restore_file_tree(cat_dir, home, old_home, undo, dry)
     if cid == "secrets" and not dry:
         ssh = home / ".ssh"
@@ -3249,6 +3512,8 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("--only", default="")
     restore.add_argument("--dry-run", action="store_true")
     restore.add_argument("--confirm-hostname", default="")
+    restore.add_argument("--system-root", default="/",
+                         help="apply the system layer into this root instead of / (for verifying)")
     restore.add_argument("--allow-system", action="store_true",
                          help="apply the system layer (/etc + systemctl enable) with sudo")
     restore.add_argument("--upgrade", action="store_true",
