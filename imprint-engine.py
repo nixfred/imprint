@@ -2235,14 +2235,72 @@ def human_size(n: int) -> str:
     return f"{n} B"
 
 
+def suggest_under_home(dest: Path) -> Path | None:
+    """/home/google/imprints is almost always a slip for ~/google/imprints --
+    a removable disk or an rclone mount lives under the home directory, and
+    one deleted character in the prompt moves it a level up."""
+    home = Path.home()
+    for i in range(1, len(dest.parts)):
+        candidate = home.joinpath(*dest.parts[i:])
+        probe = candidate
+        while probe != home and not probe.exists():
+            probe = probe.parent
+        if probe != home and probe.is_dir():
+            return candidate
+    return None
+
+
+def check_dest(dest: Path) -> None:
+    """Fail before collecting, not after. A save spends minutes packing
+    hundreds of megabytes; finding out at the end that the destination was
+    never writable throws all of that away."""
+    parent = dest.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        deepest = parent
+        while not deepest.exists() and deepest != deepest.parent:
+            deepest = deepest.parent
+        lines = [f"cannot create {parent}: {exc.strerror or exc}",
+                 f"the deepest directory that exists is {deepest}"]
+        hint = suggest_under_home(dest)
+        if hint is not None:
+            lines.append(f"did you mean {hint} ?")
+        raise SystemExit("\n".join(lines))
+    if dest.exists():
+        if dest.is_dir():
+            raise SystemExit(f"{dest} is a directory, not an archive path")
+        if not os.access(dest, os.W_OK):
+            raise SystemExit(f"cannot overwrite {dest}: permission denied")
+    probe = parent / f".imprint-write-test-{os.getpid()}"
+    try:
+        probe.touch()
+    except OSError as exc:
+        raise SystemExit(f"cannot write into {parent}: {exc.strerror or exc}")
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+
+
 def write_archive(staging: Path, dest: Path) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    check_dest(dest)
     tmp = dest.with_suffix(dest.suffix + ".partial")
-    if tmp.exists():
-        tmp.unlink()
-    with tarfile.open(tmp, "w:zst") as tar:
-        tar.add(staging, arcname=".")
-    tmp.replace(dest)
+    try:
+        if tmp.exists():
+            tmp.unlink()
+        with tarfile.open(tmp, "w:zst") as tar:
+            tar.add(staging, arcname=".")
+        tmp.replace(dest)
+    except OSError as exc:
+        # A half-written archive on a slow mount is worse than none: it looks
+        # like a backup. Take it with us on the way out.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise SystemExit(f"cannot write {dest}: {exc.strerror or exc}")
 
 
 def extract_archive(archive: Path, dest: Path) -> None:
@@ -2353,6 +2411,7 @@ def cmd_save(args) -> int:
     dest = Path(args.output).expanduser() if args.output else default_archive_path(home, hostname())
     if dest.suffixes[-2:] != [".tar", ".zst"] and not str(dest).endswith(".tar.zst"):
         dest = dest.with_name(dest.name + ".tar.zst") if dest.suffix == "" else dest
+    check_dest(dest)
     with tempfile.TemporaryDirectory(prefix="imprint-") as tmp:
         staging = Path(tmp) / "imprint"
         staging.mkdir()
@@ -4905,4 +4964,17 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.stderr.write("\ncancelled\n")
+        sys.exit(130)
+    except BrokenPipeError:
+        sys.exit(0)
+    except OSError as exc:
+        # Anything the operating system refuses -- a full disk, a mount that
+        # went away, a directory nobody may write to -- reads as a sentence,
+        # not as a traceback.
+        where = f": {exc.filename}" if exc.filename else ""
+        sys.stderr.write(f"imprint: {exc.strerror or exc}{where}\n")
+        sys.exit(1)

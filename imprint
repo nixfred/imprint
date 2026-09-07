@@ -194,6 +194,40 @@ pick_archive() {
   fi
 }
 
+# A destination is checked here, at the prompt, because that is the only
+# moment the path is still cheap to fix -- one dropped character sends a save
+# to /home/google instead of ~/google, and the old code only found out after
+# packing half a gigabyte. Prints the problem and returns 0 when there is one.
+dest_problem() {
+  local path=$1 dir deepest rest
+  dir=$(dirname -- "$path")
+  if [[ -e $path && -d $path ]]; then
+    printf '%s is a directory, not an archive path' "$path"
+    return 0
+  fi
+  if ! mkdir -p -- "$dir" 2>/dev/null; then
+    deepest=$dir
+    while [[ ! -d $deepest && $deepest != / && $deepest != . ]]; do
+      deepest=$(dirname -- "$deepest")
+    done
+    printf 'cannot create %s (the deepest directory that exists is %s)' "$dir" "$deepest"
+    rest=${path#/}
+    while [[ $rest == */* ]]; do
+      if [[ -d $HOME/${rest%%/*} ]]; then
+        printf ' -- did you mean %s ?' "$HOME/$rest"
+        break
+      fi
+      rest=${rest#*/}
+    done
+    return 0
+  fi
+  if [[ ! -w $dir ]]; then
+    printf '%s is not writable' "$dir"
+    return 0
+  fi
+  return 1
+}
+
 confirm() {
   local prompt=$1 ans
   [[ -t 0 ]] || return 1
@@ -221,9 +255,14 @@ do_save() {
     mkdir -p "$HOME/imprints"
     output="$HOME/imprints/imprint-${host}-$(date +%Y%m%d-%H%M).tar.zst"
     if [[ -t 0 ]]; then
-      local typed
-      printf '  %sWrite archive to%s\n' "$IMP_BOLD" "$IMP_RESET"
-      read -r -e -i "$output" typed </dev/tty && [[ -n $typed ]] && output=$typed
+      local typed problem attempt
+      for attempt in 1 2 3; do
+        printf '  %sWrite archive to%s\n' "$IMP_BOLD" "$IMP_RESET"
+        read -r -e -i "$output" typed </dev/tty || break
+        [[ -n $typed ]] && output=$typed
+        problem=$(dest_problem "$output") || break
+        warn "$problem"
+      done
     fi
   fi
   [[ -n $output ]] || die "no output path"

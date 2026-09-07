@@ -1507,5 +1507,84 @@ class NarrowedRestoreTests(unittest.TestCase):
             self.assertEqual(done, [".config/omarchy/other.json"])
 
 
+class DestinationTests(unittest.TestCase):
+    def test_unwritable_parent_fails_before_collecting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wall = Path(tmp) / "wall"
+            wall.mkdir(mode=0o500)
+            try:
+                with self.assertRaises(SystemExit) as caught:
+                    engine.check_dest(wall / "sub" / "a.tar.zst")
+                self.assertIn("cannot create", str(caught.exception))
+                self.assertIn(str(wall), str(caught.exception))
+            finally:
+                wall.chmod(0o700)
+
+    def test_writable_parent_is_created_and_left_clean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "imprints" / "a.tar.zst"
+            engine.check_dest(dest)
+            self.assertTrue(dest.parent.is_dir())
+            self.assertEqual(list(dest.parent.iterdir()), [])
+
+    def test_directory_in_the_way_is_named(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "a.tar.zst"
+            dest.mkdir()
+            with self.assertRaises(SystemExit) as caught:
+                engine.check_dest(dest)
+            self.assertIn("is a directory", str(caught.exception))
+
+    def test_suggests_the_same_path_under_home(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home" / "pi"
+            (home / "google").mkdir(parents=True)
+            real_home = engine.Path.home
+            engine.Path.home = staticmethod(lambda: home)
+            try:
+                hint = engine.suggest_under_home(
+                    Path("/home/google/imprints/a.tar.zst"))
+            finally:
+                engine.Path.home = real_home
+            self.assertEqual(hint, home / "google/imprints/a.tar.zst")
+
+    def test_no_suggestion_when_nothing_matches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home" / "pi"
+            home.mkdir(parents=True)
+            real_home = engine.Path.home
+            engine.Path.home = staticmethod(lambda: home)
+            try:
+                self.assertIsNone(
+                    engine.suggest_under_home(Path("/mnt/usb/a.tar.zst")))
+            finally:
+                engine.Path.home = real_home
+
+    def test_partial_archive_is_removed_when_the_write_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            staging = Path(tmp) / "staging"
+            staging.mkdir()
+            (staging / "manifest.json").write_text("{}", encoding="utf-8")
+            dest = Path(tmp) / "out" / "a.tar.zst"
+            real_open = engine.tarfile.open
+
+            def explode(name, mode="r", *a, **kw):
+                handle = real_open(name, mode, *a, **kw)
+                if "w" in mode:
+                    handle.close()
+                    raise OSError(28, "No space left on device")
+                return handle
+
+            engine.tarfile.open = explode
+            try:
+                with self.assertRaises(SystemExit) as caught:
+                    engine.write_archive(staging, dest)
+            finally:
+                engine.tarfile.open = real_open
+            self.assertIn("No space left on device", str(caught.exception))
+            self.assertFalse(dest.exists())
+            self.assertEqual(list(dest.parent.iterdir()), [])
+
+
 if __name__ == "__main__":
     unittest.main()
