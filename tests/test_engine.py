@@ -1756,5 +1756,97 @@ class VersionTests(unittest.TestCase):
         self.assertIn('imprint = "before 1.0.0"', brief)
 
 
+
+class ShellSelectionTests(unittest.TestCase):
+    """The picker's within-category choices have to survive the trip from the
+    shell wrapper to the engine. They used to be dropped on the floor."""
+
+    STUB = '''#!/usr/bin/env python3
+import json, sys, os
+cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+log = os.environ["IMPRINT_ARGV_LOG"]
+with open(log, "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(sys.argv[1:]) + "\\n")
+if "--select" in sys.argv:
+    spec = json.load(open(sys.argv[sys.argv.index("--select") + 1]))
+    with open(log + ".select", "a", encoding="utf-8") as fh:
+        fh.write(json.dumps([cmd, spec]) + "\\n")
+if cmd == "pick":
+    json.dump({"categories": ["packages", "themes"],
+               "subselections": {"packages": ["ripgrep", "fd"]}}, sys.stdout)
+    sys.stdout.write("\\n")
+elif cmd == "info":
+    json.dump({"categories": {"packages": {}, "themes": {}}}, sys.stdout)
+elif cmd in ("verify", "preview"):
+    sys.stdout.write("ok\\n")
+sys.exit(0)
+'''
+
+    def run_imprint(self, tmp, *argv):
+        import pty, subprocess, threading
+        log = Path(tmp) / "argv.log"
+        stub = Path(tmp) / "imprint-engine.py"
+        stub.write_text(self.STUB, encoding="utf-8")
+        stub.chmod(0o755)
+        script = Path(tmp) / "imprint"
+        shutil.copy2(ROOT / "imprint", script)
+        env = dict(os.environ, IMPRINT_ARGV_LOG=str(log))
+        # The picker only runs on a terminal, so give the script a real one.
+        master, slave = pty.openpty()
+        drain = threading.Thread(target=lambda: self._drain(master), daemon=True)
+        drain.start()
+        try:
+            subprocess.run([str(script), *argv], stdin=slave, stdout=slave,
+                           stderr=slave, env=env, timeout=60)
+        finally:
+            os.close(slave)
+        read = lambda f: [json.loads(line) for line in
+                          f.read_text(encoding="utf-8").splitlines()] if f.exists() else []
+        return read(log), read(Path(str(log) + ".select"))
+
+    @staticmethod
+    def _drain(master):
+        try:
+            while os.read(master, 4096):
+                pass
+        except OSError:
+            pass
+
+    def select_arg(self, call):
+        return call[call.index("--select") + 1] if "--select" in call else None
+
+    def test_save_hands_the_engine_what_the_submenu_picked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out.tar.zst"
+            calls, selects = self.run_imprint(tmp, "save", "-o", str(out))
+            save = [c for c in calls if c and c[0] == "save"]
+            self.assertTrue(save, f"engine save was never called: {calls}")
+            self.assertIn("--select", save[0],
+                          "the submenu's choices never reached the engine")
+            self.assertIn("--only", save[0], "the chosen categories were lost")
+            self.assertEqual("packages,themes", save[0][save[0].index("--only") + 1])
+            picked = [spec for cmd, spec in selects if cmd == "save"]
+            self.assertEqual([{"packages": ["ripgrep", "fd"]}],
+                             [s["subselections"] for s in picked])
+
+    def test_restore_hands_the_engine_what_the_submenu_picked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "some.tar.zst"
+            archive.write_bytes(b"x")
+            calls, selects = self.run_imprint(tmp, "restore", str(archive), "--dry-run")
+            restore = [c for c in calls if c and c[0] == "restore"]
+            self.assertTrue(restore, f"engine restore was never called: {calls}")
+            self.assertIn("--select", restore[0],
+                          "the submenu's choices never reached the engine")
+            self.assertEqual("packages,themes", restore[0][restore[0].index("--only") + 1])
+            # The preview has to narrow the same way, or it promises more than
+            # the restore delivers.
+            for want in ("restore", "preview"):
+                picked = [spec for cmd, spec in selects if cmd == want]
+                self.assertEqual([{"packages": ["ripgrep", "fd"]}],
+                                 [s["subselections"] for s in picked],
+                                 f"{want} did not get the submenu's choices")
+
+
 if __name__ == "__main__":
     unittest.main()

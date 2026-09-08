@@ -168,18 +168,26 @@ ids_from_archive_defaults() {
 }
 
 SELECTION_FILE=""
+SELECTED_CATEGORIES=""
 
 # Our own picker: space toggles, space on a row with a submenu walks into it,
 # and the top row selects everything. gum choose can do none of that.
+#
+# Both halves of the answer come back in globals. The categories used to travel
+# on stdout, which meant callers ran this in $(...) -- and the SELECTION_FILE
+# assignment then died with the subshell, so every submenu choice was silently
+# discarded and the engine captured or restored everything. Never call this in
+# a command substitution.
 choose_categories() {
   local header=$1
   local archive=${2:-}
+  SELECTED_CATEGORIES=""
   SELECTION_FILE=$(mktemp -t imprint-selection-XXXXXX.json)
   local args=(pick --header "$header" --action "${PICK_ACTION:-Start backup}")
   [[ -n $archive ]] && args+=(--archive "$archive")
   engine "${args[@]}" > "$SELECTION_FILE" || { rm -f "$SELECTION_FILE"; SELECTION_FILE=""; return 1; }
-  python3 -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["categories"]))' \
-    "$SELECTION_FILE"
+  SELECTED_CATEGORIES=$(python3 -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["categories"]))' \
+    "$SELECTION_FILE") || { rm -f "$SELECTION_FILE"; SELECTION_FILE=""; return 1; }
 }
 
 pick_archive() {
@@ -294,7 +302,9 @@ do_save() {
   banner
   if [[ -z $only && $all -eq 0 ]]; then
     if (( HAVE_GUM )); then
-      PICK_ACTION="Start backup" only=$(choose_categories "What should this imprint carry?") || die "cancelled"
+      PICK_ACTION="Start backup"
+      choose_categories "What should this imprint carry?" || die "cancelled"
+      only=$SELECTED_CATEGORIES
     else
       only=$(default_selected)
       say "No terminal for the picker; using the default categories."
@@ -348,7 +358,9 @@ do_restore() {
   say "Archive $archive"
   if [[ -z $only ]]; then
     if (( HAVE_GUM )); then
-      PICK_ACTION="Review changes" only=$(choose_categories "What should land on this machine?" "$archive") || die "cancelled"
+      PICK_ACTION="Review changes"
+      choose_categories "What should land on this machine?" "$archive" || die "cancelled"
+      only=$SELECTED_CATEGORIES
     else
       only=$(ids_from_archive_defaults "$archive")
       say "No terminal for the picker; using this archive's default categories."
