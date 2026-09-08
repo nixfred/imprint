@@ -1734,5 +1734,28 @@ class InputPathTests(unittest.TestCase):
             self.assertIn("is a directory, not a file", str(caught.exception))
 
 
+class ToolchainTests(unittest.TestCase):
+    def test_run_ok_missing_binary_returns_empty(self):
+        self.assertEqual(engine.run_ok(["definitely-not-a-real-binary-xyz"]), "")
+
+    def test_collect_toolchains_without_binaries_still_valid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"; home.mkdir()
+            cat = Path(tmp) / "cat"; cat.mkdir()
+            old = os.environ.get("PATH")
+            os.environ["PATH"] = str(Path(tmp) / "emptybin")
+            try:
+                meta = engine.collect_toolchains(cat, home)
+            finally:
+                if old is None: os.environ.pop("PATH", None)
+                else: os.environ["PATH"] = old
+            self.assertIsInstance(meta, dict)
+            self.assertEqual(meta["mise"], [])
+            self.assertEqual(meta["cargo"], [])
+            self.assertEqual(meta["npmGlobal"], [])
+            self.assertIn("cargo", meta["missingBinaries"])
+            self.assertIn("npm", meta["missingBinaries"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -478,7 +478,10 @@ def ensure_session_env() -> None:
 
 
 def run_ok(cmd: list[str], cwd: Path | None = None) -> str:
-    proc = run(cmd, cwd=cwd)
+    try:
+        proc = run(cmd, cwd=cwd)
+    except FileNotFoundError:
+        return ""
     if proc.returncode != 0:
         return ""
     return proc.stdout
@@ -1950,15 +1953,22 @@ def collect_toolchains(cat_dir: Path, home: Path) -> dict:
         noted = copy_into_category(cat_dir, home / rel, home)
         if noted:
             files.append(noted)
+    missing = []
     mise = []
-    for line in run_ok(["mise", "ls", "--current"]).splitlines():
-        parts = line.split()
-        if len(parts) >= 2:
-            mise.append({"tool": parts[0], "version": parts[1]})
+    if shutil.which("mise"):
+        for line in run_ok(["mise", "ls", "--current"]).splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                mise.append({"tool": parts[0], "version": parts[1]})
+    else:
+        missing.append("mise")
     cargo = []
-    for line in run_ok(["cargo", "install", "--list"]).splitlines():
-        if line and not line.startswith(" ") and line.endswith(":"):
-            cargo.append(line.rstrip(":").split()[0])
+    if shutil.which("cargo"):
+        for line in run_ok(["cargo", "install", "--list"]).splitlines():
+            if line and not line.startswith(" ") and line.endswith(":"):
+                cargo.append(line.rstrip(":").split()[0])
+    else:
+        missing.append("cargo")
     go_tools = []
     gobin = home / "go/bin"
     if gobin.is_dir():
@@ -1968,10 +1978,13 @@ def collect_toolchains(cat_dir: Path, home: Path) -> dict:
             module = go_module_for(binary)
             go_tools.append({"name": binary.name, "module": module})
     npm = []
-    for line in run_ok(["npm", "ls", "-g", "--depth=0", "--parseable"]).splitlines():
-        name = Path(line).name
-        if name and name != "lib" and name != "npm":
-            npm.append(name)
+    if shutil.which("npm"):
+        for line in run_ok(["npm", "ls", "-g", "--depth=0", "--parseable"]).splitlines():
+            name = Path(line).name
+            if name and name != "lib" and name != "npm":
+                npm.append(name)
+    else:
+        missing.append("npm")
     meta = {
         "files": files,
         "mise": mise,
@@ -1980,6 +1993,8 @@ def collect_toolchains(cat_dir: Path, home: Path) -> dict:
         "npmGlobal": npm,
         "unresolvedGo": sorted(t["name"] for t in go_tools if not t["module"]),
     }
+    if missing:
+        meta["missingBinaries"] = missing
     write_json(cat_dir / "meta.json", meta)
     return meta
 
