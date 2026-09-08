@@ -101,8 +101,10 @@ the progress output match the rest of the desktop.
 imprint save                         # picker, writes ~/imprints/imprint-$host-$time.tar.zst
 imprint save --only look,bar,plugins
 imprint save --all -o /mnt/usb/dex.imprint.tar.zst
+imprint save --encrypt -o FILE       # encrypt the archive with age
 
 imprint restore FILE                 # picker of what is in that file
+imprint restore FILE --identity ~/.config/age/backup-key.txt   # decrypt an encrypted archive
 imprint restore FILE --only bar,plugins --dry-run
 imprint restore FILE --only identity --confirm-hostname dex
 imprint restore FILE --upgrade       # omarchy update -y first, abort if it fails
@@ -122,6 +124,37 @@ imprint list
 
 The archive is self-contained. On a fresh Omarchy install you can extract it
 and run `tool/imprint restore .` without installing anything first.
+
+## Encrypting archives
+
+An imprint carries configs, shell history and identity data, and it is often
+copied to a USB stick or relayed through a chat. `--encrypt` wraps the finished
+archive with [age](https://github.com/FiloSottile/age) so only the holder of
+the matching key can read it:
+
+```bash
+imprint save --encrypt -o ~/imprints/imprint-dex.tar.zst
+# writes imprint-dex.tar.zst.age and removes the plaintext
+
+imprint save --encrypt -r age1... -o FILE   # encrypt to a specific recipient
+imprint save --encrypt --keep-plaintext     # keep the .tar.zst alongside
+```
+
+The recipient is your explicit `-r`, or `~/.config/age/backup-key.pub` if it
+exists. With neither, save stops and says what to do:
+
+```
+no age recipient found; run age-keygen -o backup-key.txt
+```
+
+`imprint restore`, `info`, `plan`, `preview`, `verify` and `diff` all detect a
+`.tar.zst.age` and decrypt it with `~/.config/age/backup-key.txt` (or
+`--identity FILE` on restore) before doing their normal work. A missing key is
+a clean error, not a traceback.
+
+`age` is not a hard dependency — it is only needed when you use `--encrypt` or
+restore an encrypted archive. Install it with `pacman -S age` (or
+`mise use age`); `age-keygen` ships with it.
 
 ## What a run looks like
 

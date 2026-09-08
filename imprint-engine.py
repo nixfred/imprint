@@ -2478,9 +2478,66 @@ def load_manifest(root: Path) -> dict:
     return data
 
 
-def open_imprint(path: Path, tmp: Path) -> Path:
+def age_recipient(explicit: str) -> str:
+    """The age recipient to encrypt to: --recipient, else the default public
+    key. A missing recipient is a clean error, not a half-written archive."""
+    if explicit:
+        return explicit
+    pub = Path.home() / ".config/age/backup-key.pub"
+    if pub.is_file():
+        text = pub.read_text(encoding="utf-8").strip()
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("age1"):
+                return line
+        return text
+    raise SystemExit("no age recipient found; run age-keygen -o backup-key.txt "
+                     "(and put the public key at ~/.config/age/backup-key.pub)")
+
+
+def encrypt_archive(dest: Path, recipient: str, keep_plaintext: bool) -> Path:
+    """Encrypt a finished archive with age, returning the .age path. The
+    plaintext is removed unless keep_plaintext is set."""
+    if not shutil.which("age"):
+        raise SystemExit("age is required for --encrypt; install age "
+                         "(age-keygen ships with it)")
+    enc = Path(str(dest) + ".age")
+    proc = run(["age", "-r", recipient, "-o", str(enc), str(dest)])
+    if proc.returncode != 0:
+        raise SystemExit(f"cannot encrypt {dest}: "
+                         + (proc.stderr or proc.stdout).strip()[:300])
+    if not keep_plaintext:
+        dest.unlink()
+    return enc
+
+
+def decrypt_archive(archive: Path, tmp: Path, identity: str = "") -> Path:
+    """If `archive` is age-encrypted, decrypt it into `tmp` and return the
+    plaintext path; otherwise return `archive` unchanged."""
+    if archive.suffix != ".age":
+        return archive
+    if not shutil.which("age"):
+        raise SystemExit("this archive is age-encrypted and `age` is not "
+                         "installed; install age to decrypt it")
+    ident = Path(identity).expanduser() if identity else (
+        Path.home() / ".config/age/backup-key.txt")
+    if not ident.is_file():
+        raise SystemExit(f"cannot decrypt {archive}: no age identity at {ident}; "
+                         f"run age-keygen -o backup-key.txt and put the key at "
+                         f"~/.config/age/backup-key.txt")
+    plain = tmp / (archive.name[:-4] or "archive.tar.zst")
+    tmp.mkdir(parents=True, exist_ok=True)
+    proc = run(["age", "-d", "-i", str(ident), "-o", str(plain), str(archive)])
+    if proc.returncode != 0:
+        raise SystemExit(f"cannot decrypt {archive}: "
+                         + (proc.stderr or proc.stdout).strip()[:300])
+    return plain
+
+
+def open_imprint(path: Path, tmp: Path, identity: str = "") -> Path:
     if path.is_dir() and (path / "manifest.json").is_file():
         return path
+    path = decrypt_archive(path, tmp, identity)
     extract_archive(path, tmp)
     if (tmp / "manifest.json").is_file():
         return tmp
@@ -2562,6 +2619,7 @@ def cmd_save(args) -> int:
     if dest.suffixes[-2:] != [".tar", ".zst"] and not str(dest).endswith(".tar.zst"):
         dest = dest.with_name(dest.name + ".tar.zst") if dest.suffix == "" else dest
     check_dest(dest, create=not typed)
+    encrypt = bool(getattr(args, "encrypt", False))
     SKIPPED.clear()
     with tempfile.TemporaryDirectory(prefix="imprint-") as tmp:
         staging = Path(tmp) / "imprint"
@@ -2570,7 +2628,7 @@ def cmd_save(args) -> int:
         categories = collect_selected(staging, home, ids, progress)
         manifest = machine_facts()
         manifest["categories"] = {cid: strip_heavy(categories[cid]) for cid in ids}
-        manifest["archiveName"] = dest.name
+        manifest["archiveName"] = dest.name + (".age" if encrypt else "")
         # The archive says what it could not take. Nobody restoring it should
         # have to discover the gap by finding the file missing months later.
         if SKIPPED:
@@ -2581,6 +2639,9 @@ def cmd_save(args) -> int:
         copy_tool(staging)
         progress.update("writing the archive")
         write_archive(staging, dest)
+        if encrypt:
+            recipient = age_recipient(getattr(args, "recipient", "") or "")
+            dest = encrypt_archive(dest, recipient, bool(getattr(args, "keep_plaintext", False)))
         size_now = dest.stat().st_size
         progress.finish(f"Wrote {dest}",
                         f"{human_size(size_now)} \u00b7 {len(ids)} categories")
@@ -3648,7 +3709,7 @@ def cmd_restore(args) -> int:
     ids = parse_only(args.only) if args.only else None
     dry = bool(args.dry_run)
     with tempfile.TemporaryDirectory(prefix="imprint-restore-") as tmp:
-        root = open_imprint(archive, Path(tmp) / "open")
+        root = open_imprint(archive, Path(tmp) / "open", getattr(args, "identity", "") or "")
         manifest = load_manifest(root)
         available = [cid for cid in (manifest.get("categories") or {}) if (root / "categories" / cid).exists()]
         if ids is None:
@@ -4138,8 +4199,7 @@ def cmd_plan(args) -> int:
     else:
         if payload.exists():
             shutil.rmtree(payload)
-        extract_archive(archive, payload)
-        root = payload if (payload / "manifest.json").is_file() else open_imprint(archive, payload)
+        root = open_imprint(archive, payload)
     manifest = load_manifest(root)
     available = [cid for cid in (manifest.get("categories") or {}) if (root / "categories" / cid).exists()]
     ids = parse_only(args.only) if args.only else available
@@ -5071,6 +5131,13 @@ def build_parser() -> argparse.ArgumentParser:
     save.add_argument("-o", "--output", default="")
     save.add_argument("--select", default="",
                       help="JSON from `imprint pick`, to narrow within a category")
+    save.add_argument("--encrypt", action="store_true",
+                      help="encrypt the archive with age after writing it")
+    save.add_argument("-r", "--recipient", default="",
+                      help="age recipient (public key); defaults to "
+                           "~/.config/age/backup-key.pub")
+    save.add_argument("--keep-plaintext", action="store_true",
+                      help="keep the unencrypted .tar.zst alongside the .age file")
     restore = sub.add_parser("restore")
     restore.add_argument("--json", action="store_true", help="print the machine-readable report")
     restore.add_argument("archive")
@@ -5085,6 +5152,9 @@ def build_parser() -> argparse.ArgumentParser:
                          help="apply the system layer (/etc + systemctl enable) with sudo")
     restore.add_argument("--upgrade", action="store_true",
                          help="run `omarchy update -y` before restoring anything")
+    restore.add_argument("--identity", default="",
+                         help="age identity file to decrypt an encrypted archive; "
+                              "defaults to ~/.config/age/backup-key.txt")
     info = sub.add_parser("info")
     info.add_argument("archive")
     info.add_argument("--json", action="store_true")

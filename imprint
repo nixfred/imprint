@@ -105,6 +105,7 @@ Usage:
   imprint save --all -o FILE
   imprint save --only scripts,cli      Just the scripts, no plugins
   imprint save --only look,bar,plugins
+  imprint save --encrypt -o FILE      Encrypt the archive with age
   imprint restore [FILE]      Pick what to restore, review the changes, confirm
   imprint preview FILE        Show what a restore would change, and stop
   imprint restore FILE --only bar,plugins --dry-run
@@ -290,6 +291,9 @@ do_save() {
   local only=${1:-}
   local output=${2:-}
   local all=${3:-0}
+  local encrypt=${4:-0}
+  local recipient=${5:-}
+  local keep_plaintext=${6:-0}
   banner
   if [[ -z $only && $all -eq 0 ]]; then
     if (( HAVE_GUM )); then
@@ -316,10 +320,14 @@ do_save() {
     fi
   fi
   [[ -n $output ]] || die "no output path"
+  local extra=()
+  (( encrypt == 1 )) && extra+=(--encrypt)
+  [[ -n $recipient ]] && extra+=(-r "$recipient")
+  (( keep_plaintext == 1 )) && extra+=(--keep-plaintext)
   if [[ $all -eq 1 ]]; then
-    engine save --all -o "$output" >/dev/null
+    engine save --all -o "$output" "${extra[@]}" >/dev/null
   else
-    engine save --only "$only" ${SELECTION_FILE:+--select "$SELECTION_FILE"} -o "$output" >/dev/null
+    engine save --only "$only" ${SELECTION_FILE:+--select "$SELECTION_FILE"} -o "$output" "${extra[@]}" >/dev/null
   fi
   [[ -n $SELECTION_FILE ]] && rm -f "$SELECTION_FILE"
 }
@@ -331,6 +339,7 @@ do_restore() {
   local confirm_host=${4:-}
   local upgrade=${5:-0}
   local allow_system=${6:-0}
+  local identity=${7:-}
   banner
   if [[ -z $archive ]]; then
     archive=$(pick_archive) || die "cancelled"
@@ -370,6 +379,7 @@ do_restore() {
   (( allow_system == 1 )) && extra+=(--allow-system)
   # These were parsed and then thrown away on the interactive path.
   [[ -n $confirm_host ]] && extra+=(--confirm-hostname "$confirm_host")
+  [[ -n $identity ]] && extra+=(--identity "$identity")
   [[ -n $SELECTION_FILE ]] && extra+=(--select "$SELECTION_FILE")
 
   # Say exactly what will change before asking for the go-ahead.
@@ -445,11 +455,17 @@ case $cmd in
     only=""
     output=""
     all=0
+    encrypt=0
+    recipient=""
+    keep_plaintext=0
     while [[ $# -gt 0 ]]; do
       case $1 in
         --only) [[ $# -ge 2 ]] || die "--only needs a value"; only=$2; shift 2 ;;
         --all) all=1; shift ;;
         -o|--output) [[ $# -ge 2 ]] || die "--output needs a value"; output=$2; shift 2 ;;
+        --encrypt) encrypt=1; shift ;;
+        -r|--recipient) [[ $# -ge 2 ]] || die "--recipient needs a value"; recipient=$2; shift 2 ;;
+        --keep-plaintext) keep_plaintext=1; shift ;;
         --yes) shift ;;
         *) die "unknown save flag: $1" ;;
       esac
@@ -460,9 +476,12 @@ case $cmd in
       [[ $all -eq 1 ]] && args+=(--all)
       [[ -n $only && $all -eq 0 ]] && args+=(--only "$only")
       [[ -n $output ]] && args+=(-o "$output")
+      [[ $encrypt -eq 1 ]] && args+=(--encrypt)
+      [[ -n $recipient ]] && args+=(-r "$recipient")
+      [[ $keep_plaintext -eq 1 ]] && args+=(--keep-plaintext)
       engine "${args[@]}"
     else
-      do_save "$only" "$output" "$all"
+      do_save "$only" "$output" "$all" "$encrypt" "$recipient" "$keep_plaintext"
     fi
     ;;
   restore)
@@ -472,6 +491,7 @@ case $cmd in
     upgrade=0
     allow_system=0
     confirm_host=""
+    identity=""
     while [[ $# -gt 0 ]]; do
       case $1 in
         --only) [[ $# -ge 2 ]] || die "--only needs a value"; only=$2; shift 2 ;;
@@ -479,6 +499,7 @@ case $cmd in
         --upgrade) upgrade=1; shift ;;
         --allow-system) allow_system=1; shift ;;
         --confirm-hostname) [[ $# -ge 2 ]] || die "--confirm-hostname needs a value"; confirm_host=$2; shift 2 ;;
+        --identity) [[ $# -ge 2 ]] || die "--identity needs a value"; identity=$2; shift 2 ;;
         --yes) shift ;;
         -*) die "unknown restore flag: $1" ;;
         *) archive=$1; shift ;;
@@ -489,10 +510,11 @@ case $cmd in
     [[ $upgrade -eq 1 ]] && extra+=(--upgrade)
     [[ $allow_system -eq 1 ]] && extra+=(--allow-system)
     [[ -n $confirm_host ]] && extra+=(--confirm-hostname "$confirm_host")
+    [[ -n $identity ]] && extra+=(--identity "$identity")
     if [[ -n $only && -n $archive ]]; then
       engine restore "$archive" --only "$only" "${extra[@]}"
     else
-      do_restore "$archive" "$only" "$dry" "$confirm_host" "$upgrade" "$allow_system"
+      do_restore "$archive" "$only" "$dry" "$confirm_host" "$upgrade" "$allow_system" "$identity"
     fi
     ;;
   plan)
