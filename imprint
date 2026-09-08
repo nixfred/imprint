@@ -248,12 +248,18 @@ dest_problem() {
     printf '%s is a directory, not an archive path' "$path"
     return 0
   fi
-  if ! mkdir -p -- "$dir" 2>/dev/null; then
+  # The directory has to be there already. Making one for a mistyped path just
+  # leaves empty trees in places nobody meant to write to.
+  if [[ ! -d $dir ]]; then
+    if [[ -e $dir ]]; then
+      printf '%s is a file, not a directory' "$dir"
+      return 0
+    fi
     deepest=$dir
     while [[ ! -d $deepest && $deepest != / && $deepest != . ]]; do
       deepest=$(dirname -- "$deepest")
     done
-    printf 'cannot create %s (the deepest directory that exists is %s)' "$dir" "$deepest"
+    printf 'no such directory: %s (the deepest one that exists is %s)' "$dir" "$deepest"
     rest=${path#/}
     while [[ $rest == */* ]]; do
       if [[ -d $HOME/${rest%%/*} ]]; then
@@ -262,6 +268,7 @@ dest_problem() {
       fi
       rest=${rest#*/}
     done
+    printf '\n  imprint does not create directories -- make it first: mkdir -p %q' "$dir"
     return 0
   fi
   if [[ ! -w $dir ]]; then

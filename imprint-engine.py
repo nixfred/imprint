@@ -2301,23 +2301,30 @@ def suggest_under_home(dest: Path) -> Path | None:
     return None
 
 
-def check_dest(dest: Path) -> None:
+def check_dest(dest: Path, create: bool = False) -> None:
     """Fail before collecting, not after. A save spends minutes packing
     hundreds of megabytes; finding out at the end that the destination was
-    never writable throws all of that away."""
+    never writable throws all of that away.
+
+    A directory the user named is never conjured up. `create` is only true for
+    the one path imprint chooses itself when no output was given: a typo in a
+    path should stop the run, not quietly grow a tree of empty directories in
+    a place nobody meant to write to.
+    """
     parent = dest.parent
-    try:
-        parent.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        deepest = parent
-        while not deepest.exists() and deepest != deepest.parent:
-            deepest = deepest.parent
-        lines = [f"cannot create {parent}: {exc.strerror or exc}",
-                 f"the deepest directory that exists is {deepest}"]
-        hint = suggest_under_home(dest)
-        if hint is not None:
-            lines.append(f"did you mean {hint} ?")
-        raise SystemExit("\n".join(lines))
+    if not parent.is_dir():
+        if parent.exists():
+            raise SystemExit(f"{parent} is a file, not a directory")
+        if not create:
+            lines = [f"no such directory: {parent}"] + path_advice(parent)
+            lines.append("imprint does not create directories -- make it first:")
+            lines.append(f"  mkdir -p {shlex.quote(str(parent))}")
+            raise SystemExit("\n".join(lines))
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise SystemExit("\n".join(
+                [f"cannot create {parent}: {why(exc)}"] + path_advice(parent)))
     if dest.exists():
         if dest.is_dir():
             raise SystemExit(f"{dest} is a directory, not an archive path")
@@ -2327,7 +2334,7 @@ def check_dest(dest: Path) -> None:
     try:
         probe.touch()
     except OSError as exc:
-        raise SystemExit(f"cannot write into {parent}: {exc.strerror or exc}")
+        raise SystemExit(f"cannot write into {parent}: {why(exc)}")
     finally:
         try:
             probe.unlink()
@@ -2550,10 +2557,11 @@ def cmd_save(args) -> int:
     ids = parse_only(args.only) if args.only else default_category_ids()
     if args.all:
         ids = [item["id"] for item in CATEGORIES]
-    dest = Path(args.output).expanduser() if args.output else default_archive_path(home, hostname())
+    typed = bool(args.output)
+    dest = Path(args.output).expanduser() if typed else default_archive_path(home, hostname())
     if dest.suffixes[-2:] != [".tar", ".zst"] and not str(dest).endswith(".tar.zst"):
         dest = dest.with_name(dest.name + ".tar.zst") if dest.suffix == "" else dest
-    check_dest(dest)
+    check_dest(dest, create=not typed)
     SKIPPED.clear()
     with tempfile.TemporaryDirectory(prefix="imprint-") as tmp:
         staging = Path(tmp) / "imprint"
@@ -4112,12 +4120,18 @@ def cmd_plan(args) -> int:
     archive = need_archive(args.archive)
     out_dir = Path(args.output).expanduser() if args.output else (
         Path.home() / ".local/state/imprint" / f"plan-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
-    try:
-        out_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise SystemExit("\n".join(
-            [f"cannot create the plan directory {out_dir}: {why(exc)}"]
-            + path_advice(out_dir)))
+    if args.output:
+        # A directory the user named must already be there, like any other.
+        need_dir(args.output, "cannot write the plan")
+        if not os.access(out_dir, os.W_OK):
+            raise SystemExit(f"cannot write the plan into {out_dir}: permission denied")
+    else:
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise SystemExit("\n".join(
+                [f"cannot create the plan directory {out_dir}: {why(exc)}"]
+                + path_advice(out_dir)))
     payload = out_dir / "payload"
     if archive.is_dir():
         root = archive

@@ -306,16 +306,25 @@ It will not clone disk encryption, lock policy, or another machine’s TPM.
 
 ## When a file gets in the way
 
-Paths are checked before any work starts, not after. A destination that cannot
-be written, an archive that is not there, a plan directory with no plan in it —
-each says where the name stopped being real and what is nearby:
+Paths are checked before any work starts, not after, and **imprint never
+creates a directory you named**. A tree of empty directories in a place nobody
+meant to write to is not a fix for a typo, so a path that is not there stops
+the run and says where the name stopped being real:
 
 ```
 $ imprint save -o /home/google/imprints/imprint-dex.tar.zst
-cannot create /home/google/imprints: Permission denied
-the deepest directory that exists is /home
-did you mean /home/pi/google/imprints/imprint-dex.tar.zst ?
+no such directory: /home/google/imprints
+the deepest part that exists is /home
+did you mean /home/pi/google/imprints ?
+imprint does not create directories -- make it first:
+  mkdir -p /home/google/imprints
 ```
+
+The one directory imprint makes for itself is the one it chooses when you give
+no path at all: `~/imprints` for a save, `~/.local/state/imprint/plan-<stamp>`
+for a plan. Restoring still creates directories under `$HOME` — that is the
+job. An archive that is not there, a plan directory with no plan in it and a
+selection file that is really a directory each answer the same way.
 
 Once a run is underway, one bad file never costs the rest of it:
 

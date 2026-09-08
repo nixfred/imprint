@@ -1516,18 +1516,46 @@ class DestinationTests(unittest.TestCase):
             wall.mkdir(mode=0o500)
             try:
                 with self.assertRaises(SystemExit) as caught:
-                    engine.check_dest(wall / "sub" / "a.tar.zst")
+                    engine.check_dest(wall / "sub" / "a.tar.zst", create=True)
                 self.assertIn("cannot create", str(caught.exception))
                 self.assertIn(str(wall), str(caught.exception))
+                with self.assertRaises(SystemExit) as caught:
+                    engine.check_dest(wall / "a.tar.zst")
+                self.assertIn("cannot write into", str(caught.exception))
             finally:
                 wall.chmod(0o700)
 
-    def test_writable_parent_is_created_and_left_clean(self):
+    def test_a_directory_that_is_not_there_is_refused_not_created(self):
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp) / "imprints" / "a.tar.zst"
+            with self.assertRaises(SystemExit) as caught:
+                engine.check_dest(dest)
+            message = str(caught.exception)
+            self.assertIn(f"no such directory: {dest.parent}", message)
+            self.assertIn("imprint does not create directories", message)
+            self.assertIn(f"mkdir -p {dest.parent}", message)
+            self.assertFalse(dest.parent.exists())
+
+    def test_an_existing_directory_passes_and_is_left_clean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "a.tar.zst"
             engine.check_dest(dest)
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
+    def test_only_the_path_imprint_picks_itself_is_created(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "imprints" / "a.tar.zst"
+            engine.check_dest(dest, create=True)
             self.assertTrue(dest.parent.is_dir())
             self.assertEqual(list(dest.parent.iterdir()), [])
+
+    def test_a_file_where_the_directory_should_be(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wall = Path(tmp) / "imprints"
+            wall.write_text("not a directory", encoding="utf-8")
+            with self.assertRaises(SystemExit) as caught:
+                engine.check_dest(wall / "a.tar.zst", create=True)
+            self.assertIn("is a file, not a directory", str(caught.exception))
 
     def test_directory_in_the_way_is_named(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1567,7 +1595,9 @@ class DestinationTests(unittest.TestCase):
             staging = Path(tmp) / "staging"
             staging.mkdir()
             (staging / "manifest.json").write_text("{}", encoding="utf-8")
-            dest = Path(tmp) / "out" / "a.tar.zst"
+            out = Path(tmp) / "out"
+            out.mkdir()
+            dest = out / "a.tar.zst"
             real_open = engine.tarfile.open
 
             def explode(name, mode="r", *a, **kw):
