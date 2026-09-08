@@ -1734,5 +1734,27 @@ class InputPathTests(unittest.TestCase):
             self.assertIn("is a directory, not a file", str(caught.exception))
 
 
+class VersionTests(unittest.TestCase):
+    def test_about_carries_the_version_and_both_links(self):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            engine.cmd_about(None)
+        out = buf.getvalue()
+        self.assertIn(engine.VERSION, out)
+        self.assertIn("github.com/nixfred/imprint", out)
+        self.assertIn("nixfred.com", out)
+
+    def test_an_archive_records_the_version_that_wrote_it(self):
+        self.assertEqual(engine.machine_facts()["imprintVersion"], engine.VERSION)
+        brief = engine.render_brief({"hostname": "dex", "categories": {},
+                                     "imprintVersion": engine.VERSION})
+        self.assertIn(f'imprint = "{engine.VERSION}"', brief)
+
+    def test_an_archive_from_before_versions_still_reads(self):
+        brief = engine.render_brief({"hostname": "dex", "categories": {}})
+        self.assertIn('imprint = "before 1.0.0"', brief)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -122,6 +122,7 @@ Usage:
   imprint list                Archives in ~/imprints
   imprint facts               This machine as JSON
   imprint about               Version, author and links
+  imprint --version           Print the version and nothing else
 
 In the picker: space toggles the highlighted row. A row marked ▸ has a
 submenu -- space opens it, ← goes back. The top row selects everything and
@@ -441,6 +442,7 @@ shift || true
 case $cmd in
   "" ) main_menu ;;
   -h|--help|help) usage ;;
+  -V|--version) engine --version ;;
   save)
     only=""
     output=""

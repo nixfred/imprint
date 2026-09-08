@@ -301,6 +301,10 @@ Every restore first copies overwritten files to
 - **Verify** — schema and category folders
 - **Undo** — last restore is reversible
 - **Self-extracting tool** — the archive carries `imprint` itself
+- **About** — `imprint about` for the version, the repo and
+  [nixfred.com](https://nixfred.com); `imprint --version` when you want the
+  number alone. Every archive records the version that wrote it, in
+  `manifest.json` and at the top of `BRIEF.md`.
 
 It will not clone disk encryption, lock policy, or another machine’s TPM.
 
@@ -343,7 +347,7 @@ Once a run is underway, one bad file never costs the rest of it:
 ## Archive layout
 
 ```
-manifest.json          # kind=omarchy-imprint, host, omarchy version, categories
+manifest.json          # kind=omarchy-imprint, imprint version, host, omarchy, categories
 BRIEF.md               # human/agent readable
 tool/imprint
 tool/imprint-engine.py

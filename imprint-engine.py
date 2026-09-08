@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 KIND = "omarchy-imprint"
+VERSION = "1.0.0"
 SCHEMA = 1
 EXCLUDE_DIR_NAMES = {
     ".git",
@@ -1016,6 +1017,7 @@ def machine_facts() -> dict:
     return {
         "kind": KIND,
         "schema": SCHEMA,
+        "imprintVersion": VERSION,
         "created": iso_now(),
         "hostname": hostname(),
         "user": os.environ.get("USER") or Path.home().name,
@@ -2138,6 +2140,7 @@ def render_brief(manifest: dict) -> str:
         "Applying it is `imprint restore` — do not blindly copy home directories.",
         "",
         "```toml",
+        f"imprint = \"{manifest.get('imprintVersion') or 'before 1.0.0'}\"",
         f"schema = {manifest.get('schema')}",
         f"created = \"{manifest.get('created')}\"",
         f"hostname = \"{manifest.get('hostname')}\"",
@@ -2525,7 +2528,8 @@ def cmd_about(_args) -> int:
         "  " + c(accent, osc8(REPO_URL, "github.com/nixfred/imprint")),
         "  " + c(accent, osc8(SITE_URL, "nixfred.com")),
         "",
-        c(grey, f"schema {SCHEMA}  ·  {len(CATEGORIES)} categories  ·  MIT"),
+        c(grey, f"version {VERSION}  ·  schema {SCHEMA}  ·  "
+                f"{len(CATEGORIES)} categories  ·  MIT"),
         c(grey, f"this machine: {hostname()}  ·  Omarchy {omarchy_version()}  ·  theme {current_theme()}"),
         "",
     ]
@@ -5057,6 +5061,8 @@ def cmd_undo(args) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="imprint-engine")
+    parser.add_argument("-V", "--version", action="version",
+                        version=f"imprint {VERSION}")
     sub = parser.add_subparsers(
         dest="cmd", required=True,
         metavar="{save,restore,preview,plan,apply,info,diff,verify,undo,"
