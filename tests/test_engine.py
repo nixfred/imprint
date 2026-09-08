@@ -5,6 +5,7 @@ import os
 import sys
 import shutil
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -1754,6 +1755,121 @@ class VersionTests(unittest.TestCase):
     def test_an_archive_from_before_versions_still_reads(self):
         brief = engine.render_brief({"hostname": "dex", "categories": {}})
         self.assertIn('imprint = "before 1.0.0"', brief)
+
+class ShellJsonRestoreTests(unittest.TestCase):
+    """gh #7: `omarchy shell` is an IPC forwarder taking <target> <method>.
+
+    There is no `config-edit` target, so the old restore asked for one, got
+    'Target not found.', and gave up -- shell.json never restored.
+    """
+
+    def setUp(self):
+        self.real_run = engine.run
+        engine.FAILURES.clear()
+
+    def tearDown(self):
+        engine.run = self.real_run
+        engine.FAILURES.clear()
+
+    def _archive(self, tmp, body='{"bar":{"position":"bottom"}}'):
+        t = Path(tmp)
+        files = t / "cat/files/.config/omarchy"
+        files.mkdir(parents=True)
+        (files / "shell.json").write_text(body, encoding="utf-8")
+        home = t / "home"
+        home.mkdir()
+        undo = t / "undo"
+        undo.mkdir()
+        return t / "cat", home, undo
+
+    def test_restores_shell_json_while_the_shell_is_up(self):
+        calls = []
+        engine.run = lambda cmd, **kw: (calls.append(cmd), types.SimpleNamespace(
+            returncode=0, stdout="ok", stderr=""))[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            cat, home, undo = self._archive(tmp)
+            actions = engine.restore_bar(cat, home, "", undo, False)
+            dest = home / ".config/omarchy/shell.json"
+            self.assertTrue(dest.is_file(), actions)
+            self.assertEqual(json.loads(dest.read_text(encoding="utf-8")),
+                             {"bar": {"position": "bottom"}})
+        self.assertEqual(engine.FAILURES, [])
+
+    def test_never_asks_for_a_config_edit_target(self):
+        calls = []
+        engine.run = lambda cmd, **kw: (calls.append(cmd), types.SimpleNamespace(
+            returncode=0, stdout="ok", stderr=""))[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            cat, home, undo = self._archive(tmp)
+            engine.restore_bar(cat, home, "", undo, False)
+        self.assertFalse([c for c in calls if "config-edit" in c],
+                         f"config-edit is not an omarchy IPC target: {calls}")
+
+    def test_tells_the_live_shell_to_reload(self):
+        calls = []
+        engine.run = lambda cmd, **kw: (calls.append(cmd), types.SimpleNamespace(
+            returncode=0, stdout="ok", stderr=""))[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            cat, home, undo = self._archive(tmp)
+            engine.restore_bar(cat, home, "", undo, False)
+        self.assertTrue(any(c[-2:] == ["shell", "reloadConfig"] for c in calls),
+                        f"a restored shell.json must reach the running shell: {calls}")
+
+    def test_backs_up_what_it_replaces(self):
+        engine.run = lambda cmd, **kw: types.SimpleNamespace(
+            returncode=0, stdout="ok", stderr="")
+        with tempfile.TemporaryDirectory() as tmp:
+            cat, home, undo = self._archive(tmp)
+            dest = home / ".config/omarchy/shell.json"
+            dest.parent.mkdir(parents=True)
+            dest.write_text('{"bar":{"position":"top"}}', encoding="utf-8")
+            engine.restore_bar(cat, home, "", undo, False)
+            saved = list(undo.rglob("shell.json"))
+            self.assertTrue(saved, "the replaced shell.json must be recoverable")
+            self.assertEqual(json.loads(saved[0].read_text(encoding="utf-8")),
+                             {"bar": {"position": "top"}})
+
+    def test_restores_shell_json_with_the_shell_down(self):
+        engine.run = lambda cmd, **kw: types.SimpleNamespace(
+            returncode=1, stdout="", stderr="omarchy-shell is not running")
+        with tempfile.TemporaryDirectory() as tmp:
+            cat, home, undo = self._archive(tmp)
+            actions = engine.restore_bar(cat, home, "", undo, False)
+            dest = home / ".config/omarchy/shell.json"
+            self.assertTrue(dest.is_file(), actions)
+        self.assertEqual(engine.FAILURES, [])
+
+    def test_rewrites_the_old_home_inside_shell_json(self):
+        engine.run = lambda cmd, **kw: types.SimpleNamespace(
+            returncode=0, stdout="ok", stderr="")
+        with tempfile.TemporaryDirectory() as tmp:
+            cat, home, undo = self._archive(tmp, '{"note":"/home/pi/bin/x"}')
+            engine.restore_bar(cat, home, "/home/pi", undo, False)
+            dest = home / ".config/omarchy/shell.json"
+            self.assertEqual(json.loads(dest.read_text(encoding="utf-8")),
+                             {"note": f"{home}/bin/x"})
+
+    def test_a_dry_run_writes_nothing(self):
+        engine.run = lambda cmd, **kw: types.SimpleNamespace(
+            returncode=0, stdout="ok", stderr="")
+        with tempfile.TemporaryDirectory() as tmp:
+            cat, home, undo = self._archive(tmp)
+            engine.restore_bar(cat, home, "", undo, True)
+            self.assertFalse((home / ".config/omarchy/shell.json").exists())
+
+    def test_shell_is_running_does_not_ask_for_quiet_mode(self):
+        """`-q` is not "quiet" -- omarchy-shell's fail() exits 0 under it, so a
+        -q ping succeeds even with the shell down, and the probe is a no-op."""
+        calls = []
+        engine.run = lambda cmd, **kw: (calls.append(cmd), types.SimpleNamespace(
+            returncode=0, stdout="ok", stderr=""))[1]
+        engine.shell_is_running()
+        self.assertEqual(calls, [["omarchy", "shell", "shell", "ping"]])
+
+    def test_shell_is_running_is_false_when_the_shell_is_down(self):
+        engine.run = lambda cmd, **kw: types.SimpleNamespace(
+            returncode=1, stdout="", stderr="omarchy-shell is not running")
+        self.assertFalse(engine.shell_is_running())
 
 
 if __name__ == "__main__":
