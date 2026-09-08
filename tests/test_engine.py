@@ -925,7 +925,7 @@ class SystemLayerTests(unittest.TestCase):
         real_run, real_open, real_manifest = engine.run, engine.open_imprint, engine.load_manifest
         fake_root = Path(tempfile.mkdtemp())
         (fake_root / "categories/packages").mkdir(parents=True)
-        engine.open_imprint = lambda a, b: fake_root
+        engine.open_imprint = lambda a, b, identity="": fake_root
         engine.load_manifest = lambda r: {"kind": engine.KIND, "home": "/home/x",
                                           "categories": {"packages": {}}}
         touched = []
@@ -1732,6 +1732,107 @@ class InputPathTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as caught:
                 engine.need_file(tmp, "cannot read the selection file")
             self.assertIn("is a directory, not a file", str(caught.exception))
+
+
+class AgeEncryptionTests(unittest.TestCase):
+    def _keypair(self, tmp):
+        """Generate an age keypair, returning (public_key, identity_path)."""
+        import subprocess
+        proc = subprocess.run(["age-keygen"], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        pub = priv = None
+        for line in proc.stdout.splitlines():
+            if line.startswith("# public key: "):
+                pub = line.split(": ", 1)[1]
+            elif line.startswith("AGE-SECRET-KEY-"):
+                priv = line
+        self.assertIsNotNone(pub, proc.stdout)
+        self.assertIsNotNone(priv, proc.stdout)
+        ident = Path(tmp) / "key.txt"
+        ident.write_text(priv + "\n", encoding="utf-8")
+        return pub, ident
+
+    def _archive(self, tmp):
+        """Write a real imprint tar.zst and return its path."""
+        t = Path(tmp)
+        staging = t / "staging"; staging.mkdir()
+        (staging / "manifest.json").write_text(
+            json.dumps({"kind": engine.KIND, "hostname": "x", "categories": {}}),
+            encoding="utf-8")
+        src = t / "a.tar.zst"
+        engine.write_archive(staging, src)
+        return src
+
+    @unittest.skipUnless(shutil.which("age"), "age not installed")
+    def test_encrypt_then_decrypt_round_trips_a_tar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pub, ident = self._keypair(tmp)
+            src = self._archive(tmp)
+            enc = engine.encrypt_archive(src, pub, keep_plaintext=False)
+            self.assertEqual(enc.name, "a.tar.zst.age")
+            self.assertTrue(enc.is_file())
+            self.assertFalse(src.exists())          # plaintext removed by default
+            out = engine.decrypt_archive(enc, Path(tmp) / "out", str(ident))
+            self.assertTrue(out.is_file())
+            import tarfile
+            with tarfile.open(out, "r:*") as tar:
+                names = tar.getnames()
+            self.assertTrue(any(n.endswith("manifest.json") for n in names), names)
+
+    @unittest.skipUnless(shutil.which("age"), "age not installed")
+    def test_keep_plaintext_leaves_the_tar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pub, ident = self._keypair(tmp)
+            src = self._archive(tmp)
+            enc = engine.encrypt_archive(src, pub, keep_plaintext=True)
+            self.assertTrue(enc.is_file())
+            self.assertTrue(src.exists())           # kept alongside
+
+    @unittest.skipUnless(shutil.which("age"), "age not installed")
+    def test_open_imprint_decrypts_an_encrypted_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pub, ident = self._keypair(tmp)
+            src = self._archive(tmp)
+            enc = engine.encrypt_archive(src, pub, keep_plaintext=False)
+            root = engine.open_imprint(enc, Path(tmp) / "open", str(ident))
+            self.assertTrue((root / "manifest.json").is_file())
+
+    @unittest.skipUnless(shutil.which("age"), "age not installed")
+    def test_decrypt_without_identity_is_a_clean_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pub, ident = self._keypair(tmp)
+            src = self._archive(tmp)
+            enc = engine.encrypt_archive(src, pub, keep_plaintext=False)
+            missing = Path(tmp) / "nope" / "key.txt"
+            with self.assertRaises(SystemExit) as caught:
+                engine.decrypt_archive(enc, Path(tmp) / "out", str(missing))
+            self.assertIn("no age identity", str(caught.exception))
+
+    def test_encrypt_without_age_binary_is_a_clean_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "a.tar.zst"; src.write_text("x", encoding="utf-8")
+            old = os.environ.get("PATH")
+            os.environ["PATH"] = str(Path(tmp) / "emptybin")
+            try:
+                with self.assertRaises(SystemExit) as caught:
+                    engine.encrypt_archive(src, "age1whatever", keep_plaintext=False)
+            finally:
+                if old is None: os.environ.pop("PATH", None)
+                else: os.environ["PATH"] = old
+            self.assertIn("age is required", str(caught.exception))
+
+    def test_age_recipient_without_pub_key_is_a_clean_error(self):
+        import pathlib as _pl
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(_pl.Path, "home", return_value=Path(tmp)):
+                with self.assertRaises(SystemExit) as caught:
+                    engine.age_recipient("")
+            self.assertIn("no age recipient found", str(caught.exception))
+            self.assertIn("age-keygen -o backup-key.txt", str(caught.exception))
+
+    def test_age_recipient_explicit_wins(self):
+        self.assertEqual(engine.age_recipient("age1explicit"), "age1explicit")
 
 
 if __name__ == "__main__":
