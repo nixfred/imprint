@@ -3101,7 +3101,22 @@ def restore_look(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool
 
 
 def shell_is_running() -> bool:
-    return run(["omarchy", "shell", "-q", "shell", "ping"]).returncode == 0
+    # Not `-q`. That flag is not "quiet" but "always succeed": every failure in
+    # omarchy-shell goes through a fail() that exits 0 under it, so a quiet ping
+    # answers "up" with the shell stopped, unreachable, or the target misspelt.
+    return run(["omarchy", "shell", "shell", "ping"]).returncode == 0
+
+
+def reload_shell_config() -> bool:
+    """Ask a running shell to re-read shell.json.
+
+    The same two calls omarchy-shell-config makes after it writes the file.
+    False means nothing picked the change up -- normally because no shell is
+    running, in which case the next one to start reads the file anyway.
+    """
+    if run(["omarchy", "shell", "shell", "reloadConfig"]).returncode == 0:
+        return True
+    return run(["omarchy", "shell", "shell", "rescanPlugins"]).returncode == 0
 
 
 def restore_bar(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool) -> list[str]:
@@ -3110,62 +3125,50 @@ def restore_bar(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool)
         # packed relative without leading handling
         matches = list((cat_dir / "files").rglob("shell.json")) if (cat_dir / "files").is_dir() else []
         shell_src = matches[0] if matches else shell_src
-    # Everything except shell.json is a plain file; shell.json needs config-edit.
+    # Everything except shell.json is a plain file; shell.json needs the shell
+    # told about it afterwards.
     others = restore_file_tree(cat_dir, home, old_home, undo, dry,
                                skip_rel=".config/omarchy/shell.json")
     if not shell_src.is_file():
         return others + ["no shell.json in this imprint, bar left alone"]
     dest = home / ".config/omarchy/shell.json"
     if dry:
-        return others + ["shell.json via config-edit"]
+        return others + ["shell.json restored, then the shell reloaded"]
     text = rewrite_text(shell_src.read_text(encoding="utf-8"), old_home, str(home))
 
-    # Never write dest directly while the shell is up. `config-edit` exists to
-    # merge against a live snapshot; writing first would make the snapshot
-    # reflect our own clobber and silently drop every concurrent edit.
-    snap_fd, snap_name = tempfile.mkstemp(prefix="imprint-snap-", suffix=".json")
-    edit_fd, edit_name = tempfile.mkstemp(prefix="imprint-edit-", suffix=".json")
-    os.close(snap_fd)
-    os.close(edit_fd)
-    snap, edited = Path(snap_name), Path(edit_name)
+    # `omarchy shell` forwards <target> <method> to the running shell and has no
+    # config-edit target, so there is nothing to merge against a live snapshot.
+    # Write the file and tell the shell to re-read it, which is how omarchy's own
+    # omarchy-shell-config commits a change. Nothing is lost by not merging: a
+    # restore replaces this file by intent, and the copy it displaces is in undo.
+    if dest.exists() or dest.is_symlink():
+        backup_existing(dest, undo, home)
     try:
-        edited.write_text(text, encoding="utf-8")
-        snap_proc = run(["omarchy", "shell", "config-edit", "snapshot", str(snap)])
-        if snap_proc.returncode == 0:
-            if dest.exists():
-                backup_existing(dest, undo, home)
-            apply = run(
-                [
-                    "omarchy",
-                    "shell",
-                    "config-edit",
-                    "apply",
-                    str(snap),
-                    str(edited),
-                    "--allow-layout-change",
-                ]
-            )
-            if apply.returncode == 0:
-                return others + ["shell.json via config-edit"]
-            detail = (apply.stderr or apply.stdout).strip()[:200]
-            return others + [fail(f"shell.json NOT applied, config-edit refused: {detail}")]
-        # A failed snapshot is not proof the shell is stopped -- it could be an
-        # IPC error or a timeout. Only write directly when the shell really is
-        # down, otherwise refuse and say so.
-        if shell_is_running():
-            detail = (snap_proc.stderr or snap_proc.stdout).strip()[:200]
-            return others + [fail(f"shell.json NOT applied: shell is up but snapshot failed: {detail}")]
-        if dest.exists():
-            backup_existing(dest, undo, home)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(text, encoding="utf-8")
-        return others + ["shell.json written directly (shell not running)"]
-    finally:
-        for path in (snap, edited):
+        # Land it in one step. A half-written shell.json is read by the live
+        # shell the moment it touches the directory.
+        tmp_fd, tmp_name = tempfile.mkstemp(prefix=".imprint-shell-", suffix=".json",
+                                            dir=str(dest.parent))
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            os.chmod(tmp_name, 0o644)
+            # Never write through a symlink at the destination.
+            if dest.is_symlink():
+                dest.unlink()
+            os.replace(tmp_name, dest)
+        except BaseException:
             try:
-                path.unlink()
+                os.unlink(tmp_name)
             except OSError:
                 pass
+            raise
+    except OSError as exc:
+        return others + [fail(f"shell.json NOT restored: {why(exc)}")]
+
+    if reload_shell_config():
+        return others + ["shell.json restored, then the shell reloaded"]
+    return others + ["shell.json restored (no running shell to reload)"]
 
 
 def restore_services(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool) -> list[str]:
