@@ -922,6 +922,7 @@ class SystemLayerTests(unittest.TestCase):
             cat = self._cat(tmp)
             home = Path(tmp) / "home"; home.mkdir()
             alt = Path(tmp) / "root"
+            alt.mkdir()          # the rehearsal root is the user's to make
             engine.FAILURES.clear()
             actions = engine.restore_system(cat, home, False, True, str(alt))
             self.assertTrue((alt / "etc/thing.conf").is_file(), actions)
@@ -2026,6 +2027,135 @@ class PartialAndSilentLossTests(unittest.TestCase):
             finally:
                 engine.copy_file = real
             self.assertIn("TMPDIR", str(caught.exception))
+
+
+class AltRootTests(unittest.TestCase):
+    def tearDown(self):
+        engine.FAILURES.clear()
+
+    def test_a_rehearsal_root_that_is_not_there_is_refused_not_created(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cat = Path(tmp) / "cat"
+            (cat / "etc").mkdir(parents=True)
+            (cat / "etc/thing.conf").write_text("x=1\n", encoding="utf-8")
+            (cat / "meta.json").write_text(json.dumps({"enabledUnits": [], "etcFiles": []}),
+                                           encoding="utf-8")
+            home = Path(tmp) / "home"
+            home.mkdir()
+            alt = Path(tmp) / "not-there"
+            actions = engine.restore_system(cat, home, False, True, str(alt))
+            self.assertTrue(any("no such directory" in a for a in actions), actions)
+            self.assertTrue(any("does not create directories" in a for a in actions), actions)
+            self.assertFalse(alt.exists())
+            self.assertEqual(len(engine.FAILURES), 1)
+
+
+class PlanPayloadTests(unittest.TestCase):
+    def test_planning_refuses_to_eat_the_archive_it_is_reading(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "plan"
+            payload = out / "payload"
+            payload.mkdir(parents=True)
+            archive = payload / "a.tar.zst"
+            archive.write_bytes(b"x")
+            with self.assertRaises(SystemExit) as caught:
+                engine.check_plan_target(archive, out, payload)
+            self.assertIn("inside the plan directory", str(caught.exception))
+            self.assertTrue(archive.exists())
+
+    def test_an_archive_anywhere_else_is_fine(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "plan"
+            (out / "payload").mkdir(parents=True)
+            archive = Path(tmp) / "a.tar.zst"
+            archive.write_bytes(b"x")
+            engine.check_plan_target(archive, out, out / "payload")   # must not raise
+
+    def test_the_old_payload_survives_a_failed_extraction(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "plan"
+            payload = out / "payload"
+            payload.mkdir(parents=True)
+            (payload / "manifest.json").write_text('{"kind": "old"}', encoding="utf-8")
+            archive = Path(tmp) / "a.tar.zst"
+            archive.write_bytes(b"not really an archive")
+            args = SimpleNamespace(archive=str(archive), output=str(out), only="", json=False)
+            with self.assertRaises(SystemExit):
+                engine.cmd_plan(args)
+            self.assertEqual((payload / "manifest.json").read_text(encoding="utf-8"),
+                             '{"kind": "old"}')
+            self.assertEqual(sorted(p.name for p in out.iterdir()), ["payload"])
+
+
+class StockThemeTests(unittest.TestCase):
+    def tearDown(self):
+        engine.FAILURES.clear()
+        engine.SUBSELECT.clear()
+
+    def _cat(self, tmp):
+        cat = Path(tmp) / "cat"
+        stock = cat / "stock/ristretto"
+        stock.mkdir(parents=True)
+        (stock / "colors.toml").write_text("bg = 1\n", encoding="utf-8")
+        (stock / "backgrounds").mkdir()
+        (stock / "backgrounds/a.png").write_bytes(b"png")
+        (cat / "meta.json").write_text(json.dumps({
+            "themes": [{"id": "ristretto", "url": "", "kind": "stock", "stock": True,
+                        "copied": "stock/ristretto (2 files)"}],
+            "stockIncluded": ["ristretto"]}), encoding="utf-8")
+        return cat
+
+    def test_a_carried_stock_theme_is_actually_installed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cat = self._cat(tmp)
+            home = Path(tmp) / "home"
+            home.mkdir()
+            undo = Path(tmp) / "undo"
+            undo.mkdir()
+            actions = engine.restore_themes(cat, home, "", undo, False)
+            landed = home / ".config/omarchy/themes/ristretto"
+            self.assertTrue((landed / "colors.toml").is_file(), actions)
+            self.assertEqual((landed / "backgrounds/a.png").read_bytes(), b"png")
+            self.assertTrue(any("stock theme ristretto" in a for a in actions), actions)
+            self.assertEqual(engine.FAILURES, [])
+
+    def test_a_dry_run_says_so_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cat = self._cat(tmp)
+            home = Path(tmp) / "home"
+            home.mkdir()
+            undo = Path(tmp) / "undo"
+            undo.mkdir()
+            actions = engine.restore_themes(cat, home, "", undo, True)
+            self.assertTrue(any("stock theme ristretto ->" in a for a in actions), actions)
+            self.assertFalse((home / ".config/omarchy/themes/ristretto").exists())
+
+    def test_what_is_there_now_is_backed_up_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cat = self._cat(tmp)
+            home = Path(tmp) / "home"
+            existing = home / ".config/omarchy/themes/ristretto"
+            existing.mkdir(parents=True)
+            (existing / "colors.toml").write_text("mine\n", encoding="utf-8")
+            undo = Path(tmp) / "undo"
+            undo.mkdir()
+            engine.restore_themes(cat, home, "", undo, False)
+            kept = undo / ".config/omarchy/themes/ristretto/colors.toml"
+            self.assertEqual(kept.read_text(encoding="utf-8"), "mine\n")
+            self.assertEqual((existing / "colors.toml").read_text(encoding="utf-8"), "bg = 1\n")
+
+    def test_the_plan_carries_it_too(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            cat = root / "categories/themes"
+            (cat / "stock/ristretto").mkdir(parents=True)
+            (cat / "stock/ristretto/colors.toml").write_text("bg = 1\n", encoding="utf-8")
+            plan = engine.Plan()
+            engine.plan_themes(plan, {"themes": [{"id": "ristretto", "stock": True}]}, root)
+            body = "\n".join(line for step in plan.steps for line in step["body"])
+            self.assertIn('mkdir -p "$HOME"/.config/omarchy/themes/ristretto', body)
+            self.assertIn("cp -a", body)
 
 
 if __name__ == "__main__":

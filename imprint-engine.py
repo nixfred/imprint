@@ -3310,7 +3310,51 @@ def restore_themes(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bo
                         actions.append(f"theme install {tid} ok")
                     else:
                         actions.append(fail(f"theme install {tid} failed: " + (proc.stderr or proc.stdout).strip()[:200]))
+        actions.extend(restore_stock_themes(cat_dir, home, undo, dry))
     actions.extend(restore_file_tree(cat_dir, home, old_home, undo, dry))
+    return actions
+
+
+def restore_stock_themes(cat_dir: Path, home: Path, undo: Path, dry: bool) -> list[str]:
+    """Themes that ship with Omarchy live outside $HOME, so they are staged by
+    hand at save time -- and nothing put them back. Choosing one in the picker
+    and then not restoring it is exactly the lie the collector set out not to
+    tell. They land in the user themes directory, which is where an installed
+    theme goes anyway."""
+    actions = []
+    stock = cat_dir / "stock"
+    if not stock.is_dir():
+        return actions
+    for theme_dir in sorted(stock.iterdir()):
+        name = theme_dir.name
+        if not theme_dir.is_dir() or not shell_segment(name):
+            continue
+        if not wanted("themes", name):
+            continue
+        target = home / ".config/omarchy/themes" / name
+        if dry:
+            actions.append(f"stock theme {name} -> ~/.config/omarchy/themes/{name}")
+            continue
+        try:
+            contained(home, target)
+        except UnsafePath:
+            actions.append(fail(f"refused stock theme {name!r}"))
+            continue
+        if target.exists() or target.is_symlink():
+            backup_existing(target, undo, home)
+        count = 0
+        trouble = ""
+        for file_path in iter_files(theme_dir):
+            inner = file_path.relative_to(theme_dir)
+            try:
+                copy_file(file_path, target / inner)
+                count += 1
+            except OSError as exc:
+                trouble = why(exc)
+        if trouble:
+            actions.append(fail(f"stock theme {name} is incomplete: {trouble}"))
+        else:
+            actions.append(f"stock theme {name} ({count} files)")
     return actions
 
 
@@ -3657,8 +3701,14 @@ def restore_system(cat_dir: Path, home: Path, dry: bool, allow: bool,
         ]
     if alt_root:
         # Applying into an alternate root needs no privileges and cannot touch
-        # the running system, which is how this path gets verified.
-        Path(system_root).mkdir(parents=True, exist_ok=True)
+        # the running system, which is how this path gets verified. The
+        # directory is the user's to make: imprint does not create one it was
+        # handed, here any more than anywhere else.
+        if not Path(system_root).is_dir():
+            return summary + [fail("\n".join(
+                [f"no such directory: {system_root}"] + path_advice(Path(system_root))
+                + ["imprint does not create directories -- make it first:",
+                   f"  mkdir -p {shlex.quote(system_root)}"]))]
         proc = run(["bash", str(script)])
         if proc.returncode != 0:
             return summary + [fail(f"system layer failed against {system_root}: "
@@ -4322,6 +4372,17 @@ def plan_themes(plan: Plan, meta: dict, root: Path) -> None:
         if theme.get("url"):
             plan.add("themes", f"theme {theme.get('id')}",
                      [f"omarchy theme install {sh(theme['url'])} || true"])
+    stock = root / "categories/themes/stock"
+    if not stock.is_dir():
+        return
+    for theme_dir in sorted(stock.iterdir()):
+        name = theme_dir.name
+        if not theme_dir.is_dir() or not shell_segment(name) or not wanted("themes", name):
+            continue
+        dest = '"$HOME"/.config/omarchy/themes/' + sh(name)
+        plan.add("themes", f"stock theme {name}",
+                 [f'mkdir -p {dest}',
+                  f'cp -a {payload_ref(root, theme_dir)}/. {dest}/'])
 
 
 def plan_plugins(plan: Plan, meta: dict, root: Path) -> None:
@@ -4595,6 +4656,25 @@ def session_preamble() -> list[str]:
     ]
 
 
+def check_plan_target(archive: Path, out_dir: Path, payload: Path) -> None:
+    """Planning replaces the plan directory's payload. An archive living in
+    there is the one thing that must never be the first casualty of reading
+    it."""
+    if archive.is_dir():
+        return
+    base = payload if payload.exists() else out_dir
+    try:
+        inside = archive.resolve().is_relative_to(base.resolve())
+    except OSError:
+        return
+    if inside:
+        raise SystemExit(
+            f"{archive} is inside the plan directory {out_dir}\n"
+            "planning replaces that directory's payload, which would delete the "
+            "archive it is reading\n"
+            "point -o somewhere else, or move the archive out first")
+
+
 def cmd_plan(args) -> int:
     archive = need_archive(args.archive)
     # Check in private scratch space before creating/replacing any plan output.
@@ -4626,9 +4706,21 @@ def cmd_plan(args) -> int:
     if archive.is_dir():
         root = archive
     else:
-        if payload.exists():
-            shutil.rmtree(payload)
-        extract_archive(archive, payload)
+        # The old payload is removed only once the new one is on disk. It used
+        # to go first, which ate the archive itself when that archive was
+        # sitting in the directory being planned into.
+        check_plan_target(archive, out_dir, payload)
+        fresh = out_dir / f".payload-{os.getpid()}"
+        if fresh.exists():
+            shutil.rmtree(fresh)
+        try:
+            extract_archive(archive, fresh)
+            if payload.exists():
+                shutil.rmtree(payload)
+            fresh.replace(payload)
+        except BaseException:
+            shutil.rmtree(fresh, ignore_errors=True)
+            raise
         root = payload if (payload / "manifest.json").is_file() else open_imprint(archive, payload)
     manifest = load_manifest(root)
     available = [cid for cid in (manifest.get("categories") or {}) if (root / "categories" / cid).exists()]

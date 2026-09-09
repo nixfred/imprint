@@ -118,7 +118,7 @@ imprint restore FILE --only bar,plugins --dry-run
 imprint restore FILE --only identity --confirm-hostname dex
 imprint restore FILE --upgrade       # omarchy update -y first, abort if it fails
 imprint restore FILE --only system --allow-system   # /etc + systemctl enable, via sudo
-imprint restore FILE --only system --allow-system --system-root /tmp/try   # rehearse it
+mkdir -p /tmp/try && imprint restore FILE --only system --allow-system --system-root /tmp/try
 
 imprint plan FILE                    # write a restore.sh you can read before running
 imprint plan FILE --only plugins -o ~/myplan
