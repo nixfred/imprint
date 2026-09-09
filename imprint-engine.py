@@ -12,15 +12,17 @@ import json
 import os
 import re
 import shlex
+import signal
 import shutil
 import stat
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import tempfile
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 KIND = "omarchy-imprint"
 VERSION = "1.0.0"
@@ -536,14 +538,113 @@ def catalog_payload() -> list[dict]:
     return [dict(item) for item in CATEGORIES]
 
 
-def run(cmd: list[str], cwd: Path | None = None, check: bool = False) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        cmd,
-        cwd=cwd,
-        text=True,
-        capture_output=True,
-        check=check,
-    )
+# A save asks ~90 git checkouts for their remote, head and dirty state, and
+# talks to the shell over IPC that simply does not answer when no shell is
+# running. Without a bound, one wedged child holds the whole run forever.
+#
+# The bounded-run technique here -- cap the output while the child is still
+# running, kill the process group rather than the process -- is taken from
+# omarchy-config-sync-plugin's run_bounded (MIT, (c) 2026 Dmytro Gladkyi,
+# github.com/gladimdim/omarchy-config-sync-plugin), rewritten for imprint.
+RUN_TIMEOUT = 30            # asking a question: git, systemctl, hyprctl, omarchy queries
+RUN_LONG_TIMEOUT = 3600     # doing the work: package installs, generated scripts, updates
+RUN_GIT_TIMEOUT = 120       # a status or a diff on a large repo with a cold cache
+RUN_MAX_BYTES = 8 * 1024 * 1024
+TIMED_OUT = 124             # what a shell reports for a command its timeout killed
+
+
+def _drain(pipe, sink: list[bytes], overflow: threading.Event) -> None:
+    total = 0
+    try:
+        while True:
+            chunk = pipe.read(65536)
+            if not chunk:
+                return
+            room = RUN_MAX_BYTES - total
+            if room <= 0:
+                overflow.set()
+                return
+            sink.append(chunk[:room])
+            total += len(chunk[:room])
+            if len(chunk) > room:
+                overflow.set()
+                return
+    except (OSError, ValueError):
+        return
+
+
+def run(cmd: list[str], cwd: Path | None = None, check: bool = False,
+        timeout: float = RUN_TIMEOUT, stdin_text: str | None = None) -> subprocess.CompletedProcess:
+    """Never hangs, never eats the machine's memory, never raises for the
+    ordinary failures. A child that runs long or talks too much is killed --
+    the whole process group, since the one holding the pipe open is usually a
+    grandchild -- and comes back as an ordinary non-zero result so a save or a
+    restore carries on and reports it."""
+    try:
+        proc = subprocess.Popen(
+            cmd, cwd=str(cwd) if cwd else None,
+            stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True)
+    except OSError as exc:
+        if check:
+            raise
+        return subprocess.CompletedProcess(cmd, 127, "", why(exc))
+
+    def kill_group() -> None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            proc.kill()
+
+    overflow = threading.Event()
+    out_chunks: list[bytes] = []
+    err_chunks: list[bytes] = []
+    readers = [threading.Thread(target=_drain, args=(proc.stdout, out_chunks, overflow), daemon=True),
+               threading.Thread(target=_drain, args=(proc.stderr, err_chunks, overflow), daemon=True)]
+    for reader in readers:
+        reader.start()
+    if stdin_text is not None and proc.stdin is not None:
+        try:
+            proc.stdin.write(stdin_text.encode("utf-8"))
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+    deadline = time.monotonic() + timeout
+    killed = ""
+    while True:
+        try:
+            proc.wait(timeout=0.05)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        if overflow.is_set():
+            killed = f"stopped after {human_size(RUN_MAX_BYTES)} of output"
+            kill_group()
+            proc.wait()
+            break
+        if time.monotonic() >= deadline:
+            killed = f"stopped after {int(timeout)}s"
+            kill_group()
+            proc.wait()
+            break
+    for reader in readers:
+        reader.join(timeout=5)
+    for pipe in (proc.stdout, proc.stderr, proc.stdin):
+        try:
+            if pipe is not None:
+                pipe.close()
+        except OSError:
+            pass
+    out = b"".join(out_chunks).decode("utf-8", "replace")
+    err = b"".join(err_chunks).decode("utf-8", "replace")
+    code = proc.returncode
+    if killed:
+        err = (err + f"\n[{shlex.join(cmd)[:120]} {killed}]").strip()
+        code = TIMED_OUT
+    if check and code != 0:
+        raise subprocess.CalledProcessError(code, cmd, out, err)
+    return subprocess.CompletedProcess(cmd, code, out, err)
 
 
 def ensure_session_env() -> None:
@@ -689,13 +790,31 @@ def git_branch_of(path: Path) -> str:
 def git_head(path: Path) -> str:
     if not (path / ".git").exists():
         return ""
-    return run_ok(["git", "-C", str(path), "rev-parse", "HEAD"]).strip()
+    proc = run(["git", "-C", str(path), "rev-parse", "HEAD"], timeout=RUN_GIT_TIMEOUT)
+    if proc.returncode != 0:
+        # An empty commit in a recipe means "clone the default branch", which
+        # is a different machine from the one being saved. Say so.
+        note_skip(path, f"git rev-parse did not answer: "
+                        f"{proc.stderr.strip()[:120] or 'failed'}", "read")
+        return ""
+    return proc.stdout.strip()
 
 
 def git_dirty(path: Path) -> bool:
+    """Unknown is not clean.
+
+    run_ok returns "" for a command that failed, and a timed-out `git status`
+    fails -- so reading its silence as "nothing to commit" would drop the
+    uncommitted work in that checkout without a word. A repo whose state
+    cannot be read is treated as dirty and recorded."""
     if not (path / ".git").exists():
         return False
-    return bool(run_ok(["git", "-C", str(path), "status", "--porcelain"]).strip())
+    proc = run(["git", "-C", str(path), "status", "--porcelain"], timeout=RUN_GIT_TIMEOUT)
+    if proc.returncode != 0:
+        note_skip(path, f"git status did not answer: {proc.stderr.strip()[:120] or 'failed'}",
+                  "read")
+        return True
+    return bool(proc.stdout.strip())
 
 
 def git_changed_files(path: Path) -> list[str]:
@@ -707,7 +826,13 @@ def git_changed_files(path: Path) -> list[str]:
     """
     if not (path / ".git").exists():
         return []
-    out = run_ok(["git", "-C", str(path), "status", "--porcelain", "-z", "--untracked-files=all"])
+    probe = run(["git", "-C", str(path), "status", "--porcelain", "-z", "--untracked-files=all"],
+                timeout=RUN_GIT_TIMEOUT)
+    if probe.returncode != 0:
+        note_skip(path, f"git status did not answer, so its uncommitted files are not "
+                        f"in this archive: {probe.stderr.strip()[:120] or 'failed'}", "read")
+        return []
+    out = probe.stdout
     names: list[str] = []
     for entry in out.split("\0"):
         if len(entry) < 4:
@@ -936,6 +1061,123 @@ def try_copy(src: Path, dest: Path) -> bool:
         discard(dest)
         note_skip(src, why(exc))
         return False
+
+
+# Writing archive content into $HOME, without ever traversing a path by name.
+#
+# contained() resolves a destination and checks it sits under home, then the
+# copy goes by pathname -- so a symlink that appears in between is followed and
+# the write lands wherever it points. An archive is untrusted input and a
+# restore runs against a live home directory, so the gap is real.
+#
+# The descriptor-relative walk below -- openat() per component, containment
+# verified on each opened descriptor through /proc/self/fd, the final file
+# renamed into place from the same descriptor -- is taken from
+# omarchy-config-sync-plugin's _open_dir_bound/_replace_at (MIT, (c) 2026
+# Dmytro Gladkyi, github.com/gladimdim/omarchy-config-sync-plugin).
+OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+NO_PROC_NOTED = False
+
+
+def _inside(fd: int, root: Path) -> bool:
+    """Ask the kernel where this descriptor actually is. A symlink inside the
+    tree is fine -- dotfiles are full of them -- but one that leaves it is not."""
+    link = f"/proc/self/fd/{fd}"
+    if not os.path.lexists(link):
+        raise NoProcFS()
+    return Path(os.path.realpath(link)).is_relative_to(root)
+
+
+class NoProcFS(Exception):
+    """No /proc to verify against, so the safe walk cannot be used here."""
+
+
+def open_within(root: Path, parts: tuple[str, ...], create: bool = True) -> int:
+    """A directory descriptor for root/parts, verified at every hop."""
+    if any(part in ("", ".", "..") for part in parts):
+        raise UnsafePath(f"unsafe path component in {'/'.join(parts)}")
+    resolved = root.resolve()
+    fd = os.open(str(root), OPEN_FLAGS)
+    try:
+        if not _inside(fd, resolved):
+            raise UnsafePath(f"{root} does not resolve inside itself")
+        for part in parts:
+            try:
+                nxt = os.open(part, OPEN_FLAGS, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(part, 0o755, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                nxt = os.open(part, OPEN_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+            if not _inside(fd, resolved):
+                raise UnsafePath(f"{'/'.join(parts)} leaves {root}")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def place_file(root: Path, rel: str, source: Path) -> None:
+    """Put source at root/rel. Falls back to the pathname copy only where the
+    kernel cannot be asked where a descriptor points."""
+    global NO_PROC_NOTED
+    parts = PurePosixPath(rel).parts
+    if not parts:
+        raise UnsafePath(f"empty destination for {source}")
+    try:
+        fd = open_within(root, parts[:-1])
+    except NoProcFS:
+        if not NO_PROC_NOTED:
+            NO_PROC_NOTED = True
+            sys.stderr.write("  no /proc: falling back to path-based writes\n")
+        copy_file(source, root.joinpath(*parts))
+        return
+    try:
+        _replace_at(fd, parts[-1], source)
+    finally:
+        os.close(fd)
+
+
+def _replace_at(fd: int, name: str, source: Path) -> None:
+    """Write beside the target inside an already-verified directory, then
+    rename over it. rename replaces the name in this directory; it never
+    follows a symlink sitting there, which is the whole point."""
+    broken_link = source.is_symlink() and not source.exists()
+    tmp = f".imprint-{os.getpid()}-{name[:80]}"
+    try:
+        os.unlink(tmp, dir_fd=fd)
+    except OSError:
+        pass
+    if broken_link:
+        os.symlink(os.readlink(source), tmp, dir_fd=fd)
+    else:
+        info = source.stat()
+        out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                      stat.S_IMODE(info.st_mode), dir_fd=fd)
+        try:
+            with open(source, "rb") as handle:
+                while True:
+                    chunk = handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    os.write(out, chunk)
+            os.fchmod(out, stat.S_IMODE(info.st_mode))
+        finally:
+            os.close(out)
+        os.utime(tmp, (info.st_atime, info.st_mtime), dir_fd=fd)
+    try:
+        os.rename(tmp, name, src_dir_fd=fd, dst_dir_fd=fd)
+    except OSError:
+        try:
+            os.unlink(tmp, dir_fd=fd)
+        except OSError:
+            pass
+        raise
 
 
 def read_text_safe(path: Path, limit: int = TEXT_LIMIT * 4) -> str | None:
@@ -2971,8 +3213,9 @@ def report_skipped() -> None:
     if not SKIPPED:
         return
     count = len(SKIPPED)
-    noun = "file" if count == 1 else "files"
-    sys.stderr.write(f"\n  {count} {noun} could not be read and are not in the archive:\n")
+    said = "1 thing could not be read and is" if count == 1 else \
+        f"{count} things could not be read and are"
+    sys.stderr.write(f"\n  {said} not in the archive:\n")
     for item in SKIPPED[:5]:
         sys.stderr.write(f"    {item['path']} -- {item['reason']}\n")
     if count > 5:
@@ -3047,8 +3290,10 @@ def restore_file_tree(cat_dir: Path, home: Path, old_home: str, undo: Path, dry:
                              f"not be backed up ({why(exc)})"))
             continue
         try:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            copy_file(path, dest)
+            place_file(home, str(rel), path)
+        except UnsafePath as exc:
+            done.append(fail(f"refused ~/{rel}: {exc}"))
+            continue
         except OSError as exc:
             done.append(fail(f"cannot write ~/{rel}: {why(exc)}"))
             continue
@@ -3263,7 +3508,7 @@ def restore_plugins(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: b
                             + ("" if plug.get("sourceRepoMatches") else ", installed copy had drifted") + ")")
                 actions.append(f"plugin tree {pid}{note}")
             elif plug.get("kind") == "clone" and plug.get("clonedFrom"):
-                run(["omarchy", "plugin", "clone", plug["clonedFrom"]])
+                run(["omarchy", "plugin", "clone", plug["clonedFrom"]], timeout=RUN_LONG_TIMEOUT)
                 actions.append(f"plugin clone {plug['clonedFrom']}")
 
     # Installing the code is not the same as showing it. Enabled state and bar
@@ -3346,8 +3591,8 @@ def restore_plugins(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: b
                     dest = home / ".config/systemd/user" / unit
                     try:
                         backup_existing(dest, undo, home)
-                        copy_file(packed, dest)
-                    except OSError as exc:
+                        place_file(home, str(Path(".config/systemd/user") / unit), packed)
+                    except (UnsafePath, OSError) as exc:
                         actions.append(fail(f"cannot install {unit} for "
                                             f"{plug.get('id')}: {why(exc)}"))
                         continue
@@ -3384,8 +3629,10 @@ def overlay_tree(src: Path, dest: Path, old_home: str, new_home: Path) -> None:
         inner = file_path.relative_to(src)
         target = dest / inner
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            copy_file(file_path, target)
+            place_file(new_home, str(target.relative_to(new_home)), file_path)
+        except (UnsafePath, ValueError) as exc:
+            fail(f"refused {target}: {exc}")
+            continue
         except OSError as exc:
             fail(f"cannot write {target}: {why(exc)}")
             continue
@@ -3409,13 +3656,13 @@ def restore_packages(cat_dir: Path, dry: bool) -> list[str]:
             actions.append("pkg aur add " + " ".join(aur))
         return actions
     if repo:
-        proc = run(["omarchy", "pkg", "add", *repo])
+        proc = run(["omarchy", "pkg", "add", *repo], timeout=RUN_LONG_TIMEOUT)
         if proc.returncode == 0:
             actions.append("pkg add ok")
         else:
             actions.append(fail("pkg add failed: " + (proc.stderr or proc.stdout).strip()[:400]))
     if aur:
-        proc = run(["omarchy", "pkg", "aur", "add", *aur])
+        proc = run(["omarchy", "pkg", "aur", "add", *aur], timeout=RUN_LONG_TIMEOUT)
         if proc.returncode == 0:
             actions.append("pkg aur add ok")
         else:
@@ -3443,7 +3690,7 @@ def restore_themes(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bo
                         existing = home / ".config/omarchy/themes" / tid
                         if existing.exists() or existing.is_symlink():
                             backup_existing(existing, undo, home)
-                    proc = run(["omarchy", "theme", "install", theme["url"]])
+                    proc = run(["omarchy", "theme", "install", theme["url"]], timeout=RUN_LONG_TIMEOUT)
                     if proc.returncode == 0 or "already" in (proc.stdout + proc.stderr).lower():
                         actions.append(f"theme install {tid} ok")
                     else:
@@ -3485,10 +3732,10 @@ def restore_stock_themes(cat_dir: Path, home: Path, undo: Path, dry: bool) -> li
         for file_path in iter_files(theme_dir):
             inner = file_path.relative_to(theme_dir)
             try:
-                copy_file(file_path, target / inner)
+                place_file(home, str(Path(".config/omarchy/themes") / name / inner), file_path)
                 count += 1
-            except OSError as exc:
-                trouble = why(exc)
+            except (UnsafePath, OSError) as exc:
+                trouble = str(exc) if isinstance(exc, UnsafePath) else why(exc)
         if trouble:
             actions.append(fail(f"stock theme {name} is incomplete: {trouble}"))
         else:
@@ -3505,9 +3752,8 @@ def restore_look(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool
         elif not shutil.which("dconf"):
             actions.append("dconf not installed, GTK appearance skipped")
         else:
-            proc = subprocess.run(["dconf", "load", DCONF_PATH],
-                                  input=dconf_file.read_text(encoding="utf-8"),
-                                  text=True, capture_output=True)
+            proc = run(["dconf", "load", DCONF_PATH],
+                       stdin_text=dconf_file.read_text(encoding="utf-8"))
             actions.append("dconf appearance loaded" if proc.returncode == 0
                            else fail("dconf load failed: " + (proc.stderr or proc.stdout).strip()[:200]))
     meta_path = cat_dir / "meta.json"
@@ -3847,7 +4093,7 @@ def restore_system(cat_dir: Path, home: Path, dry: bool, allow: bool,
                 [f"no such directory: {system_root}"] + path_advice(Path(system_root))
                 + ["imprint does not create directories -- make it first:",
                    f"  mkdir -p {shlex.quote(system_root)}"]))]
-        proc = run(["bash", str(script)])
+        proc = run(["bash", str(script)], timeout=RUN_LONG_TIMEOUT)
         if proc.returncode != 0:
             return summary + [fail(f"system layer failed against {system_root}: "
                                    + (proc.stderr or proc.stdout).strip()[:400])]
@@ -3855,7 +4101,7 @@ def restore_system(cat_dir: Path, home: Path, dry: bool, allow: bool,
             verify_units(units, system_root, alt_root)
     if run(["sudo", "-n", "true"]).returncode != 0:
         return summary + [fail(f"no non-interactive sudo; run it yourself: sudo {script}")]
-    proc = run(["sudo", "-n", "bash", str(script)])
+    proc = run(["sudo", "-n", "bash", str(script)], timeout=RUN_LONG_TIMEOUT)
     if proc.returncode != 0:
         return summary + [fail("system layer failed: " + (proc.stderr or proc.stdout).strip()[:400])]
     return summary + ["system layer applied"] + verify_units(units, system_root, alt_root)
@@ -4339,7 +4585,7 @@ def cmd_restore(args) -> int:
                 report["upgrade"] = "omarchy update -y"
             else:
                 note("upgrading the machine first (omarchy update -y)", "amber")
-                proc = run(["omarchy", "update", "-y"])
+                proc = run(["omarchy", "update", "-y"], timeout=RUN_LONG_TIMEOUT)
                 if proc.returncode == 0:
                     report["upgrade"] = "omarchy update ok"
                 else:

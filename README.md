@@ -453,6 +453,15 @@ Once a run is underway, one bad file never costs the rest of it:
   recovery instead attempts file rollback and reports whether it succeeded.
 - A write that dies partway takes its `.partial` file with it. Half an archive
   on a slow mount looks exactly like a backup.
+- No command imprint runs can hold it open. Every child gets a timeout, an
+  output cap enforced while it runs, and a process-group kill if it passes
+  either. A save asks ninety git checkouts three questions each and talks to a
+  shell that may not be running; one wedged child used to stall the whole run.
+  A git command that does not answer is recorded as unknown, never read as
+  "nothing to commit".
+- Archive content goes into `$HOME` through a descriptor-relative walk, with
+  containment verified at every hop, so a symlink appearing between the check
+  and the write cannot redirect it out of your home directory.
 - A staging disk that fills is the one thing that does stop a save, because
   skipping thousands of files would write a plausible archive with most of the
   machine missing from it. Point `TMPDIR` at a bigger disk and run it again.
@@ -468,6 +477,14 @@ categories/<id>/meta.json
 categories/<id>/files/...
 categories/plugins/trees/<plugin-id>/     # local-only plugins; git ones are URLs
 ```
+
+## Credit
+
+Two techniques here come from
+[omarchy-config-sync-plugin](https://github.com/gladimdim/omarchy-config-sync-plugin)
+(MIT, © 2026 Dmytro Gladkyi), rewritten for imprint and credited at the code:
+its bounded subprocess runner, and its descriptor-relative containment for
+writes into a live home directory.
 
 ## Tests
 

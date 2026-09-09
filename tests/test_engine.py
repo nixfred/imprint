@@ -6,6 +6,7 @@ import subprocess
 import sys
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -2235,6 +2236,9 @@ class InterruptedWriteTests(unittest.TestCase):
 
 
 class SkippedRecordTests(unittest.TestCase):
+    def setUp(self):
+        engine.SKIPPED.clear()
+
     def tearDown(self):
         engine.SKIPPED.clear()
 
@@ -2417,6 +2421,156 @@ class PickerRenderTests(unittest.TestCase):
         if engine.distinct_from(hexes.get("selection", ""), hexes.get("bg", "")):
             # the cursor row is painted, not reverse-video
             self.assertIn(f"48;5;{engine.xterm256(hexes['selection'])}m", screen)
+
+
+class BoundedRunTests(unittest.TestCase):
+    """No command imprint runs may hold the whole run open. A save asks ~90 git
+    checkouts three questions each and talks to a shell that may not be there."""
+
+    def test_a_command_that_never_returns_is_killed(self):
+        start = time.monotonic()
+        proc = engine.run(["sleep", "30"], timeout=1)
+        self.assertEqual(proc.returncode, engine.TIMED_OUT)
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertIn("stopped after 1s", proc.stderr)
+
+    def test_a_command_that_floods_is_killed_while_it_runs(self):
+        start = time.monotonic()
+        proc = engine.run(["bash", "-c", "cat /dev/zero"], timeout=30)
+        self.assertEqual(proc.returncode, engine.TIMED_OUT)
+        self.assertLess(time.monotonic() - start, 20)
+        self.assertLessEqual(len(proc.stdout), engine.RUN_MAX_BYTES + 65536)
+        self.assertIn("of output", proc.stderr)
+
+    def test_a_grandchild_holding_the_pipe_does_not_hold_the_run(self):
+        start = time.monotonic()
+        proc = engine.run(["bash", "-c", "sleep 60 & sleep 60"], timeout=1)
+        self.assertEqual(proc.returncode, engine.TIMED_OUT)
+        self.assertLess(time.monotonic() - start, 10)
+
+    def test_ordinary_commands_are_unchanged(self):
+        proc = engine.run(["echo", "hello"])
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout.strip(), "hello")
+        self.assertEqual(engine.run_ok(["echo", "ok"]).strip(), "ok")
+        self.assertEqual(engine.run_ok(["false"]), "")
+
+    def test_stdin_still_reaches_the_child(self):
+        proc = engine.run(["cat"], stdin_text="through the pipe")
+        self.assertEqual(proc.stdout, "through the pipe")
+
+    def test_a_missing_binary_is_a_result_not_an_explosion(self):
+        proc = engine.run(["definitely-not-a-real-command-xyz"])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotEqual(proc.stderr, "")
+
+    def test_check_still_raises_when_asked(self):
+        with self.assertRaises(subprocess.CalledProcessError):
+            engine.run(["false"], check=True)
+
+
+class ContainedWriteTests(unittest.TestCase):
+    """Archive content going into a live $HOME, without traversing a path by
+    name at any point."""
+
+    def _home(self, tmp):
+        home = Path(tmp) / "home"
+        (home / ".config").mkdir(parents=True)
+        return home
+
+    def test_an_ordinary_file_lands_with_its_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._home(tmp)
+            source = Path(tmp) / "src"
+            source.write_text("body\n", encoding="utf-8")
+            source.chmod(0o640)
+            engine.place_file(home, ".config/app/thing.conf", source)
+            landed = home / ".config/app/thing.conf"
+            self.assertEqual(landed.read_text(encoding="utf-8"), "body\n")
+            self.assertEqual(landed.stat().st_mode & 0o777, 0o640)
+            self.assertEqual([p.name for p in (home / ".config/app").iterdir()],
+                             ["thing.conf"], "a temp file was left behind")
+
+    def test_a_broken_symlink_is_restored_as_a_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._home(tmp)
+            source = Path(tmp) / "link"
+            source.symlink_to("nowhere/at/all")
+            engine.place_file(home, ".config/link", source)
+            landed = home / ".config/link"
+            self.assertTrue(landed.is_symlink())
+            self.assertEqual(os.readlink(landed), "nowhere/at/all")
+
+    def test_a_directory_symlink_out_of_home_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._home(tmp)
+            outside = Path(tmp) / "outside"
+            outside.mkdir()
+            (outside / "secret.conf").write_text("mine\n", encoding="utf-8")
+            (home / ".config/app").symlink_to(outside)
+            source = Path(tmp) / "src"
+            source.write_text("from the archive\n", encoding="utf-8")
+            with self.assertRaises(engine.UnsafePath):
+                engine.place_file(home, ".config/app/secret.conf", source)
+            self.assertEqual((outside / "secret.conf").read_text(encoding="utf-8"), "mine\n")
+
+    def test_a_symlink_that_stays_inside_home_is_fine(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._home(tmp)
+            (home / "real").mkdir()
+            (home / ".config/app").symlink_to(home / "real")
+            source = Path(tmp) / "src"
+            source.write_text("ok\n", encoding="utf-8")
+            engine.place_file(home, ".config/app/thing.conf", source)
+            self.assertEqual((home / "real/thing.conf").read_text(encoding="utf-8"), "ok\n")
+
+    def test_swapping_the_directory_after_the_check_cannot_redirect_the_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._home(tmp)
+            (home / ".config/app").mkdir()
+            outside = Path(tmp) / "outside"
+            outside.mkdir()
+            (outside / "secret.conf").write_text("mine\n", encoding="utf-8")
+            source = Path(tmp) / "src"
+            source.write_text("from the archive\n", encoding="utf-8")
+            # verified while it is a real directory
+            fd = engine.open_within(home, (".config", "app"))
+            try:
+                # and swapped for a way out of home before the write
+                (home / ".config/app").rmdir()
+                (home / ".config/app").symlink_to(outside)
+                with self.assertRaises(OSError):
+                    engine._replace_at(fd, "secret.conf", source)
+            finally:
+                os.close(fd)
+            self.assertEqual((outside / "secret.conf").read_text(encoding="utf-8"), "mine\n",
+                             "the write escaped home through a swapped symlink")
+
+    def test_traversal_in_the_archive_path_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._home(tmp)
+            source = Path(tmp) / "src"
+            source.write_text("x", encoding="utf-8")
+            for rel in ("../escape.conf", ".config/../../escape.conf", ""):
+                with self.assertRaises((engine.UnsafePath, ValueError)):
+                    engine.place_file(home, rel, source)
+
+    def test_restore_still_puts_a_whole_tree_in_place(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cat = Path(tmp) / "cat"
+            files = cat / "files/.config/deep/deeper"
+            files.mkdir(parents=True)
+            (files / "a.conf").write_text("a\n", encoding="utf-8")
+            (cat / "files/.config/b.conf").write_text("b\n", encoding="utf-8")
+            home = Path(tmp) / "home"
+            home.mkdir()
+            undo = Path(tmp) / "undo"
+            undo.mkdir()
+            engine.FAILURES.clear()
+            done = engine.restore_file_tree(cat, home, "", undo, False)
+            self.assertEqual(engine.FAILURES, [], done)
+            self.assertEqual((home / ".config/deep/deeper/a.conf").read_text(encoding="utf-8"), "a\n")
+            self.assertEqual((home / ".config/b.conf").read_text(encoding="utf-8"), "b\n")
 
 
 if __name__ == "__main__":
