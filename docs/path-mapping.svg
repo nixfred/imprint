@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="708" viewBox="0 0 960 708" role="img" aria-labelledby="title desc" font-family="system-ui, -apple-system, Segoe UI, sans-serif">
+<title id="title">Archive paths become explicit targets</title>
+<desc id="desc">User payload paths map beneath TARGET_HOME. System etc paths map beneath SYSTEM_ROOT, require allow-system, and never map into the home.</desc>
+<defs>
+<marker id="arrow-violet" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0 0 L10 5 L0 10Z" fill="#a3a7f0"/>
+</marker>
+<marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0 0 L10 5 L0 10Z" fill="#92c9a5"/>
+</marker>
+<marker id="arrow-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0 0 L10 5 L0 10Z" fill="#e0a86a"/>
+</marker>
+<marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0 0 L10 5 L0 10Z" fill="#ef959b"/>
+</marker>
+<pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+<path d="M32 0H0V32" fill="none" stroke="#242c52" stroke-opacity=".35"/>
+</pattern>
+</defs>
+<rect width="960" height="708" rx="18" fill="#0b1020"/>
+<rect x="1" y="1" width="958" height="706" rx="18" fill="url(#grid)" stroke="#242c52"/>
+<text x="32" y="42" fill="#a3a7f0" font-size="14" font-weight="600">IMPRINT / PATH MAPPING</text>
+<text x="32" y="83" fill="#d7dcf5" font-size="30" font-weight="600">Archive paths become explicit targets</text>
+<rect x="32" y="130" width="896" height="128" rx="12" fill="#111834" stroke="#a3a7f0" stroke-opacity=".65"/>
+<text x="52" y="157" fill="#a3a7f0" font-size="14" font-weight="600">USER SERVICE</text>
+<text x="52" y="188" fill="#acb6da" font-size="17" font-weight="400" font-family="ui-monospace, monospace">categories/services/files/</text>
+<text x="52" y="217" fill="#d7dcf5" font-size="16" font-weight="400" font-family="ui-monospace, monospace">.config/systemd/user/demo.service</text>
+<path d="M512 199 L550 199" fill="none" stroke="#a3a7f0" stroke-width="2" marker-end="url(#arrow-violet)"/>
+<text x="574" y="188" fill="#a3a7f0" font-size="17" font-weight="400" font-family="ui-monospace, monospace">TARGET_HOME/</text>
+<text x="574" y="216" fill="#d7dcf5" font-size="16" font-weight="400" font-family="ui-monospace, monospace">.config/systemd/user/</text>
+<text x="574" y="239" fill="#d7dcf5" font-size="16" font-weight="400" font-family="ui-monospace, monospace">demo.service</text>
+<rect x="32" y="280" width="896" height="128" rx="12" fill="#111834" stroke="#92c9a5" stroke-opacity=".65"/>
+<text x="52" y="307" fill="#92c9a5" font-size="14" font-weight="600">HELPER SCRIPT</text>
+<text x="52" y="338" fill="#acb6da" font-size="17" font-weight="400" font-family="ui-monospace, monospace">categories/scripts/files/</text>
+<text x="52" y="367" fill="#d7dcf5" font-size="16" font-weight="400" font-family="ui-monospace, monospace">.local/share/demo/watch.py</text>
+<path d="M512 349 L550 349" fill="none" stroke="#92c9a5" stroke-width="2" marker-end="url(#arrow-green)"/>
+<text x="574" y="338" fill="#92c9a5" font-size="17" font-weight="400" font-family="ui-monospace, monospace">TARGET_HOME/</text>
+<text x="574" y="366" fill="#d7dcf5" font-size="16" font-weight="400" font-family="ui-monospace, monospace">.local/share/demo/</text>
+<text x="574" y="389" fill="#d7dcf5" font-size="16" font-weight="400" font-family="ui-monospace, monospace">watch.py</text>
+<rect x="32" y="430" width="896" height="128" rx="12" fill="#111834" stroke="#e0a86a" stroke-opacity=".65"/>
+<text x="52" y="457" fill="#e0a86a" font-size="14" font-weight="600">SYSTEM POLICY</text>
+<text x="52" y="488" fill="#acb6da" font-size="17" font-weight="400" font-family="ui-monospace, monospace">categories/system/</text>
+<text x="52" y="517" fill="#d7dcf5" font-size="16" font-weight="400" font-family="ui-monospace, monospace">etc/systemd/logind.conf.d/local.conf</text>
+<path d="M512 499 L550 499" fill="none" stroke="#e0a86a" stroke-width="2" marker-end="url(#arrow-amber)"/>
+<text x="574" y="488" fill="#e0a86a" font-size="17" font-weight="400" font-family="ui-monospace, monospace">SYSTEM_ROOT/</text>
+<text x="574" y="516" fill="#d7dcf5" font-size="16" font-weight="400" font-family="ui-monospace, monospace">etc/systemd/logind.conf.d/</text>
+<text x="574" y="539" fill="#d7dcf5" font-size="16" font-weight="400" font-family="ui-monospace, monospace">local.conf</text>
+<text x="32" y="616" fill="#d7dcf5" font-size="18" font-weight="400">Select exact relative paths with --file; select system paths with etc/.</text>
+<text x="32" y="648" fill="#acb6da" font-size="17" font-weight="400">Text home paths may be rewritten. Variables, devices and dependencies need review.</text>
+<text x="32" y="679" fill="#e0a86a" font-size="17" font-weight="400">System writes and undo require --allow-system. Target roots must already exist.</text>
+</svg>

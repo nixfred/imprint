@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="590" viewBox="0 0 960 590" role="img" aria-labelledby="title desc" font-family="system-ui, -apple-system, Segoe UI, sans-serif">
+<title id="title">Recover files. Then decide what runs.</title>
+<desc id="desc">Validate, preview and atomically write with backups. Undo restores files. Activation is a separate approved step and runtime verification is not implied by a file write.</desc>
+<defs>
+<marker id="arrow-violet" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0 0 L10 5 L0 10Z" fill="#a3a7f0"/>
+</marker>
+<marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0 0 L10 5 L0 10Z" fill="#92c9a5"/>
+</marker>
+<marker id="arrow-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0 0 L10 5 L0 10Z" fill="#e0a86a"/>
+</marker>
+<marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0 0 L10 5 L0 10Z" fill="#ef959b"/>
+</marker>
+<pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+<path d="M32 0H0V32" fill="none" stroke="#242c52" stroke-opacity=".35"/>
+</pattern>
+</defs>
+<rect width="960" height="590" rx="18" fill="#0b1020"/>
+<rect x="1" y="1" width="958" height="588" rx="18" fill="url(#grid)" stroke="#242c52"/>
+<text x="32" y="42" fill="#a3a7f0" font-size="14" font-weight="600">IMPRINT / RECOVERY FLOW</text>
+<text x="32" y="83" fill="#d7dcf5" font-size="30" font-weight="600">Recover files. Then decide what runs.</text>
+<rect x="32" y="133" width="272" height="114" rx="12" fill="#111834" stroke="#a3a7f0" stroke-opacity=".65"/>
+<text x="52" y="171" fill="#d7dcf5" font-size="23" font-weight="600">Validate</text>
+<text x="52" y="210" fill="#acb6da" font-size="18" font-weight="400">Hashes + paths</text>
+<path d="M308 190 L336 190" fill="none" stroke="#a3a7f0" stroke-width="2" marker-end="url(#arrow-violet)"/>
+<rect x="344" y="133" width="272" height="114" rx="12" fill="#111834" stroke="#a3a7f0" stroke-opacity=".65"/>
+<text x="364" y="171" fill="#d7dcf5" font-size="23" font-weight="600">Preview</text>
+<text x="364" y="210" fill="#acb6da" font-size="18" font-weight="400">Diffs + modes</text>
+<path d="M620 190 L648 190" fill="none" stroke="#a3a7f0" stroke-width="2" marker-end="url(#arrow-violet)"/>
+<rect x="656" y="133" width="272" height="114" rx="12" fill="#111834" stroke="#92c9a5" stroke-opacity=".65"/>
+<text x="676" y="171" fill="#d7dcf5" font-size="23" font-weight="600">Write</text>
+<text x="676" y="210" fill="#acb6da" font-size="18" font-weight="400">Backup + rename</text>
+<path d="M792 251 L792 308" fill="none" stroke="#e0a86a" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#arrow-amber)"/>
+<rect x="656" y="320" width="272" height="128" rx="12" fill="#111834" stroke="#e0a86a" stroke-opacity=".65"/>
+<text x="676" y="360" fill="#e0a86a" font-size="21" font-weight="600">Activation: pending</text>
+<text x="676" y="395" fill="#acb6da" font-size="17" font-weight="400">Separate approval + action</text>
+<text x="676" y="424" fill="#d7dcf5" font-size="17" font-weight="400">No activation in files-only</text>
+<path d="M651 384 L620 384" fill="none" stroke="#e0a86a" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#arrow-amber)"/>
+<rect x="344" y="320" width="272" height="128" rx="12" fill="#111834" stroke="#92c9a5" stroke-opacity=".65"/>
+<text x="364" y="360" fill="#d7dcf5" font-size="22" font-weight="600">Verify runtime</text>
+<text x="364" y="396" fill="#acb6da" font-size="17" font-weight="400">Check actual app behavior</text>
+<text x="364" y="425" fill="#acb6da" font-size="16" font-weight="400">After approved activation</text>
+<rect x="32" y="320" width="272" height="128" rx="12" fill="#111834" stroke="#ef959b" stroke-opacity=".65"/>
+<text x="52" y="360" fill="#d7dcf5" font-size="22" font-weight="600">Undo files</text>
+<text x="52" y="396" fill="#acb6da" font-size="17" font-weight="400">Restore originals + modes</text>
+<text x="52" y="425" fill="#acb6da" font-size="17" font-weight="400">Remove newly created files</text>
+<path d="M756 253 V282 H167 V314" fill="none" stroke="#ef959b" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#arrow-red)"/>
+<text x="32" y="492" fill="#d7dcf5" font-size="18" font-weight="400">Write failure → file rollback attempted; read the report for the outcome.</text>
+<text x="32" y="525" fill="#e0a86a" font-size="18" font-weight="400">Undo is not an uninstall or a reversal of service / desktop activation.</text>
+<text x="32" y="558" fill="#acb6da" font-size="17" font-weight="400">A preview is advisory, not a lock. Pause competing writers before recovery.</text>
+</svg>

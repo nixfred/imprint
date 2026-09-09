@@ -171,13 +171,29 @@ SELECTION_FILE=""
 
 # Our own picker: space toggles, space on a row with a submenu walks into it,
 # and the top row selects everything. gum choose can do none of that.
+# Callers read this through $(...), which is a subshell: anything it assigns
+# to SELECTION_FILE dies with that subshell. The file is therefore made by the
+# caller, in the parent, through start_selection -- without it every submenu
+# choice was silently discarded and a category the user had narrowed went
+# through whole.
+start_selection() {
+  SELECTION_FILE=$(mktemp -t imprint-selection-XXXXXX.json)
+}
+
+end_selection() {
+  if [[ -n $SELECTION_FILE ]]; then
+    rm -f "$SELECTION_FILE"
+  fi
+  SELECTION_FILE=""
+  return 0
+}
+
 choose_categories() {
   local header=$1
   local archive=${2:-}
-  SELECTION_FILE=$(mktemp -t imprint-selection-XXXXXX.json)
   local args=(pick --header "$header" --action "${PICK_ACTION:-Start backup}")
   [[ -n $archive ]] && args+=(--archive "$archive")
-  engine "${args[@]}" > "$SELECTION_FILE" || { rm -f "$SELECTION_FILE"; SELECTION_FILE=""; return 1; }
+  engine "${args[@]}" > "$SELECTION_FILE" || return 1
   python3 -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["categories"]))' \
     "$SELECTION_FILE"
 }
@@ -307,7 +323,9 @@ do_save() {
   banner
   if [[ -z $only && $all -eq 0 ]]; then
     if (( HAVE_GUM )); then
-      PICK_ACTION="Start backup" only=$(choose_categories "What should this imprint carry?") || die "cancelled"
+      start_selection
+      PICK_ACTION="Start backup" only=$(choose_categories "What should this imprint carry?") \
+        || { end_selection; die "cancelled"; }
     else
       only=$(default_selected)
       say "No terminal for the picker; using the default categories."
@@ -340,7 +358,7 @@ do_save() {
   else
     engine save --only "$only" ${SELECTION_FILE:+--select "$SELECTION_FILE"} "${where[@]}" >/dev/null
   fi
-  [[ -n $SELECTION_FILE ]] && rm -f "$SELECTION_FILE"
+  end_selection
 }
 
 do_restore() {
@@ -366,7 +384,9 @@ do_restore() {
   say "Archive $archive"
   if [[ -z $only ]]; then
     if (( HAVE_GUM )); then
-      PICK_ACTION="Review changes" only=$(choose_categories "What should land on this machine?" "$archive") || die "cancelled"
+      start_selection
+      PICK_ACTION="Review changes" only=$(choose_categories "What should land on this machine?" "$archive") \
+        || { end_selection; die "cancelled"; }
     else
       only=$(ids_from_archive_defaults "$archive")
       say "No terminal for the picker; using this archive's default categories."
@@ -394,10 +414,10 @@ do_restore() {
   # Say exactly what will change before asking for the go-ahead.
   engine preview "$archive" --only "$only" ${SELECTION_FILE:+--select "$SELECTION_FILE"}
   if [[ $dry -eq 0 ]]; then
-    confirm "Apply these changes to this machine?" || { [[ -n $SELECTION_FILE ]] && rm -f "$SELECTION_FILE"; die "cancelled"; }
+    confirm "Apply these changes to this machine?" || { end_selection; die "cancelled"; }
   fi
   engine restore "$archive" --only "$only" "${extra[@]}" >/dev/null
-  [[ -n $SELECTION_FILE ]] && rm -f "$SELECTION_FILE"
+  end_selection
 }
 
 do_list() {
@@ -462,6 +482,13 @@ case $cmd in
   -h|--help|help) usage ;;
   -V|--version) engine --version ;;
   save)
+    # Advanced exact-file selection is already parsed by the engine.
+    for arg in "$@"; do
+      if [[ $arg == --include-file || $arg == --select || $arg == --system-root ]]; then
+        engine save "$@"
+        exit $?
+      fi
+    done
     only=""
     output=""
     all=0
@@ -486,6 +513,12 @@ case $cmd in
     fi
     ;;
   restore)
+    for arg in "$@"; do
+      if [[ $arg == --files-only || $arg == --target-home || $arg == --file || $arg == --system-root || $arg == --select || $arg == --shell-key ]]; then
+        engine restore "$@"
+        exit $?
+      fi
+    done
     archive=""
     only=""
     dry=0

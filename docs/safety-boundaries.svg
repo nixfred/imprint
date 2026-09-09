@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="675" viewBox="0 0 960 675" role="img" aria-labelledby="title desc" font-family="system-ui, -apple-system, Segoe UI, sans-serif">
+<title id="title">Two restore modes, different effects</title>
+<desc id="desc">Files-only recovers regular payload files without activation. Recipe restore can install and activate software. Shell restore allows selected scalar settings only and preserves live layout. Hashes are not archive authentication.</desc>
+<defs>
+<marker id="arrow-violet" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0 0 L10 5 L0 10Z" fill="#a3a7f0"/>
+</marker>
+<marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0 0 L10 5 L0 10Z" fill="#92c9a5"/>
+</marker>
+<marker id="arrow-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0 0 L10 5 L0 10Z" fill="#e0a86a"/>
+</marker>
+<marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0 0 L10 5 L0 10Z" fill="#ef959b"/>
+</marker>
+<pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+<path d="M32 0H0V32" fill="none" stroke="#242c52" stroke-opacity=".35"/>
+</pattern>
+</defs>
+<rect width="960" height="675" rx="18" fill="#0b1020"/>
+<rect x="1" y="1" width="958" height="673" rx="18" fill="url(#grid)" stroke="#242c52"/>
+<text x="32" y="42" fill="#a3a7f0" font-size="14" font-weight="600">IMPRINT / SAFETY BOUNDARIES</text>
+<text x="32" y="83" fill="#d7dcf5" font-size="30" font-weight="600">Two restore modes, different effects</text>
+<rect x="32" y="131" width="424" height="246" rx="12" fill="#111834" stroke="#92c9a5" stroke-opacity=".65"/>
+<text x="54" y="173" fill="#92c9a5" font-size="25" font-weight="600">Files-only recovery</text>
+<text x="54" y="212" fill="#d7dcf5" font-size="19" font-weight="400">Regular selected payload files</text>
+<text x="54" y="244" fill="#d7dcf5" font-size="19" font-weight="400">Integrity + syntax checks</text>
+<text x="54" y="276" fill="#d7dcf5" font-size="19" font-weight="400">Backup, atomic writes, file undo</text>
+<text x="54" y="308" fill="#d7dcf5" font-size="19" font-weight="400">No package / Git commands</text>
+<text x="54" y="340" fill="#d7dcf5" font-size="19" font-weight="400">No service / desktop activation</text>
+<rect x="504" y="131" width="424" height="246" rx="12" fill="#111834" stroke="#e0a86a" stroke-opacity=".65"/>
+<text x="526" y="173" fill="#e0a86a" font-size="25" font-weight="600">Recipe restore</text>
+<text x="526" y="212" fill="#d7dcf5" font-size="19" font-weight="400">Packages, projects and plugins</text>
+<text x="526" y="244" fill="#d7dcf5" font-size="19" font-weight="400">Installers may have side effects</text>
+<text x="526" y="276" fill="#d7dcf5" font-size="19" font-weight="400">User services: reload + enable</text>
+<text x="526" y="308" fill="#d7dcf5" font-size="19" font-weight="400">Does not start those services</text>
+<text x="526" y="340" fill="#d7dcf5" font-size="19" font-weight="400">No final automatic desktop reload</text>
+<rect x="32" y="403" width="896" height="131" rx="12" fill="#111834" stroke="#a3a7f0" stroke-opacity=".65"/>
+<text x="54" y="440" fill="#a3a7f0" font-size="23" font-weight="600">shell.json is never a whole-file restore</text>
+<text x="54" y="476" fill="#d7dcf5" font-size="18" font-weight="400">Explicit scalar keys → fresh live snapshot → config-edit apply → verify live + disk</text>
+<text x="54" y="509" fill="#acb6da" font-size="18" font-weight="400">Layout and membership stay untouched. Files-only refuses shell.json.</text>
+<text x="32" y="579" fill="#ef959b" font-size="14" font-weight="600">TRUST BOUNDARY</text>
+<text x="32" y="611" fill="#d7dcf5" font-size="19" font-weight="400">Hashes detect corruption, not authenticity. Use trusted archives and tools.</text>
+<text x="32" y="643" fill="#acb6da" font-size="18" font-weight="400">“Secrets off” is not a scanner. Keep archives and previews private.</text>
+</svg>

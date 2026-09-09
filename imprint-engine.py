@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import curses
+import difflib
 import errno
+import hashlib
 import json
 import os
 import re
@@ -756,6 +758,20 @@ def safe_segment(name: str) -> bool:
     if "/" in name or "\\" in name or "\0" in name:
         return False
     return True
+
+
+SHELL_SAFE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.@:+-]*$")
+
+
+def shell_segment(name: str) -> bool:
+    """A name out of an archive that ends up inside a generated shell script.
+
+    Quoting it is the real defence and the plan does that now, but a plugin id,
+    a systemd unit or a theme is a short mechanical name. `demo$(rm -rf ~)` is
+    not one, and an archive claiming otherwise is malformed. Keeping those out
+    of the script entirely means one missed pair of quotes is not a machine.
+    """
+    return bool(name) and len(name) <= 128 and bool(SHELL_SAFE.match(name))
 
 
 def contained(base: Path, candidate: Path) -> Path:
@@ -1811,7 +1827,8 @@ def package_owns(path: Path) -> bool:
 
 
 def enabled_system_units() -> list[str]:
-    text = run_ok(["systemctl", "list-unit-files", "--state=enabled", "--no-legend"])
+    flags = [f"--root={SOURCE_SYSTEM_ROOT}"] if SOURCE_SYSTEM_ROOT != Path("/") else []
+    text = run_ok(["systemctl", *flags, "list-unit-files", "--state=enabled", "--no-legend"])
     names = []
     for line in text.splitlines():
         parts = line.split()
@@ -1825,8 +1842,11 @@ def enabled_system_units() -> list[str]:
     return sorted(names)
 
 
+SOURCE_SYSTEM_ROOT = Path("/")
+
+
 def collect_system(cat_dir: Path, home: Path) -> dict:
-    etc = Path("/etc")
+    etc = SOURCE_SYSTEM_ROOT / "etc"
     kept, skipped = [], []
     for rel in ETC_DIRS:
         root = etc / rel
@@ -1866,6 +1886,7 @@ def collect_system(cat_dir: Path, home: Path) -> dict:
             except OSError:
                 skipped.append(f"{path} (unreadable)")
     meta = {
+        "sourceRoot": str(SOURCE_SYSTEM_ROOT),
         "enabledUnits": enabled_system_units(),
         "etcFiles": kept,
         "etcSkipped": skipped,
@@ -2440,10 +2461,10 @@ def need_dir(raw: str, what: str) -> Path:
 
 def write_archive(staging: Path, dest: Path) -> None:
     check_dest(dest)
-    tmp = dest.with_suffix(dest.suffix + ".partial")
+    fd, name = tempfile.mkstemp(prefix=dest.name + ".", suffix=".partial", dir=dest.parent)
+    os.close(fd)
+    tmp = Path(name)  # mode 0600 before the first archived byte is written
     try:
-        if tmp.exists():
-            tmp.unlink()
         with tarfile.open(tmp, "w:zst") as tar:
             tar.add(staging, arcname=".")
         tmp.replace(dest)
@@ -2468,6 +2489,50 @@ def extract_archive(archive: Path, dest: Path) -> None:
         raise SystemExit(f"cannot read {archive}: {exc}")
 
 
+def integrity_index(root: Path) -> dict:
+    """Index every archived leaf except the self-referential manifest."""
+    result = {}
+    for path in sorted(root.rglob("*")):
+        rel = path.relative_to(root).as_posix()
+        if rel == "manifest.json" or (path.is_dir() and not path.is_symlink()):
+            continue
+        mode = stat.S_IMODE(path.lstat().st_mode)
+        if path.is_symlink():
+            result[rel] = {"type": "symlink", "target": os.readlink(path)}
+        elif path.is_file():
+            with path.open("rb") as stream:
+                digest = hashlib.file_digest(stream, "sha256").hexdigest()
+            result[rel] = {"type": "file", "size": path.stat().st_size,
+                           "mode": mode & 0o777, "sha256": digest}
+        else:
+            raise SystemExit(f"unsupported archive file type: {rel}")
+    return result
+
+
+def check_integrity(root: Path, manifest: dict) -> None:
+    expected = manifest.get("integrity")
+    if expected is None:
+        return  # Old archives are readable, but have no content integrity claim.
+    if not isinstance(expected, dict):
+        raise SystemExit("invalid integrity index")
+    actual = integrity_index(root)
+    if set(expected) != set(actual):
+        raise SystemExit("archive integrity: missing or unexpected files")
+    for rel, record in expected.items():
+        if not isinstance(record, dict):
+            raise SystemExit(f"archive integrity: invalid record {rel}")
+        observed = dict(actual[rel])
+        if record.get("type") == "file":
+            mode = record.get("mode")
+            if type(mode) is not int or not 0 <= mode <= 0o777:
+                raise SystemExit(f"archive integrity: invalid mode {rel}")
+            # tar's safe data filter normalizes permissions; the original safe
+            # mode is provenance and is restored only after bytes verify.
+            observed["mode"] = mode
+        if record != observed:
+            raise SystemExit(f"archive integrity mismatch: {rel}")
+
+
 def load_manifest(root: Path) -> dict:
     path = root / "manifest.json"
     if not path.is_file():
@@ -2480,6 +2545,10 @@ def load_manifest(root: Path) -> dict:
         raise SystemExit("manifest.json is not an object")
     if data.get("kind") != KIND:
         raise SystemExit(f"not an imprint: kind={data.get('kind')}")
+    schema = data.get("schema")
+    if schema is not None and (type(schema) is not int or not 1 <= schema <= SCHEMA):
+        raise SystemExit(f"unsupported schema {schema!r}")
+    check_integrity(root, data)
     return data
 
 
@@ -2604,7 +2673,62 @@ def default_archive_path(home: Path, host: str) -> Path:
     return default_archive_dir(home)[0] / f"imprint-{host}-{now_stamp()}.tar.zst"
 
 
+def include_helpers(staging: Path, home: Path, paths: list[str], categories: dict) -> None:
+    """Exact opt-in helper files, never recursive agent/application state."""
+    if not paths:
+        return
+    if "scripts" not in categories:
+        raise SystemExit("--include-file requires the scripts category")
+    records = []
+    for rel in dict.fromkeys(paths):
+        parts = rel.split("/")
+        allowed = ("bin/", ".local/bin/", ".local/share/", ".hermes/scripts/")
+        if (not rel.startswith(allowed) or any(not safe_segment(p) for p in parts)
+                or any(is_skipped_name(p) for p in parts)):
+            raise SystemExit(f"refused helper path: {rel}")
+        # Open every component without following symlinks. fstat and read use
+        # the same descriptor, so a concurrent source rename cannot swap it.
+        fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            for component in parts[:-1]:
+                child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                os.close(fd)
+                fd = child
+            source = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+            with os.fdopen(source, "rb") as stream:
+                st = os.fstat(stream.fileno())
+                if not stat.S_ISREG(st.st_mode) or st.st_mode & 0o7000 or st.st_size > SCRIPT_LIMIT:
+                    raise SystemExit(f"refused helper type, mode or size: {rel}")
+                data = stream.read(SCRIPT_LIMIT + 1)
+        finally:
+            os.close(fd)
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise SystemExit(f"helper is not UTF-8: {rel}")
+        if len(data) > SCRIPT_LIMIT or b"\0" in data or not text.startswith("#!"):
+            raise SystemExit(f"helper must be a bounded text script with a shebang: {rel}")
+        if re.search(r'''(?im)["']?(?:api[_-]?key|access[_-]?token|password|passwd|secret|token)["']?\s*[:=]\s*["'][^"'\n]+["']''', text):
+            raise SystemExit(f"possible embedded credential in helper: {rel}; review and externalize it")
+        refs = []
+        forms = [str(home / rel), "~/" + rel, "$HOME/" + rel, "${HOME}/" + rel, "%h/" + rel]
+        for path in iter_files(staging / "categories"):
+            body = read_text_safe(path)
+            if body is not None and any(form in body for form in forms):
+                refs.append(path.relative_to(staging).as_posix())
+        dest = staging / "categories/scripts/files" / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        dest.chmod(stat.S_IMODE(st.st_mode))
+        records.append({"path": rel, "source": str(home / rel), "referencedBy": refs,
+                        "sha256": hashlib.sha256(data).hexdigest(), "mode": stat.S_IMODE(st.st_mode)})
+    categories["scripts"]["includedHelpers"] = records
+    write_json(staging / "categories/scripts/meta.json", categories["scripts"])
+
+
 def cmd_save(args) -> int:
+    global SOURCE_SYSTEM_ROOT
+    SOURCE_SYSTEM_ROOT = strict_target(Path(getattr(args, "system_root", "/")))
     home = Path.home()
     if getattr(args, "select", ""):
         path = need_file(args.select, "cannot read the selection file")
@@ -2635,6 +2759,7 @@ def cmd_save(args) -> int:
         staging.mkdir()
         progress = Progress(len(ids), f"Collecting {hostname()}")
         categories = collect_selected(staging, home, ids, progress)
+        include_helpers(staging, home, getattr(args, "include_file", []) or [], categories)
         manifest = machine_facts()
         manifest["categories"] = {cid: strip_heavy(categories[cid]) for cid in ids}
         manifest["archiveName"] = dest.name
@@ -2646,6 +2771,8 @@ def cmd_save(args) -> int:
         write_json(staging / "manifest.json", manifest)
         (staging / "BRIEF.md").write_text(render_brief(manifest), encoding="utf-8")
         copy_tool(staging)
+        manifest["integrity"] = integrity_index(staging)
+        write_json(staging / "manifest.json", manifest)
         progress.update("writing the archive")
         write_archive(staging, dest)
         size_now = dest.stat().st_size
@@ -2863,7 +2990,7 @@ def restore_plugins(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: b
             continue
         # An archive is untrusted input: an id like "../../../Documents" would
         # otherwise be rmtree'd and replaced.
-        if not safe_segment(pid):
+        if not shell_segment(pid):
             actions.append(f"refused unsafe plugin id {pid!r}")
             continue
         if not wanted("plugins", pid):
@@ -2963,7 +3090,7 @@ def restore_plugins(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: b
         run(["omarchy-shell", "shell", "rescanPlugins"])
         live = {item.get("id"): item for item in plugin_list() if item.get("id")}
     to_enable = [p for p in (meta.get("plugins") or [])
-                 if p.get("enabled") and safe_segment(p.get("id") or "")
+                 if p.get("enabled") and shell_segment(p.get("id") or "")
                  and wanted("plugins", p.get("id") or "")]
     for plug in to_enable:
         pid = plug["id"]
@@ -3008,7 +3135,7 @@ def restore_plugins(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: b
             if not turn_off:
                 break
             for pid in turn_off:
-                if not safe_segment(pid):
+                if not shell_segment(pid):
                     continue
                 proc = run(["omarchy", "plugin", "disable", pid])
                 if proc.returncode == 0:
@@ -3024,7 +3151,7 @@ def restore_plugins(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: b
         if not wanted("plugins", plug.get("id") or ""):
             continue
         for unit in plug.get("units") or []:
-            if not safe_segment(unit):
+            if not shell_segment(unit):
                 continue
             if dry:
                 actions.append(f"{plug.get('id')} needs user unit {unit}")
@@ -3115,7 +3242,7 @@ def restore_themes(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bo
                     # omarchy-theme-install rm -rf's the destination BEFORE it
                     # clones, so an offline install destroys the existing theme
                     # with nothing to put back. Take an undo copy first.
-                    if safe_segment(tid):
+                    if shell_segment(tid):
                         existing = home / ".config/omarchy/themes" / tid
                         if existing.exists() or existing.is_symlink():
                             backup_existing(existing, undo, home)
@@ -3168,7 +3295,8 @@ def shell_is_running() -> bool:
     return run(["omarchy", "shell", "-q", "shell", "ping"]).returncode == 0
 
 
-def restore_bar(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool) -> list[str]:
+def restore_bar(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool,
+                keys: list[str] | None = None) -> list[str]:
     shell_src = cat_dir / "files/.config/omarchy/shell.json"
     if not shell_src.is_file():
         # packed relative without leading handling
@@ -3180,6 +3308,8 @@ def restore_bar(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool)
     if not shell_src.is_file():
         return others + ["no shell.json in this imprint, bar left alone"]
     dest = home / ".config/omarchy/shell.json"
+    if not keys:
+        return others + [fail("shell.json NOT applied: select individual settings with --shell-key /object/key")]
     if dry:
         return others + ["shell.json via config-edit"]
     text = rewrite_text(shell_src.read_text(encoding="utf-8"), old_home, str(home))
@@ -3193,9 +3323,24 @@ def restore_bar(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool)
     os.close(edit_fd)
     snap, edited = Path(snap_name), Path(edit_name)
     try:
-        edited.write_text(text, encoding="utf-8")
         snap_proc = run(["omarchy", "shell", "config-edit", "snapshot", str(snap)])
         if snap_proc.returncode == 0:
+            try:
+                archived = json.loads(text)
+                merged = json.loads(snap.read_text())
+                for key in keys:
+                    if not key.startswith("/") or key in {"/", "/bar", "/plugins", "/disabledPlugins"} or key.startswith(("/bar/layout", "/bar/id", "/plugins/", "/disabledPlugins/")):
+                        raise ValueError("layout and membership are manual; choose a non-layout leaf setting")
+                    parts = [p.replace("~1", "/").replace("~0", "~") for p in key[1:].split("/")]
+                    src, dst = archived, merged
+                    for part in parts[:-1]:
+                        src, dst = src[part], dst[part]
+                    if not isinstance(dst, dict) or isinstance(src[parts[-1]], (dict, list)):
+                        raise ValueError("select a scalar leaf setting, not a whole object or array")
+                    dst[parts[-1]] = src[parts[-1]]
+                edited.write_text(json.dumps(merged), encoding="utf-8")
+            except (ValueError, KeyError, TypeError) as exc:
+                return others + [fail(f"shell.json NOT applied: {exc}")]
             if dest.exists():
                 backup_existing(dest, undo, home)
             apply = run(
@@ -3206,24 +3351,22 @@ def restore_bar(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool)
                     "apply",
                     str(snap),
                     str(edited),
-                    "--allow-layout-change",
                 ]
             )
             if apply.returncode == 0:
-                return others + ["shell.json via config-edit"]
+                verify = run(["omarchy", "shell", "config-edit", "snapshot", str(snap)])
+                try:
+                    persisted = json.loads(dest.read_text()) == merged
+                    live = json.loads(snap.read_text()) == merged
+                except (OSError, ValueError):
+                    persisted = live = False
+                if verify.returncode or not persisted or not live:
+                    return others + [fail("shell.json accepted but live/disk persistence verification failed")]
+                return others + ["selected shell settings via config-edit; live and disk verified"]
             detail = (apply.stderr or apply.stdout).strip()[:200]
             return others + [fail(f"shell.json NOT applied, config-edit refused: {detail}")]
-        # A failed snapshot is not proof the shell is stopped -- it could be an
-        # IPC error or a timeout. Only write directly when the shell really is
-        # down, otherwise refuse and say so.
-        if shell_is_running():
-            detail = (snap_proc.stderr or snap_proc.stdout).strip()[:200]
-            return others + [fail(f"shell.json NOT applied: shell is up but snapshot failed: {detail}")]
-        if dest.exists():
-            backup_existing(dest, undo, home)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(text, encoding="utf-8")
-        return others + ["shell.json written directly (shell not running)"]
+        detail = (snap_proc.stderr or snap_proc.stdout).strip()[:200]
+        return others + [fail(f"shell.json NOT applied: live snapshot unavailable: {detail}")]
     finally:
         for path in (snap, edited):
             try:
@@ -3237,14 +3380,16 @@ def restore_services(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: 
     meta_path = cat_dir / "meta.json"
     if dry or not meta_path.is_file():
         return actions
-    run(["systemctl", "--user", "daemon-reload"])
+    reload = run(["systemctl", "--user", "daemon-reload"])
+    if reload.returncode:
+        return actions + [fail("user daemon-reload failed; enablement not attempted")]
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     for unit in meta.get("units") or []:
         name = unit.get("name")
         if not name:
             continue
         if unit.get("enabled"):
-            proc = run(["systemctl", "--user", "enable", "--now", name])
+            proc = run(["systemctl", "--user", "enable", name])
             if proc.returncode == 0:
                 actions.append(f"enable {name} ok")
             else:
@@ -3419,10 +3564,10 @@ def restore_system(cat_dir: Path, home: Path, dry: bool, allow: bool,
             rel = path.relative_to(etc_root)
             if not dry:
                 copy_file(path, stage_etc / rel)
-            etc_target = Path(system_root) / "etc" / rel
+            etc_target = strict_target(Path(system_root) / "etc" / rel)
             installs.append((path, etc_target))
             lines.append(f'install -Dm644 {shlex.quote(str(stage_etc / rel))} {shlex.quote(str(etc_target))}')
-    units = [u for u in (meta.get("enabledUnits") or []) if safe_segment(u)]
+    units = [u for u in (meta.get("enabledUnits") or []) if shell_segment(u)]
     alt_root = system_root not in ("", "/")
     root_flag = f" --root={shlex.quote(system_root)}" if alt_root else ""
     if installs and not alt_root:
@@ -3520,7 +3665,7 @@ def restore_category(
     if cid == "look":
         return restore_look(cat_dir, home, old_home, undo, dry, manifest)
     if cid == "bar":
-        return restore_bar(cat_dir, home, old_home, undo, dry)
+        return restore_bar(cat_dir, home, old_home, undo, dry, getattr(args, "shell_key", []))
     if cid == "services":
         return restore_services(cat_dir, home, old_home, undo, dry)
     if cid == "identity":
@@ -3685,7 +3830,207 @@ def render_preview(changes: dict, ids: list[str]) -> str:
     return "\n".join(lines)
 
 
+def strict_target(path: Path) -> Path:
+    """A lexical absolute target, with no existing symlink components."""
+    if not path.is_absolute() or ".." in path.parts:
+        raise SystemExit(f"target must be absolute without traversal: {path}")
+    for parent in (*reversed(path.parents), path):
+        if parent.is_symlink():
+            raise SystemExit(f"refused symlink target: {parent}")
+    if path.exists() and not (path.is_file() or path.is_dir()):
+        raise SystemExit(f"refused special target: {path}")
+    return path
+
+
+def atomic_bytes(dest: Path, data: bytes, mode: int) -> None:
+    """Write via a no-follow directory descriptor and atomic rename."""
+    strict_target(dest)
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    temp = ".imprint-" + os.urandom(12).hex()
+    try:
+        for part in dest.parent.parts[1:]:
+            try:
+                os.mkdir(part, 0o700, dir_fd=fd)
+            except FileExistsError:
+                pass
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        out = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+        with os.fdopen(out, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fchmod(stream.fileno(), mode)
+            os.fsync(stream.fileno())
+        os.replace(temp, dest.name, src_dir_fd=fd, dst_dir_fd=fd)
+        os.fsync(fd)
+    finally:
+        try:
+            os.unlink(temp, dir_fd=fd)
+        except FileNotFoundError:
+            pass
+        os.close(fd)
+
+
+def file_recovery(args, preview: bool = False) -> int:
+    """The category payload path without any recipe or activation side effects."""
+    home = strict_target(Path(getattr(args, "target_home", "") or Path.home()))
+    if not home.is_dir():
+        raise SystemExit(f"target home must already exist: {home}")
+    load_selection(args)
+    with tempfile.TemporaryDirectory(prefix="imprint-files-") as tmp:
+        root = open_imprint(need_archive(args.archive), Path(tmp) / "open")
+        manifest = load_manifest(root)
+        if not isinstance(manifest.get("integrity"), dict):
+            raise SystemExit("files-only recovery requires an integrity-indexed archive; make a new save")
+        ids = parse_only(args.only) if args.only else []
+        if not ids:
+            raise SystemExit("files-only requires explicit --only categories")
+        system_root = strict_target(Path(getattr(args, "system_root", "/")))
+        if "system" in ids:
+            if not system_root.is_dir():
+                raise SystemExit("system root must already exist")
+            if not preview and not getattr(args, "dry_run", False) and not getattr(args, "allow_system", False):
+                raise SystemExit("system files require --allow-system")
+        requested = set(getattr(args, "file", []) or [])
+        found = set()
+        operations = {}
+        for cid in ids:
+            files = root / "categories" / cid / ("etc" if cid == "system" else "files")
+            for src in sorted(iter_files(files)):
+                rel = src.relative_to(files).as_posix()
+                if cid == "system":
+                    rel = "etc/" + rel
+                if requested and rel not in requested:
+                    continue
+                if not wanted(cid, rel):
+                    continue
+                found.add(rel)
+                if rel == ".config/omarchy/shell.json":
+                    raise SystemExit("shell.json needs a selective live config-edit merge, not files-only recovery")
+                if rel.startswith(".local/state/imprint/"):
+                    raise SystemExit("refused recovery state overwrite")
+                dest = strict_target((system_root if cid == "system" else home) / rel)
+                if dest.is_dir() or src.is_symlink():
+                    raise SystemExit(f"files-only requires regular files: {rel}")
+                data = src.read_bytes()
+                text = read_text_safe(src)
+                if text is not None:
+                    data = rewrite_text(text, manifest.get("home") or "", str(home)).encode("utf-8")
+                if src.suffix == ".py":
+                    try:
+                        compile(data, rel, "exec")  # syntax only; never execute recovered code
+                    except (SyntaxError, ValueError) as exc:
+                        raise SystemExit(f"invalid Python configuration {rel}: {exc}")
+                if src.suffix == ".json":
+                    try:
+                        json.loads(data)
+                    except (ValueError, UnicodeError) as exc:
+                        raise SystemExit(f"invalid JSON configuration {rel}: {exc}")
+                if src.suffix == ".sh" or data.startswith((b"#!/bin/sh", b"#!/bin/bash", b"#!/usr/bin/env bash")):
+                    checked = subprocess.run(["bash", "--noprofile", "--norc", "-n"],
+                                             input=data, capture_output=True, env={"PATH": os.defpath})
+                    if checked.returncode:
+                        raise SystemExit(f"invalid shell syntax: {rel}")
+                mode = manifest["integrity"][src.relative_to(root).as_posix()]["mode"]
+                previous = dest.read_bytes() if dest.exists() else None
+                old_mode = stat.S_IMODE(dest.stat().st_mode) if dest.exists() else None
+                diff = ""
+                if text is not None:
+                    diff = "".join(difflib.unified_diff(
+                        (previous or b"").decode("utf-8", errors="replace").splitlines(True),
+                        data.decode("utf-8").splitlines(True), fromfile=str(dest), tofile="archive (mapped)"))
+                entry = {"source": src.relative_to(root).as_posix(), "destination": str(dest),
+                         "path": rel, "scope": "system" if cid == "system" else "home",
+                         "mode": mode, "previousMode": old_mode,
+                         "sha256": hashlib.sha256(data).hexdigest(), "diff": diff,
+                         "changed": previous != data or old_mode != mode}
+                if rel in operations and operations[rel][1] != data:
+                    raise SystemExit(f"conflicting category payloads: {rel}")
+                operations[rel] = (entry, data, previous)
+        if requested - found:
+            raise SystemExit("selected files not present: " + ", ".join(sorted(requested - found)))
+        if not operations:
+            raise SystemExit("no regular payload files selected; files-only does not execute recipes")
+        entries = [entry for entry, _, _ in operations.values()]
+        report = {"ok": True, "files": entries, "targetHome": str(home), "undo": None,
+                  "activation": "not performed; validate applications and reload/restart explicitly"}
+        if preview or getattr(args, "dry_run", False):
+            emit(report, args)
+            return 0
+        state = strict_target(home / ".local/state/imprint")
+        undo = new_undo_dir(state)
+        undo.mkdir(parents=True, mode=0o700)
+        report["undo"] = str(undo)
+        journal = {"targetHome": str(home), "systemRoot": str(system_root), "files": []}
+        for entry, _, previous in operations.values():
+            if not entry["changed"]:
+                continue
+            backup = str(len(journal["files"]))
+            if previous is not None:
+                atomic_bytes(undo / backup, previous, 0o600)
+            journal["files"].append({"path": entry["path"], "scope": entry["scope"],
+                                     "backup": backup if previous is not None else None,
+                                     "mode": entry["previousMode"]})
+        atomic_bytes(undo / "recovery.json", json.dumps(journal).encode(), 0o600)
+        try:
+            for entry, data, _ in operations.values():
+                if entry["changed"]:
+                    atomic_bytes(Path(entry["destination"]), data, entry["mode"])
+        except (OSError, SystemExit) as exc:
+            report["ok"] = False
+            report["error"] = str(exc)
+            try:
+                undo_file_recovery(undo, home, system_root, quiet=True)
+                report["rollback"] = "restored original files"
+            except (OSError, SystemExit) as rollback_error:
+                report["rollback"] = "FAILED: " + str(rollback_error)
+            emit(report, args)
+            return 1
+        emit(report, args)
+        return 0
+
+
+def undo_file_recovery(chosen: Path, home: Path, system_root: Path = Path("/"), quiet: bool = False) -> int:
+    journal = json.loads((chosen / "recovery.json").read_text())
+    if journal["targetHome"] != str(home):
+        raise SystemExit("undo target differs from the recorded target home")
+    if journal.get("systemRoot", "/") != str(system_root):
+        raise SystemExit("undo system root differs from the recorded root")
+    failures = []
+    for record in reversed(journal["files"]):
+        rel = record["path"]
+        try:
+            if Path(rel).is_absolute() or any(not safe_segment(p) for p in rel.split("/")):
+                raise SystemExit("unsafe undo path")
+            dest = strict_target((system_root if record.get("scope") == "system" else home) / rel)
+            if record["backup"] is None:
+                dest.unlink(missing_ok=True)
+            else:
+                backup = record["backup"]
+                if not safe_segment(backup):
+                    raise SystemExit("unsafe undo backup")
+                data = (chosen / backup).read_bytes()
+                # A failed replacement may leave its destination untouched. Do not
+                # rewrite it; still inspect every record in case rename succeeded
+                # before the forward directory fsync failed.
+                if (dest.exists() and dest.read_bytes() == data
+                        and stat.S_IMODE(dest.stat().st_mode) == record["mode"]):
+                    continue
+                atomic_bytes(dest, data, record["mode"])
+        except (OSError, SystemExit) as exc:
+            failures.append(f"{rel}: {exc}")
+    if failures:
+        raise SystemExit("partial rollback; unrecovered files: " + "; ".join(failures))
+    if not quiet:
+        json.dump({"ok": True, "undo": str(chosen), "count": len(journal["files"])}, sys.stdout)
+        sys.stdout.write("\n")
+    return 0
+
+
 def cmd_preview(args) -> int:
+    if getattr(args, "files_only", False):
+        return file_recovery(args, preview=True)
     ensure_session_env()
     load_selection(args)
     archive = need_archive(args.archive)
@@ -3709,6 +4054,10 @@ def cmd_preview(args) -> int:
 
 
 def cmd_restore(args) -> int:
+    if getattr(args, "files_only", False):
+        return file_recovery(args)
+    if getattr(args, "target_home", "") or getattr(args, "file", []):
+        raise SystemExit("--target-home and --file require --files-only")
     ensure_session_env()
     load_selection(args)
     archive = need_archive(args.archive)
@@ -3779,17 +4128,7 @@ def cmd_restore(args) -> int:
             )
             report["categories"][cid] = actions
             progress.item(title, f"{len(actions)} actions", ok=len(FAILURES) == before)
-        if not dry:
-            reload_proc = run(["hyprctl", "reload"])
-            if reload_proc.returncode != 0:
-                report["categories"].setdefault("_final", []).append(
-                    fail("hyprctl reload failed: " + (reload_proc.stderr or reload_proc.stdout).strip()[:200])
-                )
-            shell_proc = run(["omarchy", "restart", "shell"])
-            if shell_proc.returncode != 0:
-                report["categories"].setdefault("_final", []).append(
-                    fail("omarchy restart shell failed: " + (shell_proc.stderr or shell_proc.stdout).strip()[:200])
-                )
+        report["activation"] = "restart-required where applicable; no automatic desktop reload or restart"
         progress.finish("Restore complete" if not FAILURES
                         else f"Restore finished with {len(FAILURES)} problem(s)",
                         f"{len(order)} categories")
@@ -3924,9 +4263,10 @@ def plan_plugins(plan: Plan, meta: dict, root: Path) -> None:
     cat = root / "categories/plugins"
     for plug in meta.get("plugins") or []:
         pid = plug.get("id")
-        if not pid or not safe_segment(pid):
+        if not pid or not shell_segment(pid):
             continue
-        dest = f'"$HOME"/.config/omarchy/plugins/{pid}'
+        # Quoted, because pid is archive metadata and this string is executed.
+        dest = '"$HOME"/.config/omarchy/plugins/' + sh(pid)
         body: list[str] = []
         if plug.get("kind") == "git" and plug.get("url"):
             # plugin add clones into a temp dir before noticing the id is taken,
@@ -3935,7 +4275,7 @@ def plan_plugins(plan: Plan, meta: dict, root: Path) -> None:
             if not (plug.get("branch") or plug.get("commit")):
                 # Nothing downstream would notice a failed clone for this one.
                 body.append(f'[ -d {dest} ] || '
-                            f'{{ echo "{pid} was not installed" >&2; exit 1; }}')
+                            f'{{ echo {sh(pid + " was not installed")} >&2; exit 1; }}')
             branch, commit = plug.get("branch") or "", plug.get("commit") or ""
             if branch or commit:
                 body.append(f'git -C {dest} remote get-url imprint-src >/dev/null 2>&1 '
@@ -3953,7 +4293,8 @@ def plan_plugins(plan: Plan, meta: dict, root: Path) -> None:
                 # we are about to rewrite, and without it the checkout aborts.
                 force = " -f" if overlay else ""
                 body.append(f'imprint_checkout {dest} {sh(branch)} {sh(ref)}{force} || '
-                            f'{{ echo "could not put {pid} on {branch}" >&2; exit 1; }}')
+                            f'{{ echo {sh(f"could not put {pid} on {branch}")} >&2; '
+                            f'exit 1; }}')
             else:
                 overlay = plug.get("overlay")
             if overlay:
@@ -3965,11 +4306,11 @@ def plan_plugins(plan: Plan, meta: dict, root: Path) -> None:
             elif plug.get("clonedFrom"):
                 body.append(f'omarchy plugin clone {sh(plug["clonedFrom"])} || true')
         for unit in plug.get("units") or []:
-            if not safe_segment(unit):
+            if not shell_segment(unit):
                 continue
             ufile = payload_ref(root, cat / "units" / unit)
             body += [f'if [ -f {ufile} ]; then',
-                     f'  install -Dm644 {ufile} "$HOME/.config/systemd/user/{unit}"',
+                     f'  install -Dm644 {ufile} "$HOME"/.config/systemd/user/{sh(unit)}',
                      f'  systemctl --user daemon-reload',
                      f'  systemctl --user enable --now {sh(unit)}',
                      f'  systemctl --user restart {sh(unit)}',
@@ -3977,7 +4318,7 @@ def plan_plugins(plan: Plan, meta: dict, root: Path) -> None:
         if body:
             plan.add("plugins", pid, body)
 
-    enable = [p for p in (meta.get("plugins") or []) if p.get("enabled") and safe_segment(p.get("id") or "")]
+    enable = [p for p in (meta.get("plugins") or []) if p.get("enabled") and shell_segment(p.get("id") or "")]
     if enable:
         body = ['omarchy shell -q shell ping >/dev/null 2>&1 || '
                 '{ echo "shell unreachable, enabled state NOT applied" >&2; exit 1; }',
@@ -3991,7 +4332,7 @@ def plan_plugins(plan: Plan, meta: dict, root: Path) -> None:
                     extra += f" --index {place['index']}"
             body.append(f'omarchy plugin enable {sh(plug["id"])}{extra} >/dev/null 2>&1 || true')
         plan.add("activate", f"enable {len(enable)} plugins where the source had them", body)
-    off = [i for i in (meta.get("disabledIds") or []) if safe_segment(i)]
+    off = [i for i in (meta.get("disabledIds") or []) if shell_segment(i)]
     if off:
         body = ['omarchy shell -q shell ping >/dev/null 2>&1 || '
                 '{ echo "shell unreachable, disables NOT applied" >&2; exit 1; }',
@@ -4007,12 +4348,14 @@ def plan_files(plan: Plan, cid: str, root: Path) -> None:
     files_root = root / "categories" / cid / "files"
     if not files_root.is_dir():
         return
-    count = sum(1 for _ in iter_files(files_root))
-    if not count:
+    paths = [p.relative_to(files_root).as_posix() for p in iter_files(files_root)
+             if p.relative_to(files_root).as_posix() != ".config/omarchy/shell.json"]
+    if not paths:
         return
-    plan.add("files", f"{cid}: {count} files", [
-        f'cp -a {payload_ref(root, files_root)}/. "$HOME"/',
-    ], note="home paths inside these are rewritten by `imprint restore`, not by this script")
+    selected = " ".join("--file " + sh(p) for p in paths)
+    plan.add("files", f"{cid}: {len(paths)} files", [
+        f'python3 "$PLAN_PAYLOAD/tool/imprint-engine.py" restore "$PLAN_PAYLOAD" --only {sh(cid)} --files-only {selected}',
+    ], note="verified selective payload recovery with home rewrite and undo; shell settings require --shell-key separately")
 
 
 def build_plan(root: Path, manifest: dict, ids: list[str]) -> Plan:
@@ -4058,9 +4401,8 @@ def build_plan(root: Path, manifest: dict, ids: list[str]) -> Plan:
         plan.add("system", "root-owned changes", [
             'echo "run: imprint restore <archive> --only system --allow-system" >&2',
         ], note="/etc and systemctl enable need root and are deliberately not inlined here")
-    plan.add("activate", "reload the desktop", [
-        "hyprctl reload || true",
-        "omarchy restart shell || true",
+    plan.add("activate", "report pending activation", [
+        'printf "%s\n" "restart-required: validate restored configuration before explicit reload/restart"',
     ])
     return plan
 
@@ -4108,12 +4450,16 @@ def render_plan_script(plan: Plan, manifest: dict, archive: Path, root: Path) ->
             out.append("echo")
             out.append(f"echo {sh('== ' + st['title'])}")
             if st["note"]:
-                out.append(f"# {st['note']}")
-            # A subshell with -e so the status reflects the whole step, not just
-            # its last line.
-            out.append("if ! ( set -e")
+                out.append("# " + " ".join(st["note"].split()))
+            # A subshell with -e so the status reflects the whole step, not
+            # just its last line -- and its status is captured, never tested by
+            # `if`, because bash suspends errexit inside a condition and the
+            # step would sail past its own first failure.
+            out.append("( set -e")
             out.extend("  " + line for line in st["body"])
-            out.append("); then")
+            out.append(")")
+            out.append("step_rc=$?")
+            out.append('if [ "$step_rc" -ne 0 ]; then')
             out.append("  fail=$((fail+1))")
             out.append(f"  failed_steps+=({sh(st['title'])})")
             out.append("fi")
@@ -4186,6 +4532,17 @@ def session_preamble() -> list[str]:
 
 def cmd_plan(args) -> int:
     archive = need_archive(args.archive)
+    # Check in private scratch space before creating/replacing any plan output.
+    # Never execute archived code merely to ask which arguments it supports.
+    with tempfile.TemporaryDirectory(prefix="imprint-plan-check-") as tmp:
+        checked = open_imprint(archive, Path(tmp) / "open")
+        manifest = load_manifest(checked)
+        embedded = checked / "tool/imprint-engine.py"
+        if (not isinstance(manifest.get("integrity"), dict)
+                or not embedded.is_file()
+                or embedded.read_bytes() != Path(__file__).resolve().read_bytes()):
+            raise SystemExit("plan requires an integrity-indexed archive with this installed engine; "
+                             "upgrade Imprint and make a new save with this installed version")
     out_dir = Path(args.output).expanduser() if args.output else (
         Path.home() / ".local/state/imprint" / f"plan-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
     if args.output:
@@ -5027,8 +5384,13 @@ def cmd_pick(args) -> int:
 def cmd_verify(args) -> int:
     archive = need_archive(args.archive)
     with tempfile.TemporaryDirectory(prefix="imprint-verify-") as tmp:
-        root = open_imprint(archive, Path(tmp) / "open")
-        manifest = load_manifest(root)
+        try:
+            root = open_imprint(archive, Path(tmp) / "open")
+            manifest = load_manifest(root)
+        except SystemExit as exc:
+            json.dump({"ok": False, "problems": [str(exc)]}, sys.stdout)
+            sys.stdout.write("\n")
+            return 1
         missing = []
         problems = []
         schema = manifest.get("schema")
@@ -5094,14 +5456,22 @@ def cmd_diff(args) -> int:
 
 
 def cmd_undo(args) -> int:
-    root = Path.home() / ".local/state/imprint"
-    if not root.is_dir():
-        raise SystemExit("no imprint undo history")
-    undos = sorted([p for p in root.iterdir() if p.is_dir() and p.name.startswith("undo-")])
-    if not undos:
-        raise SystemExit("no imprint undo history")
-    chosen = need_dir(args.undo_dir, "cannot read the undo") if args.undo_dir else undos[-1]
-    home = Path.home()
+    home = strict_target(Path(getattr(args, "target_home", "") or Path.home()))
+    if args.undo_dir:
+        chosen = strict_target(need_dir(args.undo_dir, "cannot read the undo"))
+    else:
+        root = strict_target(home / ".local/state/imprint")
+        undos = sorted(root.glob("undo-*")) if root.is_dir() else []
+        if not undos:
+            raise SystemExit("no imprint undo history")
+        chosen = strict_target(undos[-1])
+    if (chosen / "recovery.json").is_file():
+        journal = json.loads((chosen / "recovery.json").read_text())
+        if any(r.get("scope") == "system" for r in journal["files"]) and not getattr(args, "allow_system", False):
+            raise SystemExit("system undo requires --allow-system")
+        return undo_file_recovery(chosen, home, strict_target(Path(getattr(args, "system_root", "/"))))
+    if (chosen / ".config/omarchy/shell.json").exists():
+        raise SystemExit("undo contains shell.json: recover individual settings via fresh live config-edit, never a stale whole snapshot")
     restored = []
     # Deliberately not iter_files: its skip list (.bak, .git, __pycache__ ...)
     # would silently drop files that backup_existing genuinely saved.
@@ -5140,6 +5510,9 @@ def build_parser() -> argparse.ArgumentParser:
     save = sub.add_parser("save")
     save.add_argument("--json", action="store_true", help="print the machine-readable report")
     save.add_argument("--only", default="")
+    save.add_argument("--include-file", action="append", default=[],
+                      help="exact home-relative helper script, requires scripts; repeatable")
+    save.add_argument("--system-root", default="/", help="source root for the system category")
     save.add_argument("--all", action="store_true")
     save.add_argument("-o", "--output", default="")
     save.add_argument("--select", default="",
@@ -5151,6 +5524,7 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("--select", default="",
                          help="JSON from `imprint pick`, to narrow within a category")
     restore.add_argument("--dry-run", action="store_true")
+    restore.add_argument("--shell-key", action="append", default=[], help="archived scalar JSON pointer to merge into fresh live shell config")
     restore.add_argument("--confirm-hostname", default="")
     restore.add_argument("--system-root", default="/",
                          help="apply the system layer into this root instead of / (for verifying)")
@@ -5197,6 +5571,16 @@ def build_parser() -> argparse.ArgumentParser:
     diff.add_argument("archive")
     undo = sub.add_parser("undo")
     undo.add_argument("--undo-dir", default="")
+    undo.add_argument("--target-home", default="")
+    undo.add_argument("--system-root", default="/")
+    undo.add_argument("--allow-system", action="store_true")
+    prev.add_argument("--system-root", default="/")
+    prev.add_argument("--allow-system", action="store_true")
+    for command in (restore, prev):
+        command.add_argument("--files-only", action="store_true",
+                             help="recover category payload only; no recipes or activation")
+        command.add_argument("--target-home", default="", help="existing explicit destination home")
+        command.add_argument("--file", action="append", default=[], help="exact relative payload path; repeatable")
     return parser
 
 

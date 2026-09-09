@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="617" viewBox="0 0 960 617" role="img" aria-labelledby="title desc" font-family="system-ui, -apple-system, Segoe UI, sans-serif">
+<title id="title">Evidence without overclaiming</title>
+<desc id="desc">The verified baseline is 162 tests in a disposable Arch VM plus real systemd service recovery. Omarchy GUI and bare-metal restoration remain unverified.</desc>
+<defs>
+<marker id="arrow-violet" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0 0 L10 5 L0 10Z" fill="#a3a7f0"/>
+</marker>
+<marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0 0 L10 5 L0 10Z" fill="#92c9a5"/>
+</marker>
+<marker id="arrow-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0 0 L10 5 L0 10Z" fill="#e0a86a"/>
+</marker>
+<marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0 0 L10 5 L0 10Z" fill="#ef959b"/>
+</marker>
+<pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+<path d="M32 0H0V32" fill="none" stroke="#242c52" stroke-opacity=".35"/>
+</pattern>
+</defs>
+<rect width="960" height="617" rx="18" fill="#0b1020"/>
+<rect x="1" y="1" width="958" height="615" rx="18" fill="url(#grid)" stroke="#242c52"/>
+<text x="32" y="42" fill="#a3a7f0" font-size="14" font-weight="600">IMPRINT / VERIFICATION SCOPE</text>
+<text x="32" y="83" fill="#d7dcf5" font-size="30" font-weight="600">Evidence without overclaiming</text>
+<rect x="32" y="133" width="896" height="299" rx="12" fill="#111834" stroke="#a3a7f0" stroke-opacity=".65"/>
+<text x="54" y="171" fill="#a3a7f0" font-size="15" font-weight="600">DISPOSABLE ARCH LAB</text>
+<text x="54" y="210" fill="#d7dcf5" font-size="25" font-weight="600">Isolated homes + alternate system roots</text>
+<text x="54" y="258" fill="#92c9a5" font-size="22" font-weight="600">CLI regressions</text>
+<text x="54" y="294" fill="#acb6da" font-size="18" font-weight="400">Save / verify / preview</text>
+<text x="54" y="323" fill="#acb6da" font-size="18" font-weight="400">Restore / undo / modes</text>
+<text x="54" y="352" fill="#acb6da" font-size="18" font-weight="400">Corruption + syntax refusal</text>
+<text x="54" y="381" fill="#acb6da" font-size="18" font-weight="400">Symlink refusal + rollback</text>
+<text x="500" y="258" fill="#92c9a5" font-size="22" font-weight="600">Real user systemd</text>
+<text x="500" y="294" fill="#acb6da" font-size="18" font-weight="400">Validate recovered unit</text>
+<text x="500" y="323" fill="#acb6da" font-size="18" font-weight="400">Reload → enable, still inactive</text>
+<text x="500" y="352" fill="#acb6da" font-size="18" font-weight="400">Explicit start → journal receipt</text>
+<text x="500" y="381" fill="#acb6da" font-size="18" font-weight="400">Stop / disable → undo</text>
+<text x="32" y="478" fill="#92c9a5" font-size="21" font-weight="600">Verified baseline: 162 tests + a real disposable service smoke test.</text>
+<text x="32" y="516" fill="#d7dcf5" font-size="19" font-weight="400">Omarchy discovery fixtures are not a graphical desktop session.</text>
+<text x="32" y="550" fill="#e0a86a" font-size="18" font-weight="400">Not certified: full GUI, reboot, bootloader, encrypted unlock or bare-metal restore.</text>
+<text x="32" y="586" fill="#acb6da" font-size="18" font-weight="400">Run recovery tests in a dedicated VM, never against production configuration.</text>
+</svg>

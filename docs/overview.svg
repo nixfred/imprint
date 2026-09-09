@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="460" viewBox="0 0 960 460" role="img" aria-labelledby="title desc" font-family="system-ui, -apple-system, Segoe UI, sans-serif">
+<title id="title">Your setup, packed with intent</title>
+<desc id="desc">Choose categories, save one private archive, then preview and recover selected files or recipes. Not a bare-metal backup.</desc>
+<defs>
+<marker id="arrow-violet" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0 0 L10 5 L0 10Z" fill="#a3a7f0"/>
+</marker>
+<marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0 0 L10 5 L0 10Z" fill="#92c9a5"/>
+</marker>
+<marker id="arrow-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0 0 L10 5 L0 10Z" fill="#e0a86a"/>
+</marker>
+<marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0 0 L10 5 L0 10Z" fill="#ef959b"/>
+</marker>
+<pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+<path d="M32 0H0V32" fill="none" stroke="#242c52" stroke-opacity=".35"/>
+</pattern>
+</defs>
+<rect width="960" height="460" rx="18" fill="#0b1020"/>
+<rect x="1" y="1" width="958" height="458" rx="18" fill="url(#grid)" stroke="#242c52"/>
+<text x="32" y="42" fill="#a3a7f0" font-size="14" font-weight="600">IMPRINT / OVERVIEW</text>
+<text x="32" y="83" fill="#d7dcf5" font-size="30" font-weight="600">Your setup, packed with intent</text>
+<rect x="32" y="132" width="264" height="220" rx="12" fill="#111834" stroke="#a3a7f0" stroke-opacity=".65"/>
+<text x="52" y="167" fill="#a3a7f0" font-size="16" font-weight="600">01</text>
+<text x="52" y="205" fill="#d7dcf5" font-size="22" font-weight="600">Choose categories</text>
+<text x="52" y="247" fill="#acb6da" font-size="17" font-weight="400">Config + helper files</text>
+<text x="52" y="277" fill="#acb6da" font-size="17" font-weight="400">Git + package recipes</text>
+<text x="52" y="307" fill="#acb6da" font-size="17" font-weight="400">Host-bound items: opt in</text>
+<rect x="348" y="132" width="264" height="220" rx="12" fill="#111834" stroke="#a3a7f0" stroke-opacity=".65"/>
+<text x="368" y="167" fill="#a3a7f0" font-size="16" font-weight="600">02</text>
+<text x="368" y="205" fill="#d7dcf5" font-size="22" font-weight="600">One archive</text>
+<text x="368" y="247" fill="#acb6da" font-size="17" font-weight="400">manifest.json + hashes</text>
+<text x="368" y="277" fill="#acb6da" font-size="17" font-weight="400">BRIEF.md + embedded tool</text>
+<text x="368" y="307" fill="#acb6da" font-size="17" font-weight="400">Selected category payloads</text>
+<rect x="664" y="132" width="264" height="220" rx="12" fill="#111834" stroke="#92c9a5" stroke-opacity=".65"/>
+<text x="684" y="167" fill="#92c9a5" font-size="16" font-weight="600">03</text>
+<text x="684" y="205" fill="#d7dcf5" font-size="22" font-weight="600">Select + recover</text>
+<text x="684" y="247" fill="#acb6da" font-size="17" font-weight="400">Preview before writing</text>
+<text x="684" y="277" fill="#acb6da" font-size="17" font-weight="400">Files only OR full recipes</text>
+<text x="684" y="307" fill="#acb6da" font-size="17" font-weight="400">Activation: separate step</text>
+<path d="M299 240 L343 240" fill="none" stroke="#a3a7f0" stroke-width="2" marker-end="url(#arrow-violet)"/>
+<path d="M615 240 L659 240" fill="none" stroke="#a3a7f0" stroke-width="2" marker-end="url(#arrow-violet)"/>
+<text x="32" y="396" fill="#92c9a5" font-size="21" font-weight="600">A desktop recipe, not a disk image.</text>
+<text x="32" y="429" fill="#acb6da" font-size="18" font-weight="400">Start with a working target OS. Git recipes still need their sources and dependencies.</text>
+</svg>

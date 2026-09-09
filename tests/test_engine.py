@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import shutil
 import tempfile
@@ -828,11 +829,56 @@ class PlanTests(unittest.TestCase):
         self.assertIn("for _ in 1 2 3; do", script)
         self.assertIn("omarchy plugin disable pi.workspaces", script)
 
-    def test_steps_run_under_set_e_so_status_is_real(self):
+    def test_a_failed_line_fails_its_step_instead_of_sailing_past(self):
+        import subprocess
         _p, script = self._plan({"categories": {"packages": {"repo": ["jq"]}}})
-        self.assertIn("if ! ( set -e", script)
+        self.assertIn("( set -e", script)
+        self.assertNotIn("if ! ( set -e", script)
+        self.assertIn("step_rc=$?", script)
         self.assertIn("failed_steps+=(", script)
-        self.assertIn('exit 1', script)
+        # bash suspends errexit inside an `if` condition, so `if ! ( set -e ...)`
+        # ran every line of a step and still called the whole plan clean.
+        plan = engine.Plan()
+        plan.add("packages", "a step that fails halfway",
+                 ["false", "echo REACHED-AFTER-FAILURE"])
+        out = engine.render_plan_script(plan, {"hostname": "x"},
+                                        Path("/tmp/a.tar.zst"), Path("/tmp/payload"))
+        proc = subprocess.run(["bash", "-c", out], capture_output=True, text=True)
+        self.assertNotIn("REACHED-AFTER-FAILURE", proc.stdout)
+        self.assertNotIn("plan applied cleanly", proc.stdout)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("1 step(s) failed", proc.stderr)
+
+    def test_a_plugin_id_cannot_smuggle_a_command_into_the_plan(self):
+        import subprocess
+        evil = "demo$(printf INJECTED >&2)"
+        self.assertFalse(engine.shell_segment(evil))
+        plan = engine.Plan()
+        engine.plan_plugins(plan, {"plugins": [
+            {"id": evil, "kind": "git", "url": "https://x/a.git", "enabled": True},
+            {"id": "also'; printf ALSO-INJECTED >&2; :", "kind": "local", "tree": "trees/x"},
+        ]}, Path("/tmp/payload"))
+        script = engine.render_plan_script(plan, {"hostname": "x"},
+                                           Path("/tmp/a.tar.zst"), Path("/tmp/payload"))
+        self.assertNotIn("INJECTED", script)
+        proc = subprocess.run(["bash", "-n", "-c", script], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_ordinary_ids_and_units_are_untouched(self):
+        # shlex.quote leaves a mechanical name alone, so the guard above must
+        # not have cost the normal path its steps.
+        plan = engine.Plan()
+        engine.plan_plugins(plan, {"plugins": [
+            {"id": "a.plug", "kind": "git", "url": "https://x/a.git", "branch": "main",
+             "commit": "d" * 40, "units": ["a@b.service"]},
+        ]}, Path("/tmp/payload"))
+        body = "\n".join(line for step in plan.steps for line in step["body"])
+        self.assertIn('"$HOME"/.config/omarchy/plugins/a.plug', body)
+        self.assertIn("systemctl --user enable --now a@b.service", body)
+        self.assertTrue(engine.shell_segment("a.plug"))
+        self.assertTrue(engine.shell_segment("a@b.service"))
+        for bad in ("demo$(x)", "a;b", "a b", "-rf", "a`x`", "a|b", "a\nb", "..", ""):
+            self.assertFalse(engine.shell_segment(bad), bad)
 
     def test_generated_script_is_valid_bash(self):
         import subprocess
@@ -1809,6 +1855,65 @@ class RememberedSaveDirTests(unittest.TestCase):
             self.assertEqual(engine.read_state(), {})
         finally:
             wall.chmod(0o700)
+
+
+class WrapperPickerTests(unittest.TestCase):
+    """The bash wrapper, driven with a stub engine.
+
+    choose_categories() is read through $(...), and a subshell cannot hand an
+    assignment back to its parent. While it made the selection file itself the
+    path never reached the engine, and every submenu choice was thrown away.
+    """
+
+    HARNESS = "\n".join([
+        'engine() {',
+        '  case "$1" in',
+        '''    pick) printf '{"categories":["plugins"],"subselections":{"plugins":["a.plug"]}}' ;;''',
+        '''    save|restore|preview) printf '%s\\n' "$*" >> "$ARGV_LOG" ;;''',
+        '    default-output) echo "$HOME/imprints/x.tar.zst" ;;',
+        """    verify) echo '{"ok":true}' ;;""",
+        '    *) : ;;',
+        '  esac',
+        '}',
+        'banner() { :; }',
+        'confirm() { return 0; }',
+        'HAVE_GUM=1',
+        'PICK_ACTION=""',
+        '',
+    ])
+
+    def _run(self, call: str):
+        # Everything above the dispatch: the real functions, with a stub engine
+        # spliced on. It runs from a temp directory with a placeholder engine
+        # beside it, because the header resolves its own location.
+        wrapper = (ROOT / "imprint").read_text(encoding="utf-8").split("\ncase $cmd in")[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "imprint-engine.py").write_text("", encoding="utf-8")
+            runner = Path(tmp) / "runner.sh"
+            runner.write_text(wrapper + self.HARNESS + call + '\necho "status=$?"\n',
+                              encoding="utf-8")
+            log = Path(tmp) / "argv.log"
+            log.touch()
+            env = dict(os.environ, ARGV_LOG=str(log))
+            proc = subprocess.run(["bash", str(runner)], capture_output=True, text=True,
+                                  env=env, cwd=tmp, stdin=subprocess.DEVNULL)
+            return proc, log.read_text(encoding="utf-8")
+
+    def test_a_narrowed_category_reaches_the_engine_as_a_selection(self):
+        proc, log = self._run('do_save "" "" 0')
+        self.assertIn("--select", log, proc.stderr)
+        self.assertIn("--only plugins", log)
+
+    def test_a_successful_save_reports_success(self):
+        proc, _log = self._run('do_save "" "" 0')
+        self.assertIn("status=0", proc.stdout, proc.stderr)
+
+    def test_the_selection_file_is_cleaned_up(self):
+        proc, log = self._run('do_save "" "" 0; echo "left=[$SELECTION_FILE]"')
+        self.assertIn("left=[]", proc.stdout, proc.stdout)
+        for word in log.split():
+            if word.startswith("/tmp/imprint-selection-"):
+                self.assertFalse(Path(word).exists(), word + " was left behind")
 
 
 if __name__ == "__main__":
