@@ -98,7 +98,7 @@ Colours come from your active Omarchy theme's `colors.toml`, so the picker and
 the progress output match the rest of the desktop.
 
 ```
-imprint save                         # picker, writes ~/imprints/imprint-$host-$time.tar.zst
+imprint save                         # picker, writes to wherever the last one went
 imprint save --only look,bar,plugins
 imprint save --all -o /mnt/usb/dex.imprint.tar.zst
 
@@ -119,6 +119,18 @@ imprint facts                        # this machine as JSON, for scripts and age
 imprint undo                         # last restore’s safety copy
 imprint list
 ```
+
+**It saves where you saved last.** The first archive lands in `~/imprints`.
+After that, wherever you send one — an external disk, a Google Drive mount, a
+second laptop over sshfs — is where the next `imprint save` goes, and what the
+save prompt fills in for you. `imprint about` names the directory, and `imprint
+list` and the restore picker look there too.
+
+If that directory is gone when you come back to it, because the disk is
+unplugged or the remote is not mounted this morning, the save says so and falls
+back to `~/imprints` rather than writing into an empty mountpoint that looks
+like it worked. It is remembered in `~/.local/state/imprint/state.json`; delete
+that file to start over.
 
 The archive is self-contained. On a fresh Omarchy install you can extract it
 and run `tool/imprint restore .` without installing anything first.
@@ -301,6 +313,7 @@ Every restore first copies overwritten files to
 - **Verify** — schema and category folders
 - **Undo** — last restore is reversible
 - **Self-extracting tool** — the archive carries `imprint` itself
+- **Remembers where you save** — the next archive goes where the last one went
 - **About** — `imprint about` for the version, the repo and
   [nixfred.com](https://nixfred.com); `imprint --version` when you want the
   number alone. Every archive records the version that wrote it, in

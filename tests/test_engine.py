@@ -1756,5 +1756,60 @@ class VersionTests(unittest.TestCase):
         self.assertIn('imprint = "before 1.0.0"', brief)
 
 
+class RememberedSaveDirTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.home = Path(self.tmp) / "home"
+        (self.home / "imprints").mkdir(parents=True)
+        self.real_state_dir = engine.state_dir
+        engine.state_dir = staticmethod(lambda: Path(self.tmp) / "state")
+
+    def tearDown(self):
+        engine.state_dir = self.real_state_dir
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_with_nothing_remembered_it_is_imprints_under_home(self):
+        directory, note = engine.default_archive_dir(self.home)
+        self.assertEqual(directory, self.home / "imprints")
+        self.assertEqual(note, "")
+
+    def test_the_next_save_follows_the_last_one(self):
+        drive = Path(self.tmp) / "google/imprints"
+        drive.mkdir(parents=True)
+        engine.remember_save_dir(drive)
+        directory, note = engine.default_archive_dir(self.home)
+        self.assertEqual(directory, drive)
+        self.assertEqual(note, "")
+        self.assertTrue(str(engine.default_archive_path(self.home, "dex")).startswith(str(drive)))
+
+    def test_a_directory_that_went_away_falls_back_and_says_so(self):
+        gone = Path(self.tmp) / "usb/imprints"
+        gone.mkdir(parents=True)
+        engine.remember_save_dir(gone)
+        shutil.rmtree(Path(self.tmp) / "usb")
+        directory, note = engine.default_archive_dir(self.home)
+        self.assertEqual(directory, self.home / "imprints")
+        self.assertIn(str(gone), note)
+        self.assertIn("not there now", note)
+
+    def test_unreadable_state_is_no_state_at_all(self):
+        state = Path(self.tmp) / "state"
+        state.mkdir()
+        (state / "state.json").write_text("{not json", encoding="utf-8")
+        directory, note = engine.default_archive_dir(self.home)
+        self.assertEqual(directory, self.home / "imprints")
+        self.assertEqual(note, "")
+
+    def test_a_state_directory_that_cannot_be_written_does_not_raise(self):
+        wall = Path(self.tmp) / "wall"
+        wall.mkdir(mode=0o500)
+        engine.state_dir = staticmethod(lambda: wall / "state")
+        try:
+            engine.remember_save_dir(self.home / "imprints")   # must not raise
+            self.assertEqual(engine.read_state(), {})
+        finally:
+            wall.chmod(0o700)
+
+
 if __name__ == "__main__":
     unittest.main()

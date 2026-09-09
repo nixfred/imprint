@@ -2367,7 +2367,9 @@ def path_advice(path: Path) -> list[str]:
 
 def known_archives() -> list[Path]:
     found = []
-    for root in (Path.home() / "imprints", Path.home() / "backups"):
+    remembered, _ = default_archive_dir(Path.home())
+    roots = [remembered, Path.home() / "imprints", Path.home() / "backups"]
+    for root in dict.fromkeys(roots):
         try:
             if root.is_dir():
                 found += [p for p in root.glob("*.tar.zst") if p.is_file()]
@@ -2530,10 +2532,19 @@ def cmd_about(_args) -> int:
         "",
         c(grey, f"version {VERSION}  ·  schema {SCHEMA}  ·  "
                 f"{len(CATEGORIES)} categories  ·  MIT"),
+        c(grey, f"next save: {default_archive_dir(Path.home())[0]}"),
         c(grey, f"this machine: {hostname()}  ·  Omarchy {omarchy_version()}  ·  theme {current_theme()}"),
         "",
     ]
     sys.stdout.write("\n".join(lines) + "\n")
+    return 0
+
+
+def cmd_default_output(_args) -> int:
+    directory, note = default_archive_dir(Path.home())
+    if note:
+        sys.stderr.write(f"  {note}\n")
+    sys.stdout.write(str(directory / f"imprint-{hostname()}-{now_stamp()}.tar.zst") + "\n")
     return 0
 
 
@@ -2543,8 +2554,54 @@ def cmd_facts(_args) -> int:
     return 0
 
 
+def state_dir() -> Path:
+    return Path.home() / ".local/state/imprint"
+
+
+def read_state() -> dict:
+    try:
+        data = json.loads((state_dir() / "state.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_state(data: dict) -> None:
+    """Remembering is a convenience; it never costs a save. A state directory
+    that cannot be written just means the next run asks again."""
+    try:
+        path = state_dir() / "state.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def remember_save_dir(directory: Path) -> None:
+    state = read_state()
+    state["lastSaveDir"] = str(directory)
+    write_state(state)
+
+
+def default_archive_dir(home: Path) -> tuple[Path, str]:
+    """Where the next save goes when no path was given: wherever the last one
+    went. A remembered directory that is gone -- an unplugged disk, an rclone
+    remote that is not mounted this morning -- falls back to ~/imprints and
+    says so out loud, because writing the file into an empty mountpoint would
+    look like it worked."""
+    fallback = home / "imprints"
+    remembered = read_state().get("lastSaveDir")
+    if not remembered or not isinstance(remembered, str):
+        return fallback, ""
+    directory = Path(remembered)
+    if directory == fallback or directory.is_dir():
+        return directory, ""
+    return fallback, (f"the last imprint went to {directory}, which is not there "
+                      f"now -- this one goes to {fallback}")
+
+
 def default_archive_path(home: Path, host: str) -> Path:
-    return home / "imprints" / f"imprint-{host}-{now_stamp()}.tar.zst"
+    return default_archive_dir(home)[0] / f"imprint-{host}-{now_stamp()}.tar.zst"
 
 
 def cmd_save(args) -> int:
@@ -2562,7 +2619,13 @@ def cmd_save(args) -> int:
     if args.all:
         ids = [item["id"] for item in CATEGORIES]
     typed = bool(args.output)
-    dest = Path(args.output).expanduser() if typed else default_archive_path(home, hostname())
+    if typed:
+        dest = Path(args.output).expanduser()
+    else:
+        directory, note = default_archive_dir(home)
+        if note:
+            sys.stderr.write(f"  {note}\n")
+        dest = directory / f"imprint-{hostname()}-{now_stamp()}.tar.zst"
     if dest.suffixes[-2:] != [".tar", ".zst"] and not str(dest).endswith(".tar.zst"):
         dest = dest.with_name(dest.name + ".tar.zst") if dest.suffix == "" else dest
     check_dest(dest, create=not typed)
@@ -2588,6 +2651,7 @@ def cmd_save(args) -> int:
         size_now = dest.stat().st_size
         progress.finish(f"Wrote {dest}",
                         f"{human_size(size_now)} \u00b7 {len(ids)} categories")
+    remember_save_dir(dest.parent)
     report_skipped()
     size = dest.stat().st_size
     result = {"ok": True, "path": str(dest), "bytes": size, "categories": ids}
@@ -5066,10 +5130,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(
         dest="cmd", required=True,
         metavar="{save,restore,preview,plan,apply,info,diff,verify,undo,"
-                "categories,facts,about}")
+                "categories,facts,about,default-output}")
     sub.add_parser("categories")
     sub.add_parser("facts")
     sub.add_parser("about")
+    # What the save prompt fills in for you: the remembered directory and a
+    # name stamped with the host and the minute.
+    sub.add_parser("default-output")
     save = sub.add_parser("save")
     save.add_argument("--json", action="store_true", help="print the machine-readable report")
     save.add_argument("--only", default="")
@@ -5139,6 +5206,7 @@ def main(argv: list[str] | None = None) -> int:
     dispatch = {
         "categories": cmd_categories,
         "facts": cmd_facts,
+        "default-output": cmd_default_output,
         "about": cmd_about,
         "save": cmd_save,
         "restore": cmd_restore,

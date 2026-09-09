@@ -119,7 +119,7 @@ Usage:
   imprint diff FILE           What drifted since this imprint
   imprint verify FILE         Check the archive
   imprint undo                Put back files from the last restore
-  imprint list                Archives in ~/imprints
+  imprint list                Archives where you last saved one
   imprint facts               This machine as JSON
   imprint about               Version, author and links
   imprint --version           Print the version and nothing else
@@ -182,13 +182,24 @@ choose_categories() {
     "$SELECTION_FILE"
 }
 
+# Where saves have been going lately. The engine remembers it; ~/imprints is
+# what it falls back to.
+save_dir() {
+  local path
+  path=$(engine default-output 2>/dev/null) || path=""
+  if [[ -n $path ]]; then
+    dirname -- "$path"
+  else
+    echo "$HOME/imprints"
+  fi
+}
+
 pick_archive() {
-  local start=${1:-$HOME/imprints}
-  mkdir -p "$start"
+  local start=${1:-$(save_dir)}
   local found
-  found=$(ls -1t "$start"/*.tar.zst "$HOME"/backups/*.tar.zst 2>/dev/null | awk '!seen[$0]++')
+  found=$(ls -1t "$start"/*.tar.zst "$HOME"/imprints/*.tar.zst "$HOME"/backups/*.tar.zst 2>/dev/null | awk '!seen[$0]++')
   [[ -n $found ]] || {
-    echo "imprint: no archives in $start or ~/backups yet -- run \`imprint save\` to make one" >&2
+    echo "imprint: no archives in $start, ~/imprints or ~/backups yet -- run \`imprint save\` to make one" >&2
     return 1
   }
   if (( HAVE_GUM )); then
@@ -201,10 +212,12 @@ pick_archive() {
 # The archives this machine actually has. A path that is wrong is nearly
 # always a typo of one of these.
 nearby_archives() {
-  local found
-  found=$(ls -1t "$HOME"/imprints/*.tar.zst "$HOME"/backups/*.tar.zst 2>/dev/null | head -n 5)
+  local found where
+  where=$(save_dir)
+  found=$(ls -1t "$where"/*.tar.zst "$HOME"/imprints/*.tar.zst "$HOME"/backups/*.tar.zst 2>/dev/null \
+    | awk '!seen[$0]++' | head -n 5)
   if [[ -z $found ]]; then
-    printf '\n  there are no archives in ~/imprints or ~/backups yet -- `imprint save` makes one'
+    printf '\n  there are no archives in %s, ~/imprints or ~/backups yet -- `imprint save` makes one' "$where"
     return
   fi
   printf '\n  archives on this machine:'
@@ -300,27 +313,32 @@ do_save() {
       say "No terminal for the picker; using the default categories."
     fi
   fi
+  # The engine owns the default: the directory the last imprint went to, with
+  # a fresh name. Taking it unchanged means passing no -o at all, so the engine
+  # keeps the one directory it is allowed to make for itself.
+  local suggested=""
   if [[ -z $output ]]; then
-    local host
-    host=$(hostname)
-    mkdir -p "$HOME/imprints"
-    output="$HOME/imprints/imprint-${host}-$(date +%Y%m%d-%H%M).tar.zst"
+    suggested=$(engine default-output)
+    output=$suggested
     if [[ -t 0 ]]; then
       local typed problem attempt
       for attempt in 1 2 3; do
         printf '  %sWrite archive to%s\n' "$IMP_BOLD" "$IMP_RESET"
         read -r -e -i "$output" typed </dev/tty || break
         [[ -n $typed ]] && output=$typed
+        [[ $output == "$suggested" ]] && break
         problem=$(dest_problem "$output") || break
         warn "$problem"
       done
     fi
   fi
   [[ -n $output ]] || die "no output path"
+  local where=(-o "$output")
+  [[ $output == "$suggested" ]] && where=()
   if [[ $all -eq 1 ]]; then
-    engine save --all -o "$output" >/dev/null
+    engine save --all "${where[@]}" >/dev/null
   else
-    engine save --only "$only" ${SELECTION_FILE:+--select "$SELECTION_FILE"} -o "$output" >/dev/null
+    engine save --only "$only" ${SELECTION_FILE:+--select "$SELECTION_FILE"} "${where[@]}" >/dev/null
   fi
   [[ -n $SELECTION_FILE ]] && rm -f "$SELECTION_FILE"
 }
@@ -383,12 +401,12 @@ do_restore() {
 }
 
 do_list() {
-  mkdir -p "$HOME/imprints"
   banner
-  local files
-  files=$(ls -1t "$HOME/imprints"/imprint-*.tar.zst 2>/dev/null || true)
+  local files where
+  where=$(save_dir)
+  files=$(ls -1t "$where"/imprint-*.tar.zst "$HOME/imprints"/imprint-*.tar.zst 2>/dev/null | awk '!seen[$0]++' || true)
   if [[ -z $files ]]; then
-    say "No archives in ~/imprints yet. Run imprint save."
+    say "No archives in $where yet. Run imprint save."
     return 0
   fi
   printf '%s\n' "$files" | while read -r f; do
