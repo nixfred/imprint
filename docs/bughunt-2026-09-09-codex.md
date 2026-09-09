@@ -7,7 +7,21 @@ against commit `01bd8fd`, read-only sandbox, no files modified. It was given
 Findings 1 and 2 were independently re-read in the source before this file was
 written and are real as described; the rest are recorded as Codex reported
 them, including its own distinction between what it reproduced and what it
-reasoned about. Nothing here is fixed yet.
+reasoned about.
+
+**All eighteen are fixed**, in `8d78fe8`, `37e33ca`, `06a67fd` and `f67c938`,
+each with tests. Two were verified as bash behaviour rather than taken on
+trust: `if ! ( set -e ... )` really does suspend errexit (finding 8), and a
+command substitution really does lose the assignment (finding 2). Three
+behaviours changed as a result and are worth knowing about:
+
+- `--system-root` no longer creates the rehearsal directory it is handed.
+  Make it first.
+- `imprint plan -o DIR` refuses an archive that lives inside `DIR`.
+- A stock theme carried in an archive now installs into
+  `~/.config/omarchy/themes/`, backing up whatever is there first.
+
+The report below is unedited.
 
 Reviewed **01bd8fd**, excluding the prior audit’s findings. **No files changed.** Bash syntax checking and 28 existing tests that require no filesystem writes passed; I did not run the write-heavy full suite.
 
