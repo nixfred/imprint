@@ -106,7 +106,32 @@ there to keep editing. The run begins only when you pick the last row:
 `t` toggles a whole group, `a` all, `n` none, `q` cancels.
 
 Colours come from your active Omarchy theme's `colors.toml`, so the picker and
-the progress output match the rest of the desktop.
+the progress output match the rest of the desktop. The header and submenu arrows
+take the theme's accent, body text its foreground, hints and breadcrumbs its
+muted colour, and the marks their state: `◉` in the theme's green, `◐` in its
+orange, `○` muted. The cursor sits on the theme's own selection colour — unless
+that theme's selection is too close to its background to see, or too dark to
+read against, in which case the row falls back to reverse video.
+
+`imprint palette` shows the whole mapping, including which key each colour
+actually came from and what it fell back to:
+
+```
+theme Ethereal
+  /home/pi/.config/omarchy/themes/ethereal
+
+  ████  accent     #7d82d9   accent
+  ████  amber      #eb8b54   orange
+  ████  grey       #6d7db6   muted
+  ████  selection  #252e56   selection
+
+  picker cursor: the theme's selection colour
+```
+
+On a 256-colour terminal each one lands on the nearest of the 240 addressable
+colours, weighted for how the eye reads the channels. The terminal's own low 16
+are left out on purpose: those are whatever your terminal calls "blue", not what
+the theme does.
 
 ```
 imprint save                         # picker, writes to wherever the last one went

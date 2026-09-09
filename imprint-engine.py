@@ -236,8 +236,12 @@ CATEGORIES = [
 # watching, which is what is actually being collected.
 
 RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
+# Only for a machine with no Omarchy theme to read. Anything the theme does
+# name wins over these.
 _FALLBACK_FG = {"green": "\033[38;5;114m", "blue": "\033[38;5;111m", "amber": "\033[38;5;179m",
-                "red": "\033[38;5;174m", "grey": "\033[38;5;245m", "accent": "\033[38;5;111m"}
+                "red": "\033[38;5;174m", "grey": "\033[38;5;245m", "accent": "\033[38;5;111m",
+                "cyan": "\033[38;5;110m", "magenta": "\033[38;5;176m",
+                "fg": "", "bright": "\033[1m", "bg": "", "selection": ""}
 
 
 def theme_dir() -> Path | None:
@@ -290,29 +294,111 @@ def truecolour(value: str) -> str:
     return f"\033[38;2;{rgb[0]};{rgb[1]};{rgb[2]}m" if rgb else ""
 
 
+CUBE_STEPS = (0, 95, 135, 175, 215, 255)
+
+
+def xterm256_table() -> list[tuple[int, tuple[int, int, int]]]:
+    """The 216-colour cube and the 24 greys, with their actual RGB.
+
+    The low 16 are left out on purpose: a terminal renders those in its own
+    palette, so asking for "blue" there gives whatever blue the terminal
+    already had rather than the theme's.
+    """
+    table = []
+    for i, r in enumerate(CUBE_STEPS):
+        for j, g in enumerate(CUBE_STEPS):
+            for k, b in enumerate(CUBE_STEPS):
+                table.append((16 + 36 * i + 6 * j + k, (r, g, b)))
+    for n in range(24):
+        level = 8 + n * 10
+        table.append((232 + n, (level, level, level)))
+    return table
+
+
+_XTERM_TABLE = None
+
+
 def xterm256(value: str) -> int:
-    """Nearest xterm-256 index, for curses which cannot take a hex string."""
+    """Nearest xterm-256 index, for curses which cannot take a hex string.
+
+    Nearest by actual distance, over both the colour cube and the grey ramp.
+    The old version bucketed each channel by hand and never considered the
+    greys unless all three channels were already within ten of each other, so
+    a desaturated theme colour landed on a cube corner some way from it."""
+    global _XTERM_TABLE
     rgb = hex_rgb(value)
     if not rgb:
-        return 4
+        return -1
+    if _XTERM_TABLE is None:
+        _XTERM_TABLE = xterm256_table()
     r, g, b = rgb
-    if abs(r - g) < 10 and abs(g - b) < 10:
-        return max(232, min(255, 232 + round((r - 8) / 247 * 23)))
-    idx = lambda c: 0 if c < 48 else 1 if c < 115 else min(5, (c - 35) // 40)
-    return 16 + 36 * idx(r) + 6 * idx(g) + idx(b)
+    best, best_d = 4, None
+    for index, (cr, cg, cb) in _XTERM_TABLE:
+        # Weighted for how the eye actually reads the channels, so a near miss
+        # lands on a colour that reads as the same colour.
+        d = 2 * (r - cr) ** 2 + 4 * (g - cg) ** 2 + 3 * (b - cb) ** 2
+        if best_d is None or d < best_d:
+            best, best_d = index, d
+    return best
+
+
+def luminance(value: str) -> float:
+    rgb = hex_rgb(value)
+    if not rgb:
+        return 0.0
+    r, g, b = (c / 255 for c in rgb)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def readable_against(fg: str, bg: str) -> bool:
+    """Enough separation to read text on it."""
+    if not fg or not bg:
+        return False
+    return abs(luminance(fg) - luminance(bg)) >= 0.2
+
+
+def distinct_from(a: str, b: str) -> bool:
+    """Two backgrounds you can tell apart. A selection bar is meant to be a
+    quiet shade off the page, not a contrasting block, so this asks for much
+    less than readable_against -- but it does ask. A theme whose selection is
+    its background would otherwise give an invisible cursor row."""
+    first, second = hex_rgb(a), hex_rgb(b)
+    if not first or not second:
+        return False
+    return sum(abs(x - y) for x, y in zip(first, second)) >= 24
+
+
+# Which theme keys stand in for each role, best first. Every Omarchy theme
+# writes accent, foreground and background; the rest are optional, so each role
+# walks its own line of retreat before falling back to a fixed ANSI colour.
+ROLE_KEYS = {
+    "accent": ("accent", "blue", "bright_blue"),
+    "green": ("green", "bright_green"),
+    "red": ("red", "bright_red"),
+    "amber": ("orange", "yellow", "bright_yellow"),
+    "blue": ("blue", "accent", "bright_blue"),
+    "cyan": ("cyan", "bright_cyan", "blue"),
+    "magenta": ("magenta", "bright_magenta"),
+    "grey": ("muted", "dark_foreground", "light_foreground"),
+    "fg": ("foreground", "bright_foreground", "light_foreground"),
+    "bright": ("bright_foreground", "light_foreground", "foreground"),
+    "bg": ("background", "dark_background"),
+    "selection": ("selection", "lighter_background", "dark_background"),
+}
+
+
+def theme_hex() -> dict:
+    """Each role as a hex string, or "" where the theme offers nothing."""
+    colours = theme_colours()
+    return {role: next((colours[k] for k in keys if colours.get(k)), "")
+            for role, keys in ROLE_KEYS.items()}
 
 
 def _build_palette() -> dict:
-    colours = theme_colours()
-    if not colours:
-        return dict(_FALLBACK_FG)
-    pick = lambda *names: next((colours[n] for n in names if n in colours), "")
+    hexes = theme_hex()
     out = {}
-    for key, names in (("green", ("green",)), ("red", ("red",)),
-                       ("amber", ("orange", "yellow")), ("blue", ("blue", "accent")),
-                       ("grey", ("dark_foreground", "muted")), ("accent", ("accent", "blue"))):
-        code = truecolour(pick(*names))
-        out[key] = code or _FALLBACK_FG.get(key, "")
+    for role in ROLE_KEYS:
+        out[role] = truecolour(hexes.get(role, "")) or _FALLBACK_FG.get(role, "")
     return out
 
 
@@ -342,8 +428,8 @@ FG = _Palette()
 
 
 def theme_accent() -> int:
-    colours = theme_colours()
-    return xterm256(colours.get("accent") or colours.get("blue") or "#5f87ff")
+    index = xterm256(theme_hex().get("accent") or "#5f87ff")
+    return 4 if index < 0 else index
 TICK, CROSS, DOTS = "\u2713", "\u2717", "\u22ef"
 
 
@@ -5242,11 +5328,77 @@ def build_tree(home: Path, present: set | None, defaults_on: bool = True,
     return nodes
 
 
+# Curses colour pairs, in the order init_pairs sets them up.
+PAIR_ACCENT, PAIR_MUTED, PAIR_CURSOR, PAIR_ON, PAIR_PART, PAIR_FG = 1, 2, 3, 4, 5, 6
+CURSOR_IS_THEMED = False
+
+
+def init_pairs() -> None:
+    """Paint the picker in the theme rather than in the terminal's defaults.
+
+    Everything here is best-effort: a terminal with no colour, or fewer than
+    256 of them, falls through to the reverse-video and bold the picker used
+    before, which is legible anywhere."""
+    global CURSOR_IS_THEMED
+    CURSOR_IS_THEMED = False
+    try:
+        if not curses.has_colors():
+            return
+        curses.use_default_colors()
+    except curses.error:
+        return
+    hexes = theme_hex()
+    index = lambda role: xterm256(hexes.get(role, ""))
+    pairs = {
+        PAIR_ACCENT: index("accent"),
+        PAIR_MUTED: index("grey"),
+        PAIR_ON: index("green"),
+        PAIR_PART: index("amber"),
+        PAIR_FG: index("fg"),
+    }
+    for pair, colour in pairs.items():
+        try:
+            curses.init_pair(pair, colour if colour >= 0 else -1, -1)
+        except curses.error:
+            pass
+    # The cursor row takes the theme's own selection colour, but only when it
+    # can be told apart from the page and still be read against it.
+    selection, background, foreground = (hexes.get("selection", ""), hexes.get("bg", ""),
+                                         hexes.get("bright") or hexes.get("fg", ""))
+    if (curses.COLORS >= 256 and distinct_from(selection, background)
+            and readable_against(foreground, selection)):
+        try:
+            curses.init_pair(PAIR_CURSOR, xterm256(foreground), xterm256(selection))
+            CURSOR_IS_THEMED = True
+        except curses.error:
+            CURSOR_IS_THEMED = False
+
+
+def tint(pair: int, extra: int = 0) -> int:
+    """A colour pair when the terminal has colour, otherwise nothing lost."""
+    try:
+        return (curses.color_pair(pair) if curses.has_colors() else 0) | extra
+    except (curses.error, AttributeError):
+        return extra
+
+
+def cursor_attr() -> int:
+    return tint(PAIR_CURSOR, curses.A_BOLD) if CURSOR_IS_THEMED else curses.A_REVERSE
+
+
+def paint(stdscr, y: int, x: int, span: int, attr: int) -> None:
+    """chgat, but a narrow window is not an error worth dying for."""
+    try:
+        stdscr.chgat(y, x, span, attr)
+    except (curses.error, AttributeError):
+        pass
+
+
 def _draw(stdscr, rows, cursor, top, trail, header, height, width):
     stdscr.erase()
     crumbs = " / ".join(["All"] + [n.label for n in trail])
-    stdscr.addnstr(0, 0, header[:width - 1], width - 1, curses.A_BOLD)
-    stdscr.addnstr(1, 0, crumbs[:width - 1], width - 1, curses.A_DIM)
+    stdscr.addnstr(0, 0, header[:width - 1], width - 1, tint(PAIR_ACCENT, curses.A_BOLD))
+    stdscr.addnstr(1, 0, crumbs[:width - 1], width - 1, tint(PAIR_MUTED, curses.A_DIM))
     body = height - 4
     for i in range(body):
         idx = top + i
@@ -5255,7 +5407,7 @@ def _draw(stdscr, rows, cursor, top, trail, header, height, width):
         node = rows[idx]
         if isinstance(node, ActionRow):
             text = f"   \u25b6 {node.label}   {node.hint}"
-            attr = (curses.A_REVERSE if idx == cursor else curses.A_BOLD)
+            attr = cursor_attr() if idx == cursor else tint(PAIR_ACCENT, curses.A_BOLD)
             stdscr.addnstr(3 + i, 0, text[:width - 1].ljust(width - 1), width - 1, attr)
             continue
         st = node.state()
@@ -5272,29 +5424,37 @@ def _draw(stdscr, rows, cursor, top, trail, header, height, width):
         pad = max(1, 40 - len(text))
         if node.hint:
             text += " " * pad + node.hint
-        attr = curses.A_REVERSE if idx == cursor else curses.A_NORMAL
-        if branch and idx != cursor:
+        selected = idx == cursor
+        attr = cursor_attr() if selected else tint(PAIR_FG)
+        if branch and not selected:
             attr |= curses.A_BOLD
         stdscr.addnstr(3 + i, 0, text[:width - 1].ljust(width - 1), width - 1, attr)
-        if branch and idx != cursor:
-            # Tint just the arrow. Wrapped because has_colors() raises unless a
-            # screen is up, and a narrow window makes chgat fail.
-            try:
-                if curses.has_colors():
-                    stdscr.chgat(3 + i, 3, 1, curses.color_pair(1) | curses.A_BOLD)
-            except (curses.error, AttributeError):
-                pass
+        if not selected:
+            # The mark carries the state, so it carries the theme's colour for
+            # it: green for on, amber for a part-selected submenu, muted for
+            # off. The cursor row keeps one colour, or the selection bar reads
+            # as several.
+            paint(stdscr, 3 + i, 1, 1,
+                  tint({"on": PAIR_ON, "partial": PAIR_PART}.get(st, PAIR_MUTED),
+                       curses.A_BOLD if st != "off" else 0))
+            if branch:
+                paint(stdscr, 3 + i, 3, 1, tint(PAIR_ACCENT, curses.A_BOLD))
+            if node.hint:
+                start = min(len(text) - len(node.hint), width - 2)
+                if start > 0:
+                    paint(stdscr, 3 + i, start, min(len(node.hint), width - 1 - start),
+                          tint(PAIR_MUTED))
     hints = ("\u2192 opens \u25b8 or moves down \u00b7 \u2190 backs out or moves up \u00b7 "
              "space toggles \u00b7 t group \u00b7 a all \u00b7 n none \u00b7 q cancel")
-    stdscr.addnstr(height - 1, 0, hints[:width - 1], width - 1, curses.A_DIM)
+    stdscr.addnstr(height - 1, 0, hints[:width - 1], width - 1,
+                   tint(PAIR_MUTED, curses.A_DIM))
     stdscr.refresh()
 
 
 def _pick_loop(stdscr, roots, header):
     curses.curs_set(0)
     try:
-        curses.use_default_colors()
-        curses.init_pair(1, theme_accent(), -1)
+        init_pairs()
     except curses.error:
         pass
     stdscr.keypad(True)
@@ -5471,24 +5631,24 @@ def _menu_loop(stdscr, rows, header):
     curses.curs_set(0)
     stdscr.keypad(True)
     try:
-        curses.use_default_colors()
-        curses.init_pair(1, theme_accent(), -1)
+        init_pairs()
     except curses.error:
         pass
     cursor = 0
     while True:
         height, width = stdscr.getmaxyx()
         stdscr.erase()
-        stdscr.addnstr(0, 0, header[:width - 1], width - 1, curses.A_BOLD)
+        stdscr.addnstr(0, 0, header[:width - 1], width - 1, tint(PAIR_ACCENT, curses.A_BOLD))
         for i, label in enumerate(rows):
             if 2 + i >= height - 1:
                 break
-            mark = "\u25b8 " if i == cursor else "  "
-            attr = curses.A_REVERSE if i == cursor else curses.A_NORMAL
+            selected = i == cursor
+            mark = "\u25b8 " if selected else "  "
+            attr = cursor_attr() if selected else tint(PAIR_FG)
             stdscr.addnstr(2 + i, 0, f" {mark}{label}"[:width - 1].ljust(width - 1), width - 1, attr)
         stdscr.addnstr(height - 1, 0,
                        "\u2192/\u2190 or \u2191/\u2193 move \u00b7 enter choose \u00b7 q cancel"[:width - 1],
-                       width - 1, curses.A_DIM)
+                       width - 1, tint(PAIR_MUTED, curses.A_DIM))
         stdscr.refresh()
         key = stdscr.getch()
         if key == 27:
@@ -5544,15 +5704,47 @@ def cmd_menu(args) -> int:
     return 0
 
 
-def cmd_palette(_args) -> int:
+def cmd_palette(args) -> int:
     """Shell-evaluable colours from the active theme, so the wrapper matches."""
+    if getattr(args, "show", False):
+        return show_palette()
     out = []
-    for key in ("accent", "green", "amber", "red", "grey", "blue"):
+    for key in ("accent", "green", "amber", "red", "grey", "blue", "cyan",
+                "magenta", "fg", "bright"):
         code = FG.get(key, "")
         out.append(f"IMP_{key.upper()}=$'{code}'" if code else f"IMP_{key.upper()}=''")
     out.append("IMP_RESET=$'\\033[0m'")
     out.append("IMP_BOLD=$'\\033[1m'")
     sys.stdout.write("\n".join(out) + "\n")
+    return 0
+
+
+def show_palette() -> int:
+    """What imprint took from the theme, and what it settled for. Reading the
+    picker's colours out of a running curses screen is not something anyone
+    should have to do to check the mapping."""
+    directory = theme_dir()
+    hexes = theme_hex()
+    raw = theme_colours()
+    tint_on = colour_ok(sys.stdout)
+    c = lambda code, text: f"{code}{text}{RESET}" if tint_on and code else text
+    lines = ["", c(BOLD, f"theme {current_theme() or 'unknown'}"),
+             c(FG.get("grey"), f"  {directory or 'no colors.toml found -- built-in colours'}"), ""]
+    for role, keys in ROLE_KEYS.items():
+        value = hexes.get(role, "")
+        source = next((k for k in keys if raw.get(k)), "")
+        swatch = c(truecolour(value), "████") if value and tint_on else "    "
+        note = f"{source}" if source else c(FG.get("amber"), "not in this theme, using a built-in")
+        lines.append(f"  {swatch}  {role:<10} {value or '':<9} {note}")
+    cursor = ("the theme's selection colour"
+              if distinct_from(hexes.get("selection", ""), hexes.get("bg", ""))
+              and readable_against(hexes.get("bright") or hexes.get("fg", ""),
+                                   hexes.get("selection", ""))
+              else "reverse video: this theme's selection is too close to its background")
+    lines += ["", f"  picker cursor: {cursor}",
+              f"  256-colour terminals get the nearest of "
+              f"{len(xterm256_table())} indexes", ""]
+    sys.stdout.write("\n".join(lines) + "\n")
     return 0
 
 
@@ -5772,7 +5964,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="halt at the first failing step instead of carrying on")
     menup = sub.add_parser("menu")
     menup.add_argument("--header", default="")
-    sub.add_parser("palette")
+    palette = sub.add_parser("palette")
+    palette.add_argument("--show", action="store_true",
+                         help="print the mapping instead of shell exports")
     pick = sub.add_parser("pick")
     pick.add_argument("--archive", default="")
     pick.add_argument("--header", default="")

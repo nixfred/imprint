@@ -42,7 +42,8 @@ if [[ -t 0 && -t 1 ]]; then
 fi
 
 # Colours come from the active Omarchy theme, via the engine.
-IMP_ACCENT='' IMP_GREEN='' IMP_AMBER='' IMP_RED='' IMP_GREY='' IMP_BLUE='' IMP_RESET='' IMP_BOLD=''
+IMP_ACCENT='' IMP_GREEN='' IMP_AMBER='' IMP_RED='' IMP_GREY='' IMP_BLUE=''
+IMP_CYAN='' IMP_MAGENTA='' IMP_FG='' IMP_BRIGHT='' IMP_RESET='' IMP_BOLD=''
 if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
   eval "$(engine palette 2>/dev/null || true)"
 fi
@@ -77,7 +78,7 @@ banner() {
     logo='OMARCHY'
   fi
   printf '%s%s%s\n' "$IMP_ACCENT" "$logo" "$IMP_RESET"
-  printf '%s%s%s\n' "$IMP_BOLD" "$IMPRINT_WORDMARK" "$IMP_RESET"
+  printf '%s%s%s%s\n' "$IMP_BRIGHT" "$IMP_BOLD" "$IMPRINT_WORDMARK" "$IMP_RESET"
   printf '%s  Stamp one Omarchy onto another · space selects · ▸ opens a submenu%s\n\n' \
     "$IMP_GREY" "$IMP_RESET"
 }
@@ -121,6 +122,7 @@ Usage:
   imprint undo                Put back files from the last restore
   imprint list                Archives where you last saved one
   imprint facts               This machine as JSON
+  imprint palette             Which theme colour imprint uses for what
   imprint about               Version, author and links
   imprint --version           Print the version and nothing else
 
@@ -313,7 +315,7 @@ dest_problem() {
 confirm() {
   local prompt=$1 ans
   [[ -t 0 ]] || return 1
-  printf '  %s%s%s [y/N] ' "$IMP_BOLD" "$prompt" "$IMP_RESET"
+  printf '  %s%s%s%s [y/N] ' "$IMP_BRIGHT" "$IMP_BOLD" "$prompt" "$IMP_RESET"
   read -r ans </dev/tty || return 1
   [[ $ans == y || $ans == Y || $ans == yes ]]
 }
@@ -343,7 +345,7 @@ do_save() {
     if [[ -t 0 ]]; then
       local typed problem attempt
       for attempt in 1 2 3; do
-        printf '  %sWrite archive to%s\n' "$IMP_BOLD" "$IMP_RESET"
+        printf '  %s%sWrite archive to%s\n' "$IMP_BRIGHT" "$IMP_BOLD" "$IMP_RESET"
         read -r -e -i "$output" typed </dev/tty || break
         [[ -n $typed ]] && output=$typed
         [[ $output == "$suggested" ]] && break
@@ -589,6 +591,10 @@ case $cmd in
     ;;
   about)
     engine about
+    ;;
+  palette)
+    # A person typing this wants to see the colours, not shell exports.
+    engine palette --show
     ;;
   *)
     usage

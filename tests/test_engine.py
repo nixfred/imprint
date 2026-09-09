@@ -8,6 +8,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("imprint_engine", ROOT / "imprint-engine.py")
@@ -2278,6 +2279,144 @@ class ArchiveListingTests(unittest.TestCase):
             finally:
                 engine.Path.home, engine.state_dir = real_home, real_state
             self.assertEqual(found, [str(odd / "imprint-x.tar.zst")])
+
+
+class ThemeColourTests(unittest.TestCase):
+    THEME = {
+        "accent": "#7d82d9", "selection": "#252e56", "muted": "#6d7db6",
+        "background": "#060B1E", "foreground": "#ffcead",
+        "bright_foreground": "#ffe0c8", "dark_foreground": "#6d7db6",
+        "red": "#ED5B5A", "yellow": "#E9BB4F", "orange": "#eb8b54",
+        "green": "#92a593", "cyan": "#a3bfd1", "blue": "#7d82d9",
+    }
+
+    def _with(self, colours):
+        real = engine.theme_colours
+        engine.theme_colours = staticmethod(lambda: colours)
+        self.addCleanup(lambda: setattr(engine, "theme_colours", real))
+
+    def test_every_role_comes_from_the_theme_when_the_theme_has_it(self):
+        self._with(self.THEME)
+        hexes = engine.theme_hex()
+        self.assertEqual(hexes["accent"], "#7d82d9")
+        self.assertEqual(hexes["amber"], "#eb8b54")        # orange before yellow
+        self.assertEqual(hexes["grey"], "#6d7db6")         # muted before dark_foreground
+        self.assertEqual(hexes["fg"], "#ffcead")
+        self.assertEqual(hexes["bright"], "#ffe0c8")
+        self.assertEqual(hexes["selection"], "#252e56")
+
+    def test_a_thin_theme_falls_back_through_its_own_keys_first(self):
+        self._with({"accent": "#112233", "yellow": "#ddcc00", "background": "#000000",
+                    "foreground": "#eeeeee"})
+        hexes = engine.theme_hex()
+        self.assertEqual(hexes["amber"], "#ddcc00")        # no orange, so yellow
+        self.assertEqual(hexes["blue"], "#112233")         # no blue, so accent
+        self.assertEqual(hexes["grey"], "")                # nothing muted-ish to use
+        # nothing selection-ish and no dark background: better empty, so the
+        # cursor falls back to reverse video rather than to the page colour
+        self.assertEqual(hexes["selection"], "")
+
+    def test_no_theme_at_all_still_gives_a_usable_palette(self):
+        self._with({})
+        engine.FG._resolved = None
+        try:
+            self.assertTrue(engine.FG["green"].startswith("\033["))
+            self.assertTrue(engine.FG["accent"].startswith("\033["))
+        finally:
+            engine.FG._resolved = None
+
+    def test_the_256_colour_fallback_lands_on_the_nearest_colour(self):
+        self.assertEqual(engine.xterm256("#ff0000"), 196)
+        self.assertEqual(engine.xterm256("#000000"), 16)
+        self.assertEqual(engine.xterm256("#ffffff"), 231)
+        # a desaturated sage: the old bucketing sent anything not already
+        # near-grey to a cube corner, which is a long way from this
+        index = engine.xterm256("#92a593")
+        r, g, b = dict(engine.xterm256_table())[index]
+        self.assertLess(abs(r - 0x92) + abs(g - 0xa5) + abs(b - 0x93), 40)
+        self.assertEqual(engine.xterm256("not a colour"), -1)
+
+    def test_a_selection_too_close_to_the_page_is_not_used(self):
+        self.assertTrue(engine.distinct_from("#252e56", "#060B1E"))
+        self.assertFalse(engine.distinct_from("#060B1E", "#060b20"))
+        self.assertTrue(engine.readable_against("#ffcead", "#252e56"))
+        self.assertFalse(engine.readable_against("#6d7db6", "#7d82d9"))
+
+    def test_the_palette_export_carries_every_role(self):
+        import io, contextlib
+        engine.FG._resolved = None
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            engine.cmd_palette(SimpleNamespace(show=False))
+        out = buf.getvalue()
+        for name in ("IMP_ACCENT", "IMP_GREY", "IMP_FG", "IMP_BRIGHT", "IMP_CYAN", "IMP_RESET"):
+            self.assertIn(name + "=", out)
+        engine.FG._resolved = None
+
+    def test_show_names_where_each_colour_came_from(self):
+        import io, contextlib
+        self._with(self.THEME)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            engine.cmd_palette(SimpleNamespace(show=True))
+        out = buf.getvalue()
+        self.assertIn("#eb8b54", out)
+        self.assertIn("orange", out)                       # the key it actually used
+        self.assertIn("picker cursor: the theme's selection colour", out)
+
+    def test_show_says_when_the_cursor_cannot_use_the_theme(self):
+        import io, contextlib
+        self._with({"accent": "#7d82d9", "background": "#060B1E",
+                    "selection": "#060B20", "foreground": "#ffcead"})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            engine.cmd_palette(SimpleNamespace(show=True))
+        self.assertIn("reverse video", buf.getvalue())
+
+
+class PickerRenderTests(unittest.TestCase):
+    """The picker really drawn, on a real pty, and read back."""
+
+    def _screen(self) -> str:
+        import pty, select, time
+        try:
+            pid, fd = pty.fork()
+        except OSError as exc:                              # no pty available
+            self.skipTest(str(exc))
+        if pid == 0:
+            env = dict(os.environ, TERM="xterm-256color", COLORTERM="truecolor")
+            os.execvpe(sys.executable, [sys.executable, str(ROOT / "imprint-engine.py"),
+                                        "pick", "--header", "HEADER-HERE"], env)
+        time.sleep(1.2)
+        os.write(fd, b"q")
+        out, deadline = b"", time.time() + 5
+        while time.time() < deadline:
+            ready, _, _ = select.select([fd], [], [], 0.3)
+            if not ready:
+                continue
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+        os.waitpid(pid, os.WNOHANG)
+        return out.decode("utf-8", "replace")
+
+    def test_the_picker_draws_in_the_theme(self):
+        hexes = engine.theme_hex()
+        if not hexes.get("accent"):
+            self.skipTest("no Omarchy theme on this machine")
+        screen = self._screen()
+        self.assertIn("HEADER-HERE", screen)
+        accent = f"38;5;{engine.xterm256(hexes['accent'])}m"
+        self.assertIn(accent, screen)
+        if hexes.get("fg"):
+            self.assertIn(f"38;5;{engine.xterm256(hexes['fg'])}m", screen)
+        if engine.distinct_from(hexes.get("selection", ""), hexes.get("bg", "")):
+            # the cursor row is painted, not reverse-video
+            self.assertIn(f"48;5;{engine.xterm256(hexes['selection'])}m", screen)
 
 
 if __name__ == "__main__":
