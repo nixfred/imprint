@@ -211,33 +211,35 @@ save_dir() {
 }
 
 pick_archive() {
-  local start=${1:-$(save_dir)}
-  local found
-  found=$(ls -1t "$start"/*.tar.zst "$HOME"/imprints/*.tar.zst "$HOME"/backups/*.tar.zst 2>/dev/null | awk '!seen[$0]++')
-  [[ -n $found ]] || {
-    echo "imprint: no archives in $start, ~/imprints or ~/backups yet -- run \`imprint save\` to make one" >&2
-    return 1
-  }
-  if (( HAVE_GUM )); then
-    printf '%s\n' "$found" | engine menu --header "Choose an imprint archive"
+  local -a found=()
+  if [[ -n ${1:-} ]]; then
+    mapfile -t found < <(find "$1" -maxdepth 1 -name '*.tar.zst' -printf '%T@ %p\n' 2>/dev/null \
+      | sort -rn | cut -d" " -f2-)
   else
-    printf '%s\n' "$found" | head -n 1
+    mapfile -t found < <(engine archives 2>/dev/null)
+  fi
+  if (( ${#found[@]} == 0 )); then
+    echo "imprint: no archives in $(save_dir), ~/imprints or ~/backups yet -- run \`imprint save\` to make one" >&2
+    return 1
+  fi
+  if (( HAVE_GUM )); then
+    printf '%s\n' "${found[@]}" | engine menu --header "Choose an imprint archive"
+  else
+    printf '%s\n' "${found[0]}"
   fi
 }
 
 # The archives this machine actually has. A path that is wrong is nearly
 # always a typo of one of these.
 nearby_archives() {
-  local found where
-  where=$(save_dir)
-  found=$(ls -1t "$where"/*.tar.zst "$HOME"/imprints/*.tar.zst "$HOME"/backups/*.tar.zst 2>/dev/null \
-    | awk '!seen[$0]++' | head -n 5)
-  if [[ -z $found ]]; then
-    printf '\n  there are no archives in %s, ~/imprints or ~/backups yet -- `imprint save` makes one' "$where"
+  local -a found=()
+  mapfile -t found < <(engine archives 2>/dev/null)
+  if (( ${#found[@]} == 0 )); then
+    printf '\n  there are no archives in %s, ~/imprints or ~/backups yet -- `imprint save` makes one' "$(save_dir)"
     return
   fi
   printf '\n  archives on this machine:'
-  printf '\n    %s' $found
+  printf '\n    %s' "${found[@]:0:5}"
 }
 
 # Everything that can be wrong with a path to an existing imprint, said once,
@@ -422,15 +424,16 @@ do_restore() {
 
 do_list() {
   banner
-  local files where
-  where=$(save_dir)
-  files=$(ls -1t "$where"/imprint-*.tar.zst "$HOME/imprints"/imprint-*.tar.zst 2>/dev/null | awk '!seen[$0]++' || true)
-  if [[ -z $files ]]; then
-    say "No archives in $where yet. Run imprint save."
+  local -a files=()
+  local f size
+  mapfile -t files < <(engine archives 2>/dev/null)
+  if (( ${#files[@]} == 0 )); then
+    say "No archives in $(save_dir) yet. Run imprint save."
     return 0
   fi
-  printf '%s\n' "$files" | while read -r f; do
-    printf '  %s%8s%s  %s\n' "$IMP_GREY" "$(du -h "$f" | awk '{print $1}')" "$IMP_RESET" "$f"
+  for f in "${files[@]}"; do
+    size=$(du -h -- "$f" 2>/dev/null | cut -f1)
+    printf '  %s%8s%s  %s\n' "$IMP_GREY" "${size:-?}" "$IMP_RESET" "$f"
   done
 }
 

@@ -2158,5 +2158,127 @@ class StockThemeTests(unittest.TestCase):
             self.assertIn("cp -a", body)
 
 
+class RememberedDirDetailTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.home = Path(self.tmp) / "home"
+        (self.home / "imprints").mkdir(parents=True)
+        self.real_state_dir = engine.state_dir
+        engine.state_dir = staticmethod(lambda: Path(self.tmp) / "state")
+
+    def tearDown(self):
+        engine.state_dir = self.real_state_dir
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_a_relative_destination_is_remembered_absolutely(self):
+        cwd = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            Path("backups").mkdir()
+            engine.remember_save_dir(Path("backups"))
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(engine.read_state()["lastSaveDir"],
+                         str(Path(self.tmp).resolve() / "backups"))
+
+    def test_a_changed_filesystem_under_the_directory_is_called_out(self):
+        drive = Path(self.tmp) / "drive"
+        drive.mkdir()
+        engine.remember_save_dir(drive)
+        state = engine.read_state()
+        state["lastSaveDev"] = state["lastSaveDev"] + 1      # as if it were unmounted
+        engine.write_state(state)
+        directory, note = engine.default_archive_dir(self.home)
+        self.assertEqual(directory, drive)
+        self.assertIn("not on the filesystem it was on last time", note)
+
+    def test_the_same_filesystem_says_nothing(self):
+        drive = Path(self.tmp) / "drive"
+        drive.mkdir()
+        engine.remember_save_dir(drive)
+        self.assertEqual(engine.default_archive_dir(self.home), (drive, ""))
+
+    def test_state_that_is_not_even_utf8_is_no_state(self):
+        state = Path(self.tmp) / "state"
+        state.mkdir()
+        (state / "state.json").write_bytes(b'{"lastSaveDir": "\xff\xfe"}')
+        self.assertEqual(engine.read_state(), {})
+        self.assertEqual(engine.default_archive_dir(self.home), (self.home / "imprints", ""))
+
+
+class InterruptedWriteTests(unittest.TestCase):
+    def test_ctrl_c_takes_the_half_written_archive_with_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            staging = Path(tmp) / "staging"
+            staging.mkdir()
+            (staging / "manifest.json").write_text("{}", encoding="utf-8")
+            out = Path(tmp) / "out"
+            out.mkdir()
+            dest = out / "a.tar.zst"
+            real = engine.tarfile.open
+
+            def interrupted(name, mode="r", *a, **kw):
+                handle = real(name, mode, *a, **kw)
+                if "w" in mode:
+                    handle.close()
+                    raise KeyboardInterrupt
+                return handle
+
+            engine.tarfile.open = interrupted
+            try:
+                with self.assertRaises(KeyboardInterrupt):
+                    engine.write_archive(staging, dest)
+            finally:
+                engine.tarfile.open = real
+            self.assertEqual(list(out.iterdir()), [], "a .partial was left behind")
+
+
+class SkippedRecordTests(unittest.TestCase):
+    def tearDown(self):
+        engine.SKIPPED.clear()
+
+    def test_every_skipped_path_survives_even_past_the_manifest_sample(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            bad = home / ".config/app"
+            bad.mkdir(parents=True)
+            for i in range(201):
+                path = bad / f"f{i}.conf"
+                path.write_text("x", encoding="utf-8")
+                path.chmod(0o000)
+            cat = Path(tmp) / "cat"
+            cat.mkdir()
+            try:
+                engine.copy_into_category(cat, bad, home)
+            finally:
+                for path in bad.iterdir():
+                    path.chmod(0o600)
+            self.assertEqual(len(engine.SKIPPED), 201)
+            # what the manifest carries, and what the archive carries
+            self.assertEqual(len(engine.SKIPPED[:200]), 200)
+            staging = Path(tmp) / "staging"
+            staging.mkdir()
+            engine.write_json(staging / "skipped.json", engine.SKIPPED)
+            written = json.loads((staging / "skipped.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(written), 201)
+
+
+class ArchiveListingTests(unittest.TestCase):
+    def test_a_hostile_directory_name_lists_cleanly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            odd = Path(tmp) / "-drive dir" / "a[1]"
+            odd.mkdir(parents=True)
+            (odd / "imprint-x.tar.zst").write_bytes(b"x")
+            real_home, real_state = engine.Path.home, engine.state_dir
+            engine.Path.home = staticmethod(lambda: Path(tmp))
+            engine.state_dir = staticmethod(lambda: Path(tmp) / "state")
+            try:
+                engine.remember_save_dir(odd)
+                found = [str(p) for p in engine.known_archives()]
+            finally:
+                engine.Path.home, engine.state_dir = real_home, real_state
+            self.assertEqual(found, [str(odd / "imprint-x.tar.zst")])
+
+
 if __name__ == "__main__":
     unittest.main()

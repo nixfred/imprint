@@ -2438,11 +2438,19 @@ def known_archives() -> list[Path]:
                 found += [p for p in root.glob("*.tar.zst") if p.is_file()]
         except OSError:
             continue
-    try:
-        found.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    except OSError:
-        pass
-    return found
+    def when(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    found.sort(key=when, reverse=True)
+    seen, unique = set(), []
+    for path in found:
+        if str(path) not in seen:
+            seen.add(str(path))
+            unique.append(path)
+    return unique
 
 
 def archive_menu() -> list[str]:
@@ -2510,14 +2518,14 @@ def write_archive(staging: Path, dest: Path) -> None:
         with tarfile.open(tmp, "w:zst") as tar:
             tar.add(staging, arcname=".")
         tmp.replace(dest)
-    except OSError as exc:
+    except BaseException as exc:
         # A half-written archive on a slow mount is worse than none: it looks
-        # like a backup. Take it with us on the way out.
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        raise SystemExit(f"cannot write {dest}: {exc.strerror or exc}")
+        # like a backup. Take it with us on the way out -- including on the
+        # ctrl-c that is the likeliest way a long save ends early.
+        discard(tmp)
+        if isinstance(exc, OSError):
+            raise SystemExit(f"cannot write {dest}: {why(exc)}")
+        raise
 
 
 def extract_archive(archive: Path, dest: Path) -> None:
@@ -2651,6 +2659,22 @@ def cmd_about(_args) -> int:
     return 0
 
 
+def cmd_archives(_args) -> int:
+    """Every archive this machine knows about, newest first, one per line.
+
+    The wrapper used to reach for `ls -1t <glob>`, which splits on whitespace,
+    expands globs in the names it finds and reads a leading dash as an option.
+    A path with a newline in it cannot survive a line-based list at all, so it
+    is named on stderr rather than quietly mangled into two entries."""
+    for path in known_archives():
+        text = str(path)
+        if "\n" in text:
+            sys.stderr.write(f"  skipping {text!r}: a newline in the name\n")
+            continue
+        sys.stdout.write(text + "\n")
+    return 0
+
+
 def cmd_default_output(_args) -> int:
     directory, note = default_archive_dir(Path.home())
     if note:
@@ -2672,7 +2696,9 @@ def state_dir() -> Path:
 def read_state() -> dict:
     try:
         data = json.loads((state_dir() / "state.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
+        # ValueError covers both a bad decode and bad JSON. State is a
+        # convenience: unreadable state is no state, never a failed save.
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -2689,8 +2715,16 @@ def write_state(data: dict) -> None:
 
 
 def remember_save_dir(directory: Path) -> None:
+    # Absolute, because "backups" means something different from whichever
+    # directory the next save happens to be run from. Symlinks are left alone:
+    # the path the user gave is the path they will recognise.
+    directory = Path(os.path.abspath(directory))
     state = read_state()
     state["lastSaveDir"] = str(directory)
+    try:
+        state["lastSaveDev"] = os.stat(directory).st_dev
+    except OSError:
+        state.pop("lastSaveDev", None)
     write_state(state)
 
 
@@ -2701,11 +2735,25 @@ def default_archive_dir(home: Path) -> tuple[Path, str]:
     says so out loud, because writing the file into an empty mountpoint would
     look like it worked."""
     fallback = home / "imprints"
-    remembered = read_state().get("lastSaveDir")
+    state = read_state()
+    remembered = state.get("lastSaveDir")
     if not remembered or not isinstance(remembered, str):
         return fallback, ""
     directory = Path(remembered)
-    if directory == fallback or directory.is_dir():
+    if directory == fallback:
+        return directory, ""
+    if directory.is_dir():
+        # A mountpoint that is not mounted is still a directory, and a local
+        # copy written into an empty one looks exactly like a backup on the
+        # drive. The filesystem underneath is what tells them apart.
+        was = state.get("lastSaveDev")
+        try:
+            now = os.stat(directory).st_dev
+        except OSError:
+            now = was
+        if was is not None and now != was:
+            return directory, (f"{directory} is not on the filesystem it was on last "
+                               "time -- check the drive is mounted before trusting this")
         return directory, ""
     return fallback, (f"the last imprint went to {directory}, which is not there "
                       f"now -- this one goes to {fallback}")
@@ -2810,6 +2858,9 @@ def cmd_save(args) -> int:
         if SKIPPED:
             manifest["skipped"] = SKIPPED[:200]
             manifest["skippedCount"] = len(SKIPPED)
+            # The manifest keeps a readable sample; the archive keeps the lot,
+            # because a promise that they are all written down should be true.
+            write_json(staging / "skipped.json", SKIPPED)
         write_json(staging / "manifest.json", manifest)
         (staging / "BRIEF.md").write_text(render_brief(manifest), encoding="utf-8")
         copy_tool(staging)
@@ -2839,7 +2890,8 @@ def report_skipped() -> None:
     for item in SKIPPED[:5]:
         sys.stderr.write(f"    {item['path']} -- {item['reason']}\n")
     if count > 5:
-        sys.stderr.write(f"    ... {count - 5} more, all listed in the manifest\n")
+        sys.stderr.write(f"    ... {count - 5} more; every one of them is in "
+                         "skipped.json inside the archive\n")
 
 
 def strip_heavy(meta: dict) -> dict:
@@ -5664,13 +5716,14 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(
         dest="cmd", required=True,
         metavar="{save,restore,preview,plan,apply,info,diff,verify,undo,"
-                "categories,facts,about,default-output}")
+                "categories,facts,about,default-output,archives}")
     sub.add_parser("categories")
     sub.add_parser("facts")
     sub.add_parser("about")
     # What the save prompt fills in for you: the remembered directory and a
     # name stamped with the host and the minute.
     sub.add_parser("default-output")
+    sub.add_parser("archives")
     save = sub.add_parser("save")
     save.add_argument("--json", action="store_true", help="print the machine-readable report")
     save.add_argument("--only", default="")
@@ -5755,6 +5808,7 @@ def main(argv: list[str] | None = None) -> int:
         "categories": cmd_categories,
         "facts": cmd_facts,
         "default-output": cmd_default_output,
+        "archives": cmd_archives,
         "about": cmd_about,
         "save": cmd_save,
         "restore": cmd_restore,
