@@ -1916,5 +1916,117 @@ class WrapperPickerTests(unittest.TestCase):
                 self.assertFalse(Path(word).exists(), word + " was left behind")
 
 
+class PartialAndSilentLossTests(unittest.TestCase):
+    def setUp(self):
+        engine.SKIPPED.clear()
+        engine.FAILURES.clear()
+
+    def tearDown(self):
+        engine.SKIPPED.clear()
+        engine.FAILURES.clear()
+
+    def test_a_read_that_dies_halfway_leaves_nothing_behind(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src.conf"
+            src.write_text("PREFIX-then-a-bad-sector", encoding="utf-8")
+            dest = Path(tmp) / "staged" / "src.conf"
+            real = engine.copy_file
+
+            def dies_halfway(s, d):
+                d.parent.mkdir(parents=True, exist_ok=True)
+                d.write_text("PREFIX", encoding="utf-8")
+                raise OSError(5, "Input/output error")
+
+            engine.copy_file = dies_halfway
+            try:
+                self.assertFalse(engine.try_copy(src, dest))
+            finally:
+                engine.copy_file = real
+            self.assertFalse(dest.exists(), "a file reported as skipped was still staged")
+            self.assertEqual(len(engine.SKIPPED), 1)
+
+    def test_a_directory_nobody_can_read_is_reported_not_dropped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            shut = home / ".config/shut"
+            shut.mkdir(parents=True)
+            (shut / "a.conf").write_text("a", encoding="utf-8")
+            (home / ".config/open.conf").write_text("b", encoding="utf-8")
+            cat = Path(tmp) / "cat"
+            cat.mkdir()
+            shut.chmod(0o000)
+            try:
+                noted = engine.copy_into_category(cat, home / ".config", home)
+            finally:
+                shut.chmod(0o700)
+            self.assertIn(".config/", noted or "")
+            self.assertTrue(any("shut" in item["path"] for item in engine.SKIPPED),
+                            engine.SKIPPED)
+
+    def test_a_rewrite_that_fails_keeps_the_file_and_says_so(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "a.conf"
+            dest.write_text("path = /home/old/thing\n", encoding="utf-8")
+            real = Path.write_text
+
+            def no_space(self, *a, **kw):
+                if self.name.endswith(".imprint-rewrite"):
+                    raise OSError(28, "No space left on device")
+                return real(self, *a, **kw)
+
+            Path.write_text = no_space
+            try:
+                trouble = engine.rewrite_in_place(dest, "/home/old", "/home/new")
+            finally:
+                Path.write_text = real
+            self.assertIn("No space left", trouble)
+            self.assertEqual(dest.read_text(encoding="utf-8"), "path = /home/old/thing\n")
+            self.assertEqual(list(Path(tmp).iterdir()), [dest])
+
+    def test_a_rewrite_that_works_replaces_the_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "a.conf"
+            dest.write_text("path = /home/old/thing\n", encoding="utf-8")
+            self.assertEqual(engine.rewrite_in_place(dest, "/home/old", "/home/new"), "")
+            self.assertEqual(dest.read_text(encoding="utf-8"), "path = /home/new/thing\n")
+            self.assertEqual(list(Path(tmp).iterdir()), [dest])
+
+    def test_a_failed_rewrite_during_restore_counts_as_a_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cat = Path(tmp) / "cat"
+            files = cat / "files/.config"
+            files.mkdir(parents=True)
+            (files / "a.conf").write_text("p = /home/old/x\n", encoding="utf-8")
+            home = Path(tmp) / "home"
+            home.mkdir()
+            undo = Path(tmp) / "undo"
+            undo.mkdir()
+            real = engine.rewrite_in_place
+            engine.rewrite_in_place = lambda *a, **k: "Read-only file system"
+            try:
+                done = engine.restore_file_tree(cat, home, "/home/old", undo, False)
+            finally:
+                engine.rewrite_in_place = real
+            self.assertTrue(any("still points at the old home" in line for line in done), done)
+            self.assertEqual(len(engine.FAILURES), 1)
+
+    def test_a_collector_stops_on_a_full_staging_disk_instead_of_shrugging(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "a.conf"
+            src.write_text("a", encoding="utf-8")
+            real = engine.copy_file
+
+            def no_space(s, d):
+                raise OSError(28, "No space left on device")
+
+            engine.copy_file = no_space
+            try:
+                with self.assertRaises(SystemExit) as caught:
+                    engine.try_copy(src, Path(tmp) / "staged/a.conf")
+            finally:
+                engine.copy_file = real
+            self.assertIn("TMPDIR", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

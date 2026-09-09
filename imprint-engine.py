@@ -820,20 +820,35 @@ def staging_is_full(exc: OSError) -> SystemExit:
         "  TMPDIR=/var/tmp imprint save")
 
 
+def note_skip(path: Path, reason: str, action: str = "read") -> None:
+    entry = {"path": str(path), "action": action, "reason": reason}
+    if entry not in SKIPPED:
+        SKIPPED.append(entry)
+
+
+def discard(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
 def try_copy(src: Path, dest: Path) -> bool:
     """One unreadable file must not cost a whole save. A root-owned file under
     ~/.config, a file deleted while the walk was running, a mount that went
-    away mid-copy -- each is recorded and stepped over."""
+    away mid-copy -- each is recorded and stepped over.
+
+    A read that dies partway leaves bytes at the destination. Those go: the
+    manifest says this file is not in the archive, and restoring half of one
+    over a good file would make that a lie in the worst direction."""
     try:
         copy_file(src, dest)
         return True
-    except OSError as exc:
-        if out_of_space(exc):
+    except (OSError, UnicodeError) as exc:
+        if isinstance(exc, OSError) and out_of_space(exc):
             raise staging_is_full(exc)
-        SKIPPED.append({"path": str(src), "action": "read", "reason": why(exc)})
-        return False
-    except UnicodeError as exc:
-        SKIPPED.append({"path": str(src), "action": "read", "reason": why(exc)})
+        discard(dest)
+        note_skip(src, why(exc))
         return False
 
 
@@ -855,26 +870,44 @@ def read_text_safe(path: Path, limit: int = TEXT_LIMIT * 4) -> str | None:
         return None
 
 
-def rewrite_in_place(dest: Path, old_home: str, new_home: str) -> None:
+def rewrite_in_place(dest: Path, old_home: str, new_home: str) -> str:
+    """Point a restored file at this machine's home. Returns "" when there was
+    nothing to do or it worked, else why it did not.
+
+    Written beside the file and moved into place. write_text() truncates first,
+    so a disk that fills or a mount that drops halfway through used to leave an
+    empty file where a good one had been -- and the error was swallowed, so the
+    restore reported that file as done."""
     if not old_home or old_home == new_home:
-        return
+        return ""
     text = read_text_safe(dest)
     if text is None:
-        return
+        return ""
     rewritten = rewrite_text(text, old_home, new_home)
-    if rewritten != text:
-        try:
-            dest.write_text(rewritten, encoding="utf-8")
-        except OSError:
-            pass
+    if rewritten == text:
+        return ""
+    tmp = dest.with_name(dest.name + ".imprint-rewrite")
+    try:
+        tmp.write_text(rewritten, encoding="utf-8")
+        shutil.copystat(dest, tmp)
+        tmp.replace(dest)
+        return ""
+    except OSError as exc:
+        discard(tmp)
+        return why(exc)
 
 
 def copyable(path: Path) -> bool:
     """Regular files and symlinks only. A socket, fifo or device node cannot be
-    copied -- ~/.config/cliamp/cliamp.sock crashed a whole save."""
+    copied -- ~/.config/cliamp/cliamp.sock crashed a whole save.
+
+    A path that cannot even be stat'ed is a different thing from one that is
+    the wrong kind of file, and it is recorded: the archive should never be
+    quietly missing something."""
     try:
         mode = path.lstat().st_mode
-    except OSError:
+    except OSError as exc:
+        note_skip(path, why(exc))
         return False
     return stat.S_ISREG(mode) or stat.S_ISLNK(mode)
 
@@ -886,7 +919,13 @@ def iter_files(root: Path):
         if copyable(root):
             yield root
         return
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+    # Without onerror, os.walk swallows a directory it cannot list and the
+    # whole subtree leaves no trace anywhere -- not in the archive, not in the
+    # skip list, not on screen.
+    def unreadable(exc: OSError) -> None:
+        note_skip(Path(getattr(exc, "filename", None) or root), why(exc), "list")
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=unreadable, followlinks=False):
         dirnames[:] = [name for name in dirnames if not is_skipped_name(name)]
         for name in filenames:
             if is_skipped_name(name):
@@ -1138,6 +1177,11 @@ def collect_bar(cat_dir: Path, home: Path) -> dict:
             shell = json.loads(shell_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             shell = {}
+        except OSError as exc:
+            # Copied a moment ago through try_copy, which records and moves on.
+            # Reading it again raised, and used to end the run right there.
+            note_skip(shell_path, why(exc))
+            shell = {}
     layout = ((shell.get("bar") or {}).get("layout")) or {}
     meta = {
         "files": files,
@@ -1334,7 +1378,7 @@ def collect_plugins(cat_dir: Path, home: Path) -> dict:
             for unit_name in info["units"]:
                 src = home / ".config/systemd/user" / unit_name
                 if src.is_file():
-                    copy_file(src, cat_dir / "units" / unit_name)
+                    try_copy(src, cat_dir / "units" / unit_name)
             real = Path(info["source"])
             # Recipe, not payload: anything with a git remote is re-installed
             # from source at restore. Only trees with no upstream get packed,
@@ -1354,8 +1398,8 @@ def collect_plugins(cat_dir: Path, home: Path) -> dict:
                         src = real / inner
                         if not src.is_file():
                             continue
-                        copy_file(src, dest_root / inner)
-                        copied += 1
+                        if try_copy(src, dest_root / inner):
+                            copied += 1
                     info["overlay"] = str(overlay_rel)
                     info["overlayFiles"] = sorted(changed)
                     info["files"] = copied
@@ -1385,8 +1429,8 @@ def collect_plugins(cat_dir: Path, home: Path) -> dict:
                     inner = file_path.relative_to(real)
                 except ValueError:
                     continue
-                copy_file(file_path, dest_root / inner)
-                copied += 1
+                if try_copy(file_path, dest_root / inner):
+                    copied += 1
             info["tree"] = str(tree_rel)
             info["files"] = copied
             info["packed"] = True
@@ -1447,10 +1491,11 @@ def collect_themes(cat_dir: Path, home: Path) -> dict:
                     count = 0
                     for f in iter_files(theme_dir):
                         try:
-                            copy_file(f, dest_root / f.relative_to(theme_dir))
+                            inner = f.relative_to(theme_dir)
+                        except ValueError:
+                            continue
+                        if try_copy(f, dest_root / inner):
                             count += 1
-                        except (OSError, ValueError):
-                            pass
                     rec["copied"] = f"stock/{theme_dir.name} ({count} files)"
                 else:
                     rec["copied"] = copy_into_category(cat_dir, theme_dir, home)
@@ -1871,20 +1916,17 @@ def collect_system(cat_dir: Path, home: Path) -> dict:
             elif package_owns(path):
                 continue
             dest = cat_dir / "etc" / path.relative_to(etc)
-            try:
-                copy_file(path, dest)
-            except OSError:
-                skipped.append(f"{path} (unreadable)")
+            if not try_copy(path, dest):
+                skipped.append(f"{path} ({SKIPPED[-1]['reason']})")
                 continue
             kept.append(str(path.relative_to(etc)))
     for name in ETC_FILES:
         path = etc / name
         if path.is_file() and not etc_is_denied(path):
-            try:
-                copy_file(path, cat_dir / "etc" / name)
+            if try_copy(path, cat_dir / "etc" / name):
                 kept.append(name)
-            except OSError:
-                skipped.append(f"{path} (unreadable)")
+            else:
+                skipped.append(f"{path} ({SKIPPED[-1]['reason']})")
     meta = {
         "sourceRoot": str(SOURCE_SYSTEM_ROOT),
         "enabledUnits": enabled_system_units(),
@@ -2872,7 +2914,11 @@ def restore_file_tree(cat_dir: Path, home: Path, old_home: str, undo: Path, dry:
         except OSError as exc:
             done.append(fail(f"cannot write ~/{rel}: {why(exc)}"))
             continue
-        rewrite_in_place(dest, old_home, str(home))
+        trouble = rewrite_in_place(dest, old_home, str(home))
+        if trouble:
+            done.append(fail(f"~/{rel} was restored but still points at the old "
+                             f"home: {trouble}"))
+            continue
         done.append(str(rel))
     return done
 
@@ -3160,9 +3206,16 @@ def restore_plugins(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: b
                 packed = cat_dir / "units" / unit
                 if packed.is_file():
                     dest = home / ".config/systemd/user" / unit
-                    backup_existing(dest, undo, home)
-                    copy_file(packed, dest)
-                    rewrite_in_place(dest, old_home, str(home))
+                    try:
+                        backup_existing(dest, undo, home)
+                        copy_file(packed, dest)
+                    except OSError as exc:
+                        actions.append(fail(f"cannot install {unit} for "
+                                            f"{plug.get('id')}: {why(exc)}"))
+                        continue
+                    trouble = rewrite_in_place(dest, old_home, str(home))
+                    if trouble:
+                        actions.append(fail(f"{unit} still points at the old home: {trouble}"))
                     run(["systemctl", "--user", "daemon-reload"])
                     proc = run(["systemctl", "--user", "enable", "--now", unit])
                     actions.append(f"installed and enabled {unit} for {plug.get('id')}"
@@ -3192,9 +3245,15 @@ def overlay_tree(src: Path, dest: Path, old_home: str, new_home: Path) -> None:
     for file_path in iter_files(src):
         inner = file_path.relative_to(src)
         target = dest / inner
-        target.parent.mkdir(parents=True, exist_ok=True)
-        copy_file(file_path, target)
-        rewrite_in_place(target, old_home, str(new_home))
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            copy_file(file_path, target)
+        except OSError as exc:
+            fail(f"cannot write {target}: {why(exc)}")
+            continue
+        trouble = rewrite_in_place(target, old_home, str(new_home))
+        if trouble:
+            fail(f"{target} was restored but still points at the old home: {trouble}")
 
 
 def restore_packages(cat_dir: Path, dry: bool) -> list[str]:
@@ -3563,7 +3622,13 @@ def restore_system(cat_dir: Path, home: Path, dry: bool, allow: bool,
                 continue
             rel = path.relative_to(etc_root)
             if not dry:
-                copy_file(path, stage_etc / rel)
+                try:
+                    copy_file(path, stage_etc / rel)
+                except OSError as exc:
+                    # Leave it out of the script rather than write a line that
+                    # installs a file which is not there.
+                    actions.append(fail(f"could not stage /etc/{rel}: {why(exc)}"))
+                    continue
             etc_target = strict_target(Path(system_root) / "etc" / rel)
             installs.append((path, etc_target))
             lines.append(f'install -Dm644 {shlex.quote(str(stage_etc / rel))} {shlex.quote(str(etc_target))}')
@@ -5485,12 +5550,19 @@ def cmd_undo(args) -> int:
         except ValueError:
             continue
         dest = home / rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        copy_file(path, dest)
+        # An undo that dies partway is the worst of both machines. Report the
+        # file, keep putting the rest back.
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            copy_file(path, dest)
+        except OSError as exc:
+            fail(f"cannot put ~/{rel} back: {why(exc)}")
+            continue
         restored.append(str(rel))
-    json.dump({"ok": True, "undo": str(chosen), "files": restored[:100], "count": len(restored)}, sys.stdout, indent=2)
+    json.dump({"ok": not FAILURES, "undo": str(chosen), "files": restored[:100],
+               "count": len(restored), "failures": list(FAILURES)}, sys.stdout, indent=2)
     sys.stdout.write("\n")
-    return 0
+    return 0 if not FAILURES else 1
 
 
 def build_parser() -> argparse.ArgumentParser:

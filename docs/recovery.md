@@ -48,6 +48,13 @@ do not execute an untrusted archive's embedded tool or generated recipe.
 Older archives remain inspectable but have no content-integrity claim and cannot
 use files-only recovery. Make a new save with this version first.
 
+Generated plans also require an integrity-indexed archive whose embedded engine
+is byte-for-byte identical to the installed engine generating the plan. This
+conservative compatibility check refuses legacy or different-engine archives
+before creating output or replacing an existing plan payload. Upgrade Imprint
+and make a new save with that installed version; there is no automatic migration
+or execution of archived code to probe compatibility. Inspection remains available.
+
 ## Preview and recover exact files
 
 Create a disposable target home first. Never use a production home for tests.
@@ -93,8 +100,12 @@ Files-only restore verifies the archive, plans the full selection, refuses
 symlink targets/ancestors, validates Python syntax, JSON and Bash/sh syntax,
 and backs up every changed original before replacing any target. Writes use
 no-follow directory descriptors, private temporary files, fsync and atomic
-rename. A failed write triggers file rollback; the report states whether rollback
-succeeded or needs intervention. JSON/Python/Bash validation does not establish
+rename. A failed write triggers best-effort rollback across every journal record,
+including when one rollback fails. Originals already matching bytes and modes
+are not rewritten. Failures report `partial rollback` and each unrecovered path;
+other writable files are still restored. Keep the undo directory, resolve the
+reported permission/path problem, and retry explicit undo. JSON/Python/Bash
+validation does not establish
 that application settings or dependencies are correct. Lua, QML, YAML, service
 semantics and hardware behavior require their application-specific validators.
 

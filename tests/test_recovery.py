@@ -159,6 +159,28 @@ if sys.argv[1:] == ['--user', 'list-unit-files', '--state=enabled', '--no-legend
         self.assertFalse((output / 'restore.sh').exists())
         self.assertFalse((output / 'plan.json').exists())
 
+    def test_plan_accepts_current_engine_but_refuses_different_indexed_engine(self):
+        self.put('bin/demo', '#!/bin/sh\nprintf current\n')
+        self.cli('save', '--only', 'scripts', '-o', self.archive)
+        output = self.root / 'plan'
+        output.mkdir()
+        self.cli('plan', self.archive, '--only', 'scripts', '-o', output)
+        self.assertIn('--files-only', (output / 'restore.sh').read_text())
+        unpacked = self.unpack()
+        embedded = unpacked / 'tool/imprint-engine.py'
+        embedded.write_bytes(embedded.read_bytes() + b'\n# different producer\n')
+        manifest_path = unpacked / 'manifest.json'
+        manifest = json.loads(manifest_path.read_text())
+        entry = manifest['integrity']['tool/imprint-engine.py']
+        entry['sha256'] = hashlib.sha256(embedded.read_bytes()).hexdigest()
+        entry['size'] = embedded.stat().st_size
+        manifest_path.write_text(json.dumps(manifest))
+        self.cli('verify', unpacked)
+        previous = (output / 'restore.sh').read_bytes()
+        refused = self.cli('plan', unpacked, '--only', 'scripts', '-o', output, ok=False)
+        self.assertIn('make a new save', refused.stderr)
+        self.assertEqual((output / 'restore.sh').read_bytes(), previous)
+
     def test_failed_write_rolls_back_prior_files(self):
         import resource
         import signal
