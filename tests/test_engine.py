@@ -1902,6 +1902,14 @@ class WrapperPickerTests(unittest.TestCase):
                                   env=env, cwd=tmp, stdin=subprocess.DEVNULL)
             return proc, log.read_text(encoding="utf-8")
 
+    def test_the_picker_is_never_called_in_a_command_substitution(self):
+        # The shape of the fix, not just its effect: an assignment made inside
+        # $(...) cannot reach the parent, so a call site that reintroduces one
+        # reintroduces the bug.
+        text = (ROOT / "imprint").read_text(encoding="utf-8")
+        self.assertNotIn("$(choose_categories", text)
+        self.assertIn("SELECTED_CATEGORIES", text)
+
     def test_a_narrowed_category_reaches_the_engine_as_a_selection(self):
         proc, log = self._run('do_save "" "" 0')
         self.assertIn("--select", log, proc.stderr)

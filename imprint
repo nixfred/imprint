@@ -170,17 +170,7 @@ ids_from_archive_defaults() {
 }
 
 SELECTION_FILE=""
-
-# Our own picker: space toggles, space on a row with a submenu walks into it,
-# and the top row selects everything. gum choose can do none of that.
-# Callers read this through $(...), which is a subshell: anything it assigns
-# to SELECTION_FILE dies with that subshell. The file is therefore made by the
-# caller, in the parent, through start_selection -- without it every submenu
-# choice was silently discarded and a category the user had narrowed went
-# through whole.
-start_selection() {
-  SELECTION_FILE=$(mktemp -t imprint-selection-XXXXXX.json)
-}
+SELECTED_CATEGORIES=""
 
 end_selection() {
   if [[ -n $SELECTION_FILE ]]; then
@@ -190,14 +180,25 @@ end_selection() {
   return 0
 }
 
+# Our own picker: space toggles, space on a row with a submenu walks into it,
+# and the top row selects everything. gum choose can do none of that.
+#
+# Both halves of the answer come back in globals, and neither may travel
+# through $(...). A subshell cannot hand an assignment back to its parent, so
+# while the categories rode out on stdout the SELECTION_FILE assignment died
+# with the subshell: every submenu choice was discarded and a category the user
+# had narrowed went through whole. Never call this in a command substitution.
 choose_categories() {
   local header=$1
   local archive=${2:-}
+  SELECTED_CATEGORIES=""
+  SELECTION_FILE=$(mktemp -t imprint-selection-XXXXXX.json)
   local args=(pick --header "$header" --action "${PICK_ACTION:-Start backup}")
   [[ -n $archive ]] && args+=(--archive "$archive")
-  engine "${args[@]}" > "$SELECTION_FILE" || return 1
-  python3 -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["categories"]))' \
-    "$SELECTION_FILE"
+  engine "${args[@]}" > "$SELECTION_FILE" || { end_selection; return 1; }
+  SELECTED_CATEGORIES=$(python3 -c \
+    'import json,sys; print(",".join(json.load(open(sys.argv[1]))["categories"]))' \
+    "$SELECTION_FILE") || { end_selection; return 1; }
 }
 
 # Where saves have been going lately. The engine remembers it; ~/imprints is
@@ -327,9 +328,9 @@ do_save() {
   banner
   if [[ -z $only && $all -eq 0 ]]; then
     if (( HAVE_GUM )); then
-      start_selection
-      PICK_ACTION="Start backup" only=$(choose_categories "What should this imprint carry?") \
-        || { end_selection; die "cancelled"; }
+      PICK_ACTION="Start backup"
+      choose_categories "What should this imprint carry?" || die "cancelled"
+      only=$SELECTED_CATEGORIES
     else
       only=$(default_selected)
       say "No terminal for the picker; using the default categories."
@@ -388,9 +389,9 @@ do_restore() {
   say "Archive $archive"
   if [[ -z $only ]]; then
     if (( HAVE_GUM )); then
-      start_selection
-      PICK_ACTION="Review changes" only=$(choose_categories "What should land on this machine?" "$archive") \
-        || { end_selection; die "cancelled"; }
+      PICK_ACTION="Review changes"
+      choose_categories "What should land on this machine?" "$archive" || die "cancelled"
+      only=$SELECTED_CATEGORIES
     else
       only=$(ids_from_archive_defaults "$archive")
       say "No terminal for the picker; using this archive's default categories."

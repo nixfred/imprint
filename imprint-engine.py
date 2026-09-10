@@ -2343,6 +2343,10 @@ def collect_toolchains(cat_dir: Path, home: Path) -> dict:
         noted = copy_into_category(cat_dir, home / rel, home)
         if noted:
             files.append(noted)
+    # A tool that is not installed and a tool with nothing installed through it
+    # both read as an empty list. The difference matters to whoever restores
+    # this: one says "set mise up", the other says "mise is set up already".
+    missing = [name for name in ("mise", "cargo", "npm") if not shutil.which(name)]
     mise = []
     for line in run_ok(["mise", "ls", "--current"]).splitlines():
         parts = line.split()
@@ -2373,6 +2377,8 @@ def collect_toolchains(cat_dir: Path, home: Path) -> dict:
         "npmGlobal": npm,
         "unresolvedGo": sorted(t["name"] for t in go_tools if not t["module"]),
     }
+    if missing:
+        meta["missingBinaries"] = missing
     write_json(cat_dir / "meta.json", meta)
     return meta
 
@@ -3779,7 +3785,12 @@ def restore_look(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool
 
 
 def shell_is_running() -> bool:
-    return run(["omarchy", "shell", "-q", "shell", "ping"]).returncode == 0
+    """Not `-q`. That flag is not "quiet" but "always succeed": every failure
+    path in omarchy-shell goes through a fail() whose first line exits 0 under
+    it, so a quiet ping answers "up" with the shell stopped, unreachable, or
+    the target misspelt. Measured on 4.0.2 and on dev."""
+    proc = run(["omarchy", "shell", "shell", "ping"])
+    return proc.returncode == 0 and "ok" in proc.stdout.lower()
 
 
 def restore_bar(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool,
@@ -3853,6 +3864,16 @@ def restore_bar(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool,
             detail = (apply.stderr or apply.stdout).strip()[:200]
             return others + [fail(f"shell.json NOT applied, config-edit refused: {detail}")]
         detail = (snap_proc.stderr or snap_proc.stdout).strip()[:200]
+        if "target not found" in detail.lower():
+            # `omarchy shell <target> <method>` forwards to the running shell.
+            # Where config-edit is not a subcommand yet it is read as a target,
+            # and no such target exists.
+            return others + [fail(
+                "shell.json NOT applied: this Omarchy has no `shell config-edit` "
+                f"({omarchy_version()}), so there is no safe way to merge into a "
+                "live shell.json. Update Omarchy, or apply the setting by hand "
+                "with `omarchy-shell shell setBarWidget`. The archived copy is at "
+                ".config/omarchy/shell.json inside the imprint.")]
         return others + [fail(f"shell.json NOT applied: live snapshot unavailable: {detail}")]
     finally:
         for path in (snap, edited):
