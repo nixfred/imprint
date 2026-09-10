@@ -477,7 +477,10 @@ def ensure_session_env() -> None:
 
 
 def run_ok(cmd: list[str], cwd: Path | None = None) -> str:
-    proc = run(cmd, cwd=cwd)
+    try:
+        proc = run(cmd, cwd=cwd)
+    except (FileNotFoundError, OSError):
+        return ""
     if proc.returncode != 0:
         return ""
     return proc.stdout
