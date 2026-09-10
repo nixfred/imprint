@@ -3868,11 +3868,15 @@ def restore_bar(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool,
             # `omarchy shell <target> <method>` forwards to the running shell.
             # Where config-edit is not a subcommand yet it is read as a target,
             # and no such target exists.
+            # Do not say "update Omarchy". 4.0.3 is current and has no
+            # config-edit either -- only dev builds carry it, which is why this
+            # looked fixed when it was measured on one.
             return others + [fail(
-                "shell.json NOT applied: this Omarchy has no `shell config-edit` "
-                f"({omarchy_version()}), so there is no safe way to merge into a "
-                "live shell.json. Update Omarchy, or apply the setting by hand "
-                "with `omarchy-shell shell setBarWidget`. The archived copy is at "
+                f"shell.json NOT applied: this Omarchy ({omarchy_version()}) has no "
+                "`shell config-edit`, which only dev builds carry, so there is no "
+                "safe way to merge into a live shell.json. Apply the setting the "
+                "way omarchy-bar does, through /usr/bin/omarchy-shell-config, then "
+                "`omarchy-shell shell reloadConfig`. The archived copy is at "
                 ".config/omarchy/shell.json inside the imprint.")]
         return others + [fail(f"shell.json NOT applied: live snapshot unavailable: {detail}")]
     finally:
