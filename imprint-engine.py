@@ -3784,6 +3784,22 @@ def restore_look(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool
     return actions
 
 
+def config_edit_supported() -> bool:
+    """Whether this Omarchy carries `shell config-edit`.
+
+    Only dev builds do. Releases -- 4.0.2 and 4.0.3-1 alike -- read it as an
+    IPC target and answer "Target not found", so the whole shell.json path is
+    unavailable there. Probing writes a snapshot of the live config to a temp
+    file and reads nothing else; it changes nothing.
+    """
+    with tempfile.TemporaryDirectory(prefix="imprint-probe-") as tmp:
+        proc = run(["omarchy", "shell", "config-edit", "snapshot",
+                    str(Path(tmp) / "probe.json")])
+        if proc.returncode == 0:
+            return True
+        return "target not found" not in (proc.stderr + proc.stdout).lower()
+
+
 def shell_is_running() -> bool:
     """Not `-q`. That flag is not "quiet" but "always succeed": every failure
     path in omarchy-shell goes through a fail() whose first line exits 0 under
@@ -3809,7 +3825,13 @@ def restore_bar(cat_dir: Path, home: Path, old_home: str, undo: Path, dry: bool,
     if not keys:
         return others + [fail("shell.json NOT applied: select individual settings with --shell-key /object/key")]
     if dry:
-        return others + ["shell.json via config-edit"]
+        # A dry run that promises config-edit on a machine without it is a
+        # preview of something that cannot happen. Ask this machine first.
+        if not config_edit_supported():
+            return others + [fail(
+                f"shell.json would NOT apply: this Omarchy ({omarchy_version()}) "
+                "has no `shell config-edit`, which only dev builds carry")]
+        return others + [f"shell.json: {len(keys)} setting(s) via config-edit"]
     text = rewrite_text(shell_src.read_text(encoding="utf-8"), old_home, str(home))
 
     # Never write dest directly while the shell is up. `config-edit` exists to
