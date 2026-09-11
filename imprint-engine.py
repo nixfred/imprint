@@ -2936,9 +2936,82 @@ def load_manifest(root: Path) -> dict:
     return data
 
 
-def open_imprint(path: Path, tmp: Path) -> Path:
+ACTIVE_IDENTITY = ""
+AGE_DEFAULT_PUB = ".config/age/backup-key.pub"
+AGE_DEFAULT_KEY = ".config/age/backup-key.txt"
+
+
+def age_recipient(explicit: str) -> str:
+    """Who the archive is encrypted to: --recipient, else the default public
+    key. No recipient is a clean stop before any work, not a half-written
+    archive nobody holds the key to."""
+    if explicit:
+        return explicit
+    pub = Path.home() / AGE_DEFAULT_PUB
+    if pub.is_file():
+        for line in read_text(pub).splitlines():
+            line = line.strip()
+            if line.startswith("age1"):
+                return line
+    raise SystemExit(
+        f"no age recipient: pass -r age1..., or put a public key at ~/{AGE_DEFAULT_PUB}\n"
+        "  age-keygen -o ~/.config/age/backup-key.txt\n"
+        "  (it prints the public key; that line is the recipient)")
+
+
+def need_age(what: str) -> None:
+    if not shutil.which("age"):
+        raise SystemExit(f"{what} needs `age`, which is not installed here: "
+                         "pacman -S age  (age-keygen ships with it)")
+
+
+def encrypt_to(plain: Path, dest: Path, recipient: str) -> None:
+    """Encrypt the staged archive straight to its destination.
+
+    The plaintext never touches the destination. Writing it there first and
+    encrypting in place -- which is the obvious shape -- would put the whole
+    unencrypted machine on the USB stick or push it to the cloud mount before
+    the encryption existed, and deleting it afterwards does not take it back
+    off a flash device or out of a remote's history."""
+    need_age("--encrypt")
+    proc = run(["age", "-r", recipient, "-o", str(dest), str(plain)],
+               timeout=RUN_LONG_TIMEOUT)
+    if proc.returncode != 0:
+        discard(dest)
+        raise SystemExit(f"cannot encrypt to {dest}: "
+                         + ((proc.stderr or proc.stdout).strip()[:300] or "age failed"))
+
+
+def decrypt_archive(archive: Path, tmp: Path, identity: str = "") -> Path:
+    """An .age archive decrypted into tmp, which is a 0700 directory that goes
+    away with the run. Anything else is returned untouched."""
+    if archive.suffix != ".age":
+        return archive
+    need_age("this archive")
+    key = Path(identity).expanduser() if identity else Path.home() / AGE_DEFAULT_KEY
+    if not key.is_file():
+        raise SystemExit(f"cannot decrypt {archive}: no age identity at {key}\n"
+                         "  pass --identity FILE, or put the key at "
+                         f"~/{AGE_DEFAULT_KEY}")
+    # Beside the extraction root, never inside it: the archive is unpacked into
+    # `tmp`, and a decrypted tarball sitting there counts as an unexpected file
+    # against the manifest's integrity index.
+    holding = tmp.parent / f"{tmp.name}-cipher"
+    holding.mkdir(parents=True, exist_ok=True)
+    plain = holding / (archive.name[:-4] or "archive.tar.zst")
+    proc = run(["age", "-d", "-i", str(key), "-o", str(plain), str(archive)],
+               timeout=RUN_LONG_TIMEOUT)
+    if proc.returncode != 0:
+        discard(plain)
+        raise SystemExit(f"cannot decrypt {archive}: "
+                         + ((proc.stderr or proc.stdout).strip()[:300] or "age failed"))
+    return plain
+
+
+def open_imprint(path: Path, tmp: Path, identity: str = "") -> Path:
     if path.is_dir() and (path / "manifest.json").is_file():
         return path
+    path = decrypt_archive(path, tmp, identity or ACTIVE_IDENTITY)
     extract_archive(path, tmp)
     if (tmp / "manifest.json").is_file():
         return tmp
@@ -3176,6 +3249,14 @@ def cmd_save(args) -> int:
         dest = directory / f"imprint-{hostname()}-{now_stamp()}.tar.zst"
     if dest.suffixes[-2:] != [".tar", ".zst"] and not str(dest).endswith(".tar.zst"):
         dest = dest.with_name(dest.name + ".tar.zst") if dest.suffix == "" else dest
+    encrypt = bool(getattr(args, "encrypt", False))
+    if encrypt:
+        # Resolve the recipient before collecting: an hour of packing that ends
+        # in "no recipient" is an hour nobody gets back.
+        need_age("--encrypt")
+        recipient = age_recipient(getattr(args, "recipient", "") or "")
+        if dest.suffix != ".age":
+            dest = dest.with_name(dest.name + ".age")
     check_dest(dest, create=not typed)
     SKIPPED.clear()
     with tempfile.TemporaryDirectory(prefix="imprint-") as tmp:
@@ -3187,6 +3268,8 @@ def cmd_save(args) -> int:
         manifest = machine_facts()
         manifest["categories"] = {cid: strip_heavy(categories[cid]) for cid in ids}
         manifest["archiveName"] = dest.name
+        if encrypt:
+            manifest["encryption"] = "age"
         # The archive says what it could not take. Nobody restoring it should
         # have to discover the gap by finding the file missing months later.
         if SKIPPED:
@@ -3201,7 +3284,16 @@ def cmd_save(args) -> int:
         manifest["integrity"] = integrity_index(staging)
         write_json(staging / "manifest.json", manifest)
         progress.update("writing the archive")
-        write_archive(staging, dest)
+        if encrypt:
+            # Staged, then encrypted out. The plaintext lives and dies inside
+            # this 0700 temp directory and never reaches the destination.
+            plain = Path(tmp) / dest.name[:-4]
+            write_archive(staging, plain)
+            progress.update("encrypting")
+            encrypt_to(plain, dest, recipient)
+            discard(plain)
+        else:
+            write_archive(staging, dest)
         size_now = dest.stat().st_size
         progress.finish(f"Wrote {dest}",
                         f"{human_size(size_now)} \u00b7 {len(ids)} categories")
@@ -6217,11 +6309,17 @@ def build_parser() -> argparse.ArgumentParser:
     save.add_argument("--system-root", default="/", help="source root for the system category")
     save.add_argument("--all", action="store_true")
     save.add_argument("-o", "--output", default="")
+    save.add_argument("--encrypt", action="store_true",
+                      help="encrypt the finished archive with age")
+    save.add_argument("-r", "--recipient", default="",
+                      help="age recipient (default: ~/.config/age/backup-key.pub)")
     save.add_argument("--select", default="",
                       help="JSON from `imprint pick`, to narrow within a category")
     restore = sub.add_parser("restore")
     restore.add_argument("--json", action="store_true", help="print the machine-readable report")
     restore.add_argument("archive")
+    restore.add_argument("--identity", default="",
+                         help="age key file for an encrypted archive")
     restore.add_argument("--only", default="")
     restore.add_argument("--select", default="",
                          help="JSON from `imprint pick`, to narrow within a category")
@@ -6236,12 +6334,18 @@ def build_parser() -> argparse.ArgumentParser:
                          help="run `omarchy update -y` before restoring anything")
     info = sub.add_parser("info")
     info.add_argument("archive")
+    info.add_argument("--identity", default="",
+                      help="age key file for an encrypted archive")
     info.add_argument("--json", action="store_true")
     brief = sub.add_parser("brief")
     brief.add_argument("archive")
+    brief.add_argument("--identity", default="",
+                       help="age key file for an encrypted archive")
     brief.add_argument("--json", action="store_true")
     planp = sub.add_parser("plan")
     planp.add_argument("archive")
+    planp.add_argument("--identity", default="",
+                       help="age key file for an encrypted archive")
     planp.add_argument("--only", default="")
     planp.add_argument("-o", "--output", default="")
     applyp = sub.add_parser("apply")
@@ -6266,13 +6370,19 @@ def build_parser() -> argparse.ArgumentParser:
     pick.add_argument("--action", default="", help="label for the row that starts the job")
     prev = sub.add_parser("preview")
     prev.add_argument("archive")
+    prev.add_argument("--identity", default="",
+                      help="age key file for an encrypted archive")
     prev.add_argument("--only", default="")
     prev.add_argument("--select", default="")
     prev.add_argument("--json", action="store_true")
     verify = sub.add_parser("verify")
     verify.add_argument("archive")
+    verify.add_argument("--identity", default="",
+                        help="age key file for an encrypted archive")
     diff = sub.add_parser("diff")
     diff.add_argument("archive")
+    diff.add_argument("--identity", default="",
+                      help="age key file for an encrypted archive")
     undo = sub.add_parser("undo")
     undo.add_argument("--undo-dir", default="")
     undo.add_argument("--target-home", default="")
@@ -6289,8 +6399,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    global ACTIVE_IDENTITY
     parser = build_parser()
     args = parser.parse_args(argv)
+    ACTIVE_IDENTITY = getattr(args, "identity", "") or ""
     dispatch = {
         "categories": cmd_categories,
         "facts": cmd_facts,

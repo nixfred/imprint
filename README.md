@@ -421,6 +421,33 @@ performs neither and reports activation pending.
 
 It will not clone disk encryption, lock policy, or another machine’s TPM.
 
+## Encrypting an archive
+
+An imprint carries configs, shell history and identity data, and it usually
+ends up on a USB stick or a cloud mount. `--encrypt` wraps it with
+[age](https://github.com/FiloSottile/age):
+
+```bash
+imprint save --encrypt                  # writes imprint-$host-$time.tar.zst.age
+imprint save --encrypt -r age1...       # to a specific recipient
+imprint restore FILE.age --identity ~/.config/age/backup-key.txt
+```
+
+The recipient is your `-r`, or the first `age1...` line in
+`~/.config/age/backup-key.pub`. With neither, the save stops before it collects
+anything rather than after. `restore`, `info`, `plan`, `preview`, `verify` and
+`diff` all take `--identity` and decrypt a `.age` archive before their normal
+work; without one they look for `~/.config/age/backup-key.txt`.
+
+**The plaintext never touches the destination.** The archive is built in the
+staging directory and encrypted out to where you asked for it, because writing
+it whole and encrypting in place would put the unencrypted machine on the stick
+or in the remote's history first, and deleting it afterwards does not take it
+back off either.
+
+`age` is not a dependency. It is needed only when you use `--encrypt` or open
+an encrypted archive; install it with `pacman -S age`.
+
 ## When a file gets in the way
 
 Paths are checked before any work starts, not after, and **imprint never

@@ -2581,5 +2581,123 @@ class ContainedWriteTests(unittest.TestCase):
             self.assertEqual((home / ".config/b.conf").read_text(encoding="utf-8"), "b\n")
 
 
+class AgeEncryptionTests(unittest.TestCase):
+    """Opt-in age encryption. `age` itself is stood in for, so the suite runs
+    on a machine that does not have it."""
+
+    STUB = "\n".join([
+        "#!/usr/bin/env bash",
+        'out=""; src=""; mode=enc',
+        'while [[ $# -gt 0 ]]; do',
+        '  case $1 in',
+        '    -d) mode=dec; shift ;;',
+        '    -r|-i) shift 2 ;;',
+        '    -o) out=$2; shift 2 ;;',
+        '    *) src=$1; shift ;;',
+        '  esac',
+        'done',
+        'if [[ $mode == enc ]]; then { printf "AGEFAKE\\n"; cat "$src"; } > "$out";',
+        'else tail -c +9 "$src" > "$out"; fi',
+        "",
+    ])
+
+    def _age(self, tmp: Path) -> None:
+        binp = tmp / "bin"
+        binp.mkdir(parents=True, exist_ok=True)
+        stub = binp / "age"
+        stub.write_text(self.STUB, encoding="utf-8")
+        stub.chmod(0o755)
+        old = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{binp}:{old}"
+        self.addCleanup(lambda: os.environ.__setitem__("PATH", old))
+
+    def _home(self, tmp: Path, with_keys: bool = True) -> Path:
+        home = tmp / "home"
+        if with_keys:
+            (home / ".config/age").mkdir(parents=True)
+            (home / ".config/age/backup-key.pub").write_text(
+                "# created by age-keygen\nage1recipienttestvalue\n", encoding="utf-8")
+            (home / ".config/age/backup-key.txt").write_text(
+                "AGE-SECRET-KEY-TEST\n", encoding="utf-8")
+        else:
+            home.mkdir(parents=True)
+        real = engine.Path.home
+        engine.Path.home = staticmethod(lambda: home)
+        self.addCleanup(lambda: setattr(engine, "Path", engine.Path) or
+                        setattr(engine.Path, "home", real))
+        return home
+
+    def test_the_recipient_comes_from_the_public_key_and_r_wins(self):
+        with tempfile.TemporaryDirectory() as t:
+            self._home(Path(t))
+            self.assertEqual(engine.age_recipient(""), "age1recipienttestvalue")
+            self.assertEqual(engine.age_recipient("age1explicit"), "age1explicit")
+
+    def test_no_recipient_says_how_to_make_one(self):
+        with tempfile.TemporaryDirectory() as t:
+            self._home(Path(t), with_keys=False)
+            with self.assertRaises(SystemExit) as caught:
+                engine.age_recipient("")
+            message = str(caught.exception)
+            self.assertIn("no age recipient", message)
+            self.assertIn("age-keygen", message)
+
+    def test_the_plaintext_never_reaches_the_destination(self):
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            self._age(tmp)
+            plain = tmp / "staging.tar.zst"
+            plain.write_bytes(b"the whole machine")
+            out = tmp / "dest"
+            out.mkdir()
+            engine.encrypt_to(plain, out / "a.tar.zst.age", "age1recipienttestvalue")
+            self.assertEqual([p.name for p in out.iterdir()], ["a.tar.zst.age"])
+            self.assertTrue((out / "a.tar.zst.age").read_bytes().startswith(b"AGEFAKE"))
+
+    def test_a_failed_encryption_leaves_nothing_behind(self):
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            self._age(tmp)
+            out = tmp / "dest"
+            out.mkdir()
+            with self.assertRaises(SystemExit):
+                engine.encrypt_to(tmp / "not-there.tar.zst",
+                                  out / "a.tar.zst.age", "age1r")
+            self.assertEqual(list(out.iterdir()), [])
+
+    def test_the_decrypted_copy_stays_out_of_the_extraction_root(self):
+        # It used to land in the same directory the archive unpacks into, where
+        # the manifest's integrity index counted it as an unexpected file.
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            self._age(tmp)
+            self._home(tmp)
+            archive = tmp / "a.tar.zst.age"
+            archive.write_bytes(b"AGEFAKE\nPAYLOAD")
+            root = tmp / "open"
+            root.mkdir()
+            plain = engine.decrypt_archive(archive, root)
+            self.assertEqual(plain.read_bytes(), b"PAYLOAD")
+            self.assertFalse(plain.is_relative_to(root), f"{plain} is inside {root}")
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_a_plain_archive_is_passed_straight_through(self):
+        with tempfile.TemporaryDirectory() as t:
+            archive = Path(t) / "a.tar.zst"
+            archive.write_bytes(b"x")
+            self.assertEqual(engine.decrypt_archive(archive, Path(t) / "open"), archive)
+
+    def test_a_missing_identity_is_a_sentence(self):
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            self._age(tmp)
+            self._home(tmp, with_keys=False)
+            archive = tmp / "a.tar.zst.age"
+            archive.write_bytes(b"AGEFAKE\nx")
+            with self.assertRaises(SystemExit) as caught:
+                engine.decrypt_archive(archive, tmp / "open")
+            self.assertIn("no age identity", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
