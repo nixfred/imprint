@@ -2699,5 +2699,66 @@ class AgeEncryptionTests(unittest.TestCase):
             self.assertIn("no age identity", str(caught.exception))
 
 
+class UnbornHeadTests(unittest.TestCase):
+    """A `git init` with no commit yet is a normal checkout, not a failure.
+
+    Reporting it as "could not be read and is not in the archive" was false
+    twice over: nothing had failed, and the repo's content -- its untracked
+    files -- was in the archive all along, carried as a patch.
+    """
+
+    def setUp(self):
+        engine.SKIPPED.clear()
+
+    def tearDown(self):
+        engine.SKIPPED.clear()
+
+    def _repo(self, tmp: Path) -> Path:
+        repo = Path(tmp) / "fresh"
+        repo.mkdir()
+        engine.run(["git", "-C", str(repo), "init", "-q"])
+        return repo
+
+    def test_a_repo_with_no_commits_is_not_a_skipped_thing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._repo(Path(tmp))
+            (repo / "notes.md").write_text("untracked work\n", encoding="utf-8")
+            self.assertEqual(engine.git_head(repo), "")
+            self.assertEqual(engine.SKIPPED, [], "an unborn HEAD was reported as unreadable")
+            # and its content is still seen as work worth carrying
+            self.assertTrue(engine.git_dirty(repo))
+            self.assertIn("notes.md", engine.git_changed_files(repo))
+            self.assertEqual(engine.SKIPPED, [])
+
+    def test_a_real_git_failure_is_still_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            broken = Path(tmp) / "broken"
+            (broken / ".git").mkdir(parents=True)
+            (broken / ".git/HEAD").write_text("garbage\n", encoding="utf-8")
+            engine.git_head(broken)
+            self.assertEqual(len(engine.SKIPPED), 1, "a corrupt repo went unreported")
+
+    def test_a_timeout_is_still_reported(self):
+        real = engine.run
+        engine.run = lambda *a, **k: subprocess.CompletedProcess(
+            a[0], engine.TIMED_OUT, "", "")
+        try:
+            engine.git_head(ROOT)
+        finally:
+            engine.run = real
+        self.assertEqual(len(engine.SKIPPED), 1)
+
+    def test_a_complaint_is_reported_whole_not_cut_mid_word(self):
+        long_error = ("fatal: ambiguous argument 'HEAD': unknown revision or path "
+                      "not in the working tree.\n"
+                      "Use '--' to separate paths from revisions, like this:\n"
+                      "git <command> [<revision>...] -- [<file>...]")
+        said = engine.first_line(long_error)
+        self.assertTrue(said.endswith("working tree."), said)
+        self.assertNotIn("\n", said)
+        self.assertEqual(engine.first_line(""), "")
+        self.assertTrue(engine.first_line("x" * 400).endswith("…"))
+
+
 if __name__ == "__main__":
     unittest.main()

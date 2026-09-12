@@ -787,17 +787,40 @@ def git_branch_of(path: Path) -> str:
     return "" if name in {"", "HEAD"} else name
 
 
+def first_line(text: str, limit: int = 160) -> str:
+    """The first line of a command's complaint, whole.
+
+    git's rev-parse error runs to three lines of advice about `--`, and a flat
+    slice of the first 120 characters cut it mid-word: "separate paths from
+    revi". The first line is the error; the rest is a tutorial."""
+    line = (text or "").strip().splitlines()
+    if not line:
+        return ""
+    head = line[0].strip()
+    return head if len(head) <= limit else head[:limit - 1] + "\u2026"
+
+
 def git_head(path: Path) -> str:
     if not (path / ".git").exists():
         return ""
-    proc = run(["git", "-C", str(path), "rev-parse", "HEAD"], timeout=RUN_GIT_TIMEOUT)
-    if proc.returncode != 0:
-        # An empty commit in a recipe means "clone the default branch", which
-        # is a different machine from the one being saved. Say so.
-        note_skip(path, f"git rev-parse did not answer: "
-                        f"{proc.stderr.strip()[:120] or 'failed'}", "read")
-        return ""
-    return proc.stdout.strip()
+    # --verify --quiet is the discriminator. A repo whose first commit has not
+    # been made yet has an unborn HEAD: rev-parse exits non-zero with nothing
+    # on stderr, which is a normal state for `git init`, not a failure. Without
+    # --quiet it prints three lines about `--`, and every freshly initialised
+    # checkout was reported as a thing that "could not be read and is not in
+    # the archive" -- while its content was in the archive all along, carried
+    # as a patch of its untracked files.
+    proc = run(["git", "-C", str(path), "rev-parse", "--verify", "--quiet", "HEAD"],
+               timeout=RUN_GIT_TIMEOUT)
+    if proc.returncode == 0:
+        return proc.stdout.strip()
+    trouble = first_line(proc.stderr)
+    if proc.returncode == TIMED_OUT or trouble:
+        # A real one: a timeout, a permission problem, a corrupt object store.
+        # An empty commit in the recipe would mean "clone the default branch",
+        # which is a different machine from the one being saved.
+        note_skip(path, f"git rev-parse did not answer: {trouble or 'failed'}", "read")
+    return ""
 
 
 def git_dirty(path: Path) -> bool:
@@ -811,8 +834,8 @@ def git_dirty(path: Path) -> bool:
         return False
     proc = run(["git", "-C", str(path), "status", "--porcelain"], timeout=RUN_GIT_TIMEOUT)
     if proc.returncode != 0:
-        note_skip(path, f"git status did not answer: {proc.stderr.strip()[:120] or 'failed'}",
-                  "read")
+        note_skip(path, f"git status did not answer: "
+                        f"{first_line(proc.stderr) or 'failed'}", "read")
         return True
     return bool(proc.stdout.strip())
 
@@ -830,7 +853,7 @@ def git_changed_files(path: Path) -> list[str]:
                 timeout=RUN_GIT_TIMEOUT)
     if probe.returncode != 0:
         note_skip(path, f"git status did not answer, so its uncommitted files are not "
-                        f"in this archive: {probe.stderr.strip()[:120] or 'failed'}", "read")
+                        f"in this archive: {first_line(probe.stderr) or 'failed'}", "read")
         return []
     out = probe.stdout
     names: list[str] = []
