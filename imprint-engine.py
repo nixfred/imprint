@@ -1017,15 +1017,48 @@ def contained(base: Path, candidate: Path) -> Path:
     return cand_r
 
 
-def copy_file(src: Path, dest: Path) -> None:
+def link_target_within(src: Path, link_root: Path | None) -> str | None:
+    """The relative target to store for a symlink worth keeping as one.
+
+    A theme directory full of links into a shared video pool is the case this
+    exists for: 10 real files and 207 links became 207 full copies, 287 MB
+    packed as 6.7 GB, because a resolvable link was always dereferenced. A link
+    whose target is packed alongside it is stored as a relative link instead,
+    which survives the tar data filter and restores the same layout.
+
+    None means dereference, which stays the answer for a link pointing outside
+    the tree being packed: that target is not in the archive, so a link to it
+    would restore as a dangling one."""
+    if not src.is_symlink():
+        return None
+    raw = os.readlink(src)
+    if not raw.startswith("/"):
+        return raw          # already relative, so already self-contained
+    if link_root is None:
+        return None
+    try:
+        target = Path(os.path.realpath(src))
+        root = Path(os.path.realpath(link_root))
+        if not target.is_relative_to(root):
+            return None
+        return os.path.relpath(target, start=os.path.realpath(src.parent))
+    except OSError:
+        return None
+
+
+def copy_file(src: Path, dest: Path, link_root: Path | None = None) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     broken_link = src.is_symlink() and not src.exists()
+    keep_link = None if broken_link else link_target_within(src, link_root)
     # Never write through a symlink at the destination, and never symlink onto
     # an existing path -- both raise or corrupt an unrelated file.
-    if dest.is_symlink() or (broken_link and dest.exists()):
+    if dest.is_symlink() or ((broken_link or keep_link) and dest.exists()):
         dest.unlink()
     if broken_link:
         dest.symlink_to(os.readlink(src))
+        return
+    if keep_link is not None:
+        dest.symlink_to(keep_link)
         return
     shutil.copy2(src, dest, follow_symlinks=True)
 
@@ -1067,7 +1100,7 @@ def discard(path: Path) -> None:
         pass
 
 
-def try_copy(src: Path, dest: Path) -> bool:
+def try_copy(src: Path, dest: Path, link_root: Path | None = None) -> bool:
     """One unreadable file must not cost a whole save. A root-owned file under
     ~/.config, a file deleted while the walk was running, a mount that went
     away mid-copy -- each is recorded and stepped over.
@@ -1076,7 +1109,7 @@ def try_copy(src: Path, dest: Path) -> bool:
     manifest says this file is not in the archive, and restoring half of one
     over a good file would make that a lie in the worst direction."""
     try:
-        copy_file(src, dest)
+        copy_file(src, dest, link_root=link_root)
         return True
     except (OSError, UnicodeError) as exc:
         if isinstance(exc, OSError) and out_of_space(exc):
@@ -1170,13 +1203,16 @@ def _replace_at(fd: int, name: str, source: Path) -> None:
     """Write beside the target inside an already-verified directory, then
     rename over it. rename replaces the name in this directory; it never
     follows a symlink sitting there, which is the whole point."""
-    broken_link = source.is_symlink() and not source.exists()
+    # Any symlink the archive carries was packed as one on purpose, whether it
+    # was broken at save time or points at a sibling packed beside it.
+    # Dereferencing it here would undo the deduplication on the way back in.
+    is_link = source.is_symlink()
     tmp = f".imprint-{os.getpid()}-{name[:80]}"
     try:
         os.unlink(tmp, dir_fd=fd)
     except OSError:
         pass
-    if broken_link:
+    if is_link:
         os.symlink(os.readlink(source), tmp, dir_fd=fd)
     else:
         info = source.stat()
@@ -1327,7 +1363,7 @@ def copy_into_category(cat_dir: Path, src: Path, home: Path) -> str | None:
         count = 0
         for file_path in iter_files(src):
             file_rel = rel_under_home(file_path, home)
-            if try_copy(file_path, stage_path(cat_dir, file_rel)):
+            if try_copy(file_path, stage_path(cat_dir, file_rel), link_root=src):
                 count += 1
         return f"{rel}/ ({count} files)" if count else None
     if src.is_dir() and src.is_symlink():
@@ -1337,7 +1373,7 @@ def copy_into_category(cat_dir: Path, src: Path, home: Path) -> str | None:
                 inner = file_path.relative_to(real)
             except ValueError:
                 continue
-            try_copy(file_path, stage_path(cat_dir, str(Path(rel) / inner)))
+            try_copy(file_path, stage_path(cat_dir, str(Path(rel) / inner)), link_root=real)
         return f"{rel}/ (symlink -> {real})"
     return rel if try_copy(src, dest) else None
 
@@ -3144,6 +3180,36 @@ def write_state(data: dict) -> None:
         pass
 
 
+SAVE_MARKER = ".imprint-drive"
+
+
+def drive_id(directory: Path) -> str:
+    """The id imprint left in a save directory, or "" if there is none."""
+    try:
+        return (directory / SAVE_MARKER).read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        return ""
+
+
+def mark_drive(directory: Path) -> str:
+    """Leave an id in the save directory and return it.
+
+    This replaces comparing st_dev. A FUSE mount is handed a fresh device id
+    every time it is mounted, so rclone answered 90 one day and 77 the next on
+    a perfectly healthy drive, and the warning fired after every reboot. An id
+    file travels with the drive instead, which is the thing actually being
+    identified. Failing to write it is not worth failing a save over."""
+    existing = drive_id(directory)
+    if existing:
+        return existing
+    fresh = os.urandom(8).hex()
+    try:
+        (directory / SAVE_MARKER).write_text(fresh + "\n", encoding="utf-8")
+    except OSError:
+        return ""
+    return fresh
+
+
 def remember_save_dir(directory: Path) -> None:
     # Absolute, because "backups" means something different from whichever
     # directory the next save happens to be run from. Symlinks are left alone:
@@ -3151,10 +3217,12 @@ def remember_save_dir(directory: Path) -> None:
     directory = Path(os.path.abspath(directory))
     state = read_state()
     state["lastSaveDir"] = str(directory)
-    try:
-        state["lastSaveDev"] = os.stat(directory).st_dev
-    except OSError:
-        state.pop("lastSaveDev", None)
+    state.pop("lastSaveDev", None)     # superseded by the marker file
+    marker = mark_drive(directory)
+    if marker:
+        state["lastSaveId"] = marker
+    else:
+        state.pop("lastSaveId", None)
     write_state(state)
 
 
@@ -3175,15 +3243,14 @@ def default_archive_dir(home: Path) -> tuple[Path, str]:
     if directory.is_dir():
         # A mountpoint that is not mounted is still a directory, and a local
         # copy written into an empty one looks exactly like a backup on the
-        # drive. The filesystem underneath is what tells them apart.
-        was = state.get("lastSaveDev")
-        try:
-            now = os.stat(directory).st_dev
-        except OSError:
-            now = was
-        if was is not None and now != was:
-            return directory, (f"{directory} is not on the filesystem it was on last "
-                               "time -- check the drive is mounted before trusting this")
+        # drive. The id imprint left there is what tells them apart; silence
+        # when nothing was recorded yet, so an older state file is not a
+        # standing accusation.
+        was = state.get("lastSaveId")
+        if was and drive_id(directory) != was:
+            return directory, (f"{directory} does not carry the marker the last imprint "
+                               "left there -- check the right drive is mounted before "
+                               "trusting this")
         return directory, ""
     return fallback, (f"the last imprint went to {directory}, which is not there "
                       f"now -- this one goes to {fallback}")

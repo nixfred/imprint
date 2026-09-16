@@ -1700,7 +1700,7 @@ class UnreadableFileTests(unittest.TestCase):
     def test_a_full_staging_disk_stops_the_save(self):
         real = engine.copy_file
 
-        def no_space(src, dest):
+        def no_space(src, dest, link_root=None):
             raise OSError(28, "No space left on device")
 
         engine.copy_file = no_space
@@ -1943,7 +1943,7 @@ class PartialAndSilentLossTests(unittest.TestCase):
             dest = Path(tmp) / "staged" / "src.conf"
             real = engine.copy_file
 
-            def dies_halfway(s, d):
+            def dies_halfway(s, d, link_root=None):
                 d.parent.mkdir(parents=True, exist_ok=True)
                 d.write_text("PREFIX", encoding="utf-8")
                 raise OSError(5, "Input/output error")
@@ -2027,7 +2027,7 @@ class PartialAndSilentLossTests(unittest.TestCase):
             src.write_text("a", encoding="utf-8")
             real = engine.copy_file
 
-            def no_space(s, d):
+            def no_space(s, d, link_root=None):
                 raise OSError(28, "No space left on device")
 
             engine.copy_file = no_space
@@ -2190,17 +2190,6 @@ class RememberedDirDetailTests(unittest.TestCase):
             os.chdir(cwd)
         self.assertEqual(engine.read_state()["lastSaveDir"],
                          str(Path(self.tmp).resolve() / "backups"))
-
-    def test_a_changed_filesystem_under_the_directory_is_called_out(self):
-        drive = Path(self.tmp) / "drive"
-        drive.mkdir()
-        engine.remember_save_dir(drive)
-        state = engine.read_state()
-        state["lastSaveDev"] = state["lastSaveDev"] + 1      # as if it were unmounted
-        engine.write_state(state)
-        directory, note = engine.default_archive_dir(self.home)
-        self.assertEqual(directory, drive)
-        self.assertIn("not on the filesystem it was on last time", note)
 
     def test_the_same_filesystem_says_nothing(self):
         drive = Path(self.tmp) / "drive"
@@ -2758,6 +2747,152 @@ class UnbornHeadTests(unittest.TestCase):
         self.assertNotIn("\n", said)
         self.assertEqual(engine.first_line(""), "")
         self.assertTrue(engine.first_line("x" * 400).endswith("…"))
+
+
+class SharedLinkTests(unittest.TestCase):
+    """A tree of symlinks into a shared pool must not become one full copy per
+    link. 10 real videos and 207 links packed 287 MB as 6.7 GB before this."""
+
+    def setUp(self):
+        engine.SKIPPED.clear()
+
+    def tearDown(self):
+        engine.SKIPPED.clear()
+
+    def _tree(self, tmp: Path) -> Path:
+        home = Path(tmp)
+        bg = home / ".config/omarchy/backgrounds"
+        (bg / "_shared").mkdir(parents=True)
+        payload = b"x" * (256 * 1024)
+        (bg / "_shared/clip.bin").write_bytes(payload)
+        for theme in ("themeA", "themeB", "themeC"):
+            (bg / theme).mkdir()
+            # absolute target, exactly how the real backgrounds tree links
+            (bg / theme / "clip.bin").symlink_to(bg / "_shared/clip.bin")
+        return home
+
+    def test_internal_links_are_packed_as_links_not_copies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._tree(tmp)
+            cat = Path(tmp) / "cat"
+            cat.mkdir()
+            engine.copy_into_category(cat, home / ".config/omarchy/backgrounds", home)
+            staged = cat / "files/.config/omarchy/backgrounds"
+            real = staged / "_shared/clip.bin"
+            self.assertTrue(real.is_file() and not real.is_symlink())
+            for theme in ("themeA", "themeB", "themeC"):
+                link = staged / theme / "clip.bin"
+                self.assertTrue(link.is_symlink(), f"{theme} was dereferenced")
+                self.assertFalse(os.readlink(link).startswith("/"),
+                                 "an absolute target cannot survive the tar data filter")
+                self.assertEqual(link.resolve(), real.resolve())
+            # the pool is stored once, not once per theme
+            total = sum(f.stat().st_size for f in staged.rglob("*")
+                        if f.is_file() and not f.is_symlink())
+            self.assertLess(total, 400 * 1024, f"{total} bytes staged, pool is 256 KB")
+
+    def test_a_link_out_of_the_packed_tree_is_still_dereferenced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._tree(tmp)
+            outside = Path(tmp) / "outside"
+            outside.mkdir()
+            (outside / "elsewhere.bin").write_bytes(b"y" * 4096)
+            bg = home / ".config/omarchy/backgrounds"
+            (bg / "themeA/elsewhere.bin").symlink_to(outside / "elsewhere.bin")
+            cat = Path(tmp) / "cat"
+            cat.mkdir()
+            engine.copy_into_category(cat, bg, home)
+            landed = cat / "files/.config/omarchy/backgrounds/themeA/elsewhere.bin"
+            self.assertTrue(landed.is_file() and not landed.is_symlink(),
+                            "a link to an unpacked target must be dereferenced")
+            self.assertEqual(landed.read_bytes(), b"y" * 4096)
+
+    def test_a_broken_link_is_still_carried_as_a_link(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            bg = home / "bg"
+            bg.mkdir()
+            (bg / "gone.bin").symlink_to("nowhere/at/all")
+            cat = Path(tmp) / "cat"
+            cat.mkdir()
+            engine.copy_into_category(cat, bg, home)
+            self.assertTrue((cat / "files/bg/gone.bin").is_symlink())
+
+    def test_restore_puts_a_link_back_as_a_link(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cat = Path(tmp) / "cat"
+            files = cat / "files/.config/bg"
+            (files / "_shared").mkdir(parents=True)
+            (files / "_shared/clip.bin").write_bytes(b"z" * 2048)
+            (files / "themeA").mkdir()
+            (files / "themeA/clip.bin").symlink_to("../_shared/clip.bin")
+            home = Path(tmp) / "home"
+            home.mkdir()
+            undo = Path(tmp) / "undo"
+            undo.mkdir()
+            engine.FAILURES.clear()
+            engine.restore_file_tree(cat, home, "", undo, False)
+            landed = home / ".config/bg/themeA/clip.bin"
+            self.assertTrue(landed.is_symlink(), "restore dereferenced the link again")
+            self.assertEqual(landed.read_bytes(), b"z" * 2048)
+            engine.FAILURES.clear()
+
+
+class DriveMarkerTests(unittest.TestCase):
+    """rclone hands out a new device id on every mount, so st_dev cried wolf
+    after every reboot. The drive carries its own id now."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.home = Path(self.tmp) / "home"
+        (self.home / "imprints").mkdir(parents=True)
+        self.real_state_dir = engine.state_dir
+        engine.state_dir = staticmethod(lambda: Path(self.tmp) / "state")
+
+    def tearDown(self):
+        engine.state_dir = self.real_state_dir
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_the_same_drive_says_nothing(self):
+        drive = Path(self.tmp) / "drive"
+        drive.mkdir()
+        engine.remember_save_dir(drive)
+        self.assertTrue((drive / engine.SAVE_MARKER).is_file())
+        self.assertEqual(engine.default_archive_dir(self.home), (drive, ""))
+
+    def test_a_remount_with_a_new_device_id_is_not_a_warning(self):
+        drive = Path(self.tmp) / "drive"
+        drive.mkdir()
+        engine.remember_save_dir(drive)
+        state = engine.read_state()
+        self.assertNotIn("lastSaveDev", state)
+        self.assertIn("lastSaveId", state)
+        directory, note = engine.default_archive_dir(self.home)
+        self.assertEqual((directory, note), (drive, ""))
+
+    def test_a_drive_without_the_marker_is_called_out(self):
+        drive = Path(self.tmp) / "drive"
+        drive.mkdir()
+        engine.remember_save_dir(drive)
+        (drive / engine.SAVE_MARKER).unlink()          # as if a different disk
+        directory, note = engine.default_archive_dir(self.home)
+        self.assertEqual(directory, drive)
+        self.assertIn("does not carry the marker", note)
+
+    def test_state_from_before_the_marker_stays_quiet(self):
+        drive = Path(self.tmp) / "drive"
+        drive.mkdir()
+        engine.write_state({"lastSaveDir": str(drive), "lastSaveDev": 90})
+        self.assertEqual(engine.default_archive_dir(self.home), (drive, ""))
+
+    def test_a_directory_that_cannot_be_marked_does_not_fail_the_save(self):
+        drive = Path(self.tmp) / "readonly"
+        drive.mkdir(mode=0o500)
+        try:
+            engine.remember_save_dir(drive)            # must not raise
+            self.assertEqual(engine.read_state().get("lastSaveDir"), str(drive))
+        finally:
+            drive.chmod(0o700)
 
 
 if __name__ == "__main__":
