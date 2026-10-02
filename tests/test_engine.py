@@ -2488,6 +2488,56 @@ class ContainedWriteTests(unittest.TestCase):
             self.assertEqual([p.name for p in (home / ".config/app").iterdir()],
                              ["thing.conf"], "a temp file was left behind")
 
+    def test_short_writes_preserve_every_byte_across_read_chunks(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self._home(tmp)
+            source = Path(tmp) / "src"
+            data = bytes(range(256)) * 8193  # more than two 1 MiB read chunks
+            source.write_bytes(data)
+            source.chmod(0o750)
+            real_write = os.write
+            with patch.object(engine.os, "write",
+                              side_effect=lambda fd, buf: real_write(fd, buf[:8191])):
+                engine.place_file(home, ".config/thing", source)
+            landed = home / ".config/thing"
+            self.assertEqual(landed.read_bytes(), data)
+            self.assertEqual(landed.stat().st_mode & 0o777, 0o750)
+            self.assertEqual(list(landed.parent.iterdir()), [landed])
+
+    def test_failed_write_preserves_destination_and_removes_partial_file(self):
+        import errno
+        from unittest.mock import patch
+        for failure in ("disk full", "zero progress", "interrupted"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
+                home = self._home(tmp)
+                source = Path(tmp) / "src"
+                source.write_bytes(b"new contents" * 100)
+                landed = home / ".config/thing"
+                landed.write_bytes(b"original")
+                landed.chmod(0o600)
+                real_write = os.write
+                calls = 0
+
+                def write(fd, buf):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        return real_write(fd, buf[:3])
+                    if failure == "zero progress":
+                        return 0
+                    if failure == "interrupted":
+                        raise KeyboardInterrupt
+                    raise OSError(errno.ENOSPC, "injected disk full")
+
+                expected = KeyboardInterrupt if failure == "interrupted" else OSError
+                with patch.object(engine.os, "write", side_effect=write):
+                    with self.assertRaises(expected):
+                        engine.place_file(home, ".config/thing", source)
+                self.assertEqual(landed.read_bytes(), b"original")
+                self.assertEqual(landed.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(list(landed.parent.iterdir()), [landed])
+
     def test_a_broken_symlink_is_restored_as_a_symlink(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = self._home(tmp)
