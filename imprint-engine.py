@@ -1212,31 +1212,37 @@ def _replace_at(fd: int, name: str, source: Path) -> None:
         os.unlink(tmp, dir_fd=fd)
     except OSError:
         pass
-    if is_link:
-        os.symlink(os.readlink(source), tmp, dir_fd=fd)
-    else:
-        info = source.stat()
-        out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                      stat.S_IMODE(info.st_mode), dir_fd=fd)
-        try:
-            with open(source, "rb") as handle:
-                while True:
-                    chunk = handle.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    os.write(out, chunk)
-            os.fchmod(out, stat.S_IMODE(info.st_mode))
-        finally:
-            os.close(out)
-        os.utime(tmp, (info.st_atime, info.st_mtime), dir_fd=fd)
     try:
+        if is_link:
+            os.symlink(os.readlink(source), tmp, dir_fd=fd)
+        else:
+            info = source.stat()
+            out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                          stat.S_IMODE(info.st_mode), dir_fd=fd)
+            try:
+                with open(source, "rb") as handle:
+                    while True:
+                        chunk = handle.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        remaining = memoryview(chunk)
+                        while remaining:
+                            written = os.write(out, remaining)
+                            if written <= 0:
+                                raise OSError(errno.EIO, "restore write made no progress")
+                            remaining = remaining[written:]
+                os.fchmod(out, stat.S_IMODE(info.st_mode))
+            finally:
+                os.close(out)
+            os.utime(tmp, (info.st_atime, info.st_mtime), dir_fd=fd)
         os.rename(tmp, name, src_dir_fd=fd, dst_dir_fd=fd)
-    except OSError:
+    finally:
+        # A write, metadata update, or interruption can fail before rename.
+        # Leave the original in place and remove the incomplete sibling too.
         try:
             os.unlink(tmp, dir_fd=fd)
         except OSError:
             pass
-        raise
 
 
 def read_text_safe(path: Path, limit: int = TEXT_LIMIT * 4) -> str | None:
